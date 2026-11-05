@@ -178,12 +178,26 @@ pub struct User {
     pub extras: UserExtras,
 }
 
+impl User {
+    /// Discord's own account, whose messages tell you about yours.
+    pub fn is_discord(&self) -> bool {
+        self.id == Id(643_945_264_868_098_049)
+    }
+
+    pub fn is_verified_bot(&self) -> bool {
+        self.bot && self.extras.public_flags.is_some_and(|flags| flags & (1 << 16) != 0)
+    }
+}
+
 /// The cosmetic parts of a user: server tag, avatar decoration, nameplate.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 pub struct UserExtras {
     /// Our own Nitro level, in READY: 0 or absent is none.
     #[serde(default)]
     pub premium_type: Option<u8>,
+    /// Discord's account flags, of which we only read whether a bot's verified.
+    #[serde(default)]
+    pub public_flags: Option<u64>,
     /// Bots still have these: `eara#6801`. "0" for everyone else.
     #[serde(default)]
     pub discriminator: Option<String>,

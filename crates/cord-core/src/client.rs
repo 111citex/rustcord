@@ -493,6 +493,16 @@ impl Core {
         Ok(profile)
     }
 
+    /// A game's or app's icon, as a picture's address. `None` if it hasn't got one.
+    pub async fn application_icon(&self, application: String) -> Result<Option<String>, HttpError> {
+        let http = self.http.clone();
+        self.on_rt(async move {
+            let app: Value = http.get(&format!("/applications/{application}/rpc")).await?;
+            Ok(app["icon"].as_str().map(|icon| format!("https://cdn.discordapp.com/app-icons/{application}/{icon}.png?size=128")))
+        })
+        .await
+    }
+
     pub async fn add_friend(&self, user: Id) -> Result<(), HttpError> {
         let http = self.http.clone();
         let result = self

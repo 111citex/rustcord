@@ -11,7 +11,7 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, LiveLayer, LiveScroll, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
@@ -962,6 +962,12 @@ pub(crate) struct TooltipRequest {
     tooltip: AnyTooltip,
 }
 
+/// Rustcord: a scroll layer the render thread can move, see [`Window::keep_scroll_layer_live`].
+struct LiveScrollEntry {
+    live: Arc<LiveScroll>,
+    follow: Rc<dyn Fn(f32)>,
+}
+
 pub(crate) struct DeferredDraw {
     /// Rustcord: comes from a scroll layer's content but paints outside the layer, so it wouldn't
     /// follow when the layer moves.
@@ -1222,6 +1228,8 @@ pub struct Window {
     scroll_layer_clips: Vec<Bounds<Pixels>>,
     /// Whether scroll layers get made. Off where the platform can't draw them.
     pub(crate) scroll_layers_enabled: bool,
+    /// Scroll layers the render thread moves, as far as the last draw went.
+    live_scrolls: FxHashMap<ScrollLayerId, LiveScrollEntry>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1820,6 +1828,11 @@ impl Window {
                                 let arena_clear_needed = window.draw(cx);
                                 crate::frame_stats::since(&crate::frame_stats::DRAW_NS, draw_start);
                                 crate::frame_stats::add(&crate::frame_stats::FRAMES, 1);
+                                crate::frame_stats::add(&crate::frame_stats::SCROLL_REBUILDS, 1);
+                                crate::frame_stats::SCROLL_WORST_DRAW_NS.fetch_max(
+                                    draw_start.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 let present_start = std::time::Instant::now();
                                 window.present();
                                 crate::frame_stats::since(&crate::frame_stats::PRESENT_NS, present_start);
@@ -2087,6 +2100,7 @@ impl Window {
             needs_present,
             scroll_layer_clips: Vec::new(),
             scroll_layers_enabled,
+            live_scrolls: FxHashMap::default(),
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3291,6 +3305,12 @@ impl Window {
             self.refresh();
         }
         self.invalidate_entities();
+        // Rustcord: lists catch up with the render thread's movement first, so everything in
+        // this frame sees them where they are.
+        let scale_factor = self.scale_factor();
+        for entry in self.live_scrolls.values() {
+            (entry.follow)(scale_factor);
+        }
         // Rustcord: a layer that's moved has to be rendered for real now, or a cached view would
         // bring back its old place along with hitboxes to match.
         let moved_views: SmallVec<[EntityId; 4]> = self
@@ -3298,7 +3318,7 @@ impl Window {
             .scene
             .scroll_layers
             .iter()
-            .filter(|layer| layer.offset_y.0 != 0.)
+            .filter(|layer| layer.has_moved())
             .filter_map(|layer| layer.view)
             .collect();
         for view in moved_views {
@@ -3380,6 +3400,7 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.update_live_scrolls();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -4104,12 +4125,17 @@ impl Window {
             return self.with_content_mask(mask, f);
         };
         let view = self.current_view();
+        let live = self
+            .live_scrolls
+            .get(&spec.id)
+            .map(|entry| LiveLayer::new(entry.live.clone(), entry.live.mark_painted()));
         // Snapped the way every primitive's own mask is, or an edge could land elsewhere.
-        self.next_frame.scene.begin_scroll_layer(
+        self.next_frame.scene.begin_live_scroll_layer(
             spec.id,
             view,
             self.cover_bounds(clip),
             self.cover_bounds(painted.bounds),
+            live,
         );
         self.content_mask_stack.push(painted);
         self.scroll_layer_clips.push(clip);
@@ -4143,6 +4169,7 @@ impl Window {
             .find(|layer| layer.id == Some(id))
         else {
             crate::frame_stats::add(&crate::frame_stats::LAYER_MOVE_REFUSED, 1);
+            crate::frame_stats::add(&crate::frame_stats::SCROLL_REFUSED, 1);
             return false;
         };
         let device_pixels = moved.0 * scale;
@@ -4157,11 +4184,56 @@ impl Window {
         layer.offset_y = offset_y;
         if can_move {
             crate::frame_stats::add(&crate::frame_stats::LAYER_MOVES, 1);
+            crate::frame_stats::add(&crate::frame_stats::SCROLL_MOVES, 1);
             self.needs_present.set(true);
         } else {
             crate::frame_stats::add(&crate::frame_stats::LAYER_MOVE_REFUSED, 1);
+            crate::frame_stats::add(&crate::frame_stats::SCROLL_REFUSED, 1);
         }
         can_move
+    }
+
+    /// Rustcord: lets the render thread move scroll layer `id` by itself from the next draw on,
+    /// where the platform can. `follow` catches the list up with its movement, given the scale:
+    /// it takes [`LiveScroll::take_unsynced`], applies that, and calls [`LiveScroll::set_room`].
+    pub fn keep_scroll_layer_live(
+        &mut self,
+        id: ScrollLayerId,
+        live: &Arc<LiveScroll>,
+        follow: &Rc<dyn Fn(f32)>,
+    ) {
+        if !self.scroll_layers_enabled {
+            return;
+        }
+        let platform_window = &self.platform_window;
+        self.live_scrolls.entry(id).or_insert_with(|| {
+            live.set_render_waker(platform_window.scroll_compositor_waker());
+            LiveScrollEntry { live: live.clone(), follow: follow.clone() }
+        });
+    }
+
+    /// Rustcord: a new frame's in, which decides what the render thread may do with its layers:
+    /// the same things that stop [`Self::move_scroll_layer`]. Lists also learn how far they
+    /// can go now, since drawing them may have changed it.
+    fn update_live_scrolls(&mut self) {
+        if self.live_scrolls.is_empty() {
+            return;
+        }
+        let scale_factor = self.scale_factor();
+        let tooltip_shown = self.tooltip_bounds.is_some();
+        let deferred_content = self
+            .rendered_frame
+            .deferred_draws
+            .iter()
+            .any(|deferred| deferred.in_scroll_layer);
+        let layers = &self.rendered_frame.scene.scroll_layers;
+        self.live_scrolls.retain(|id, entry| {
+            let layer = layers.iter().find(|layer| layer.id == Some(*id));
+            let may_move = layer.is_some_and(|layer| layer.movable && layer.live.is_some());
+            entry.live.set_may_move(may_move && !tooltip_shown && !deferred_content);
+            (entry.follow)(scale_factor);
+            layer.is_some()
+        });
     }
 
     /// Rustcord: have this frame presented, with or without anything new in it. A list in mid-glide
@@ -4184,7 +4256,7 @@ impl Window {
             .scene
             .scroll_layers
             .iter()
-            .any(|layer| layer.offset_y.0 != 0.);
+            .any(|layer| layer.has_moved());
         if moved {
             self.draw(cx).clear(cx);
         }
@@ -5619,11 +5691,16 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
-        // Rustcord: another wheel notch where the pointer already was only needs the list's own
-        // bounds, which a moved layer doesn't change. Everything else looks at what's under
-        // the pointer, or may do something that does.
-        if !matches!(&event, PlatformInput::ScrollWheel(wheel) if wheel.position == self.mouse_position)
-        {
+        // Rustcord: a wheel notch only needs a list's own bounds, which a moved layer doesn't
+        // change, and rows don't react to a pointer passing over them while they move. A rebuild
+        // for each of those would back up the queue, and the notches behind it would land late,
+        // after the wheel's stopped. Anything else may act on what's under the pointer.
+        let only_passing = match &event {
+            PlatformInput::ScrollWheel(_) => true,
+            PlatformInput::MouseMove(moved) => moved.pressed_button.is_none(),
+            _ => false,
+        };
+        if !only_passing {
             self.settle_scroll_layers(cx);
         }
         #[cfg(feature = "profiler")]

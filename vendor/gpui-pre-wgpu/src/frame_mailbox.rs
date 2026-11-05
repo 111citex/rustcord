@@ -17,6 +17,8 @@ pub(crate) struct FrameMailbox<F> {
 struct MailboxState<F> {
     pending: Option<F>,
     spares: Vec<F>,
+    /// The render thread has something to do with the frame it's got already.
+    nudged: bool,
     closed: bool,
 }
 
@@ -26,6 +28,7 @@ impl<F> FrameMailbox<F> {
             state: Mutex::new(MailboxState {
                 pending: None,
                 spares: Vec::new(),
+                nudged: false,
                 closed: false,
             }),
             changed: Condvar::new(),
@@ -66,6 +69,7 @@ impl<F> FrameMailbox<F> {
     }
 
     /// Waits for the next frame. `None` once closed, even with a frame still waiting.
+    #[cfg(test)]
     pub(crate) fn wait(&self) -> Option<F> {
         let mut state = self.state.lock();
         loop {
@@ -77,6 +81,34 @@ impl<F> FrameMailbox<F> {
             }
             self.changed.wait(&mut state);
         }
+    }
+
+    /// Waits for a frame or a [`Self::nudge`]: `Some(None)` is the nudge, and `None` is closed.
+    pub(crate) fn wait_or_nudge(&self) -> Option<Option<F>> {
+        let mut state = self.state.lock();
+        loop {
+            if state.closed {
+                return None;
+            }
+            if let Some(frame) = state.pending.take() {
+                state.nudged = false;
+                return Some(Some(frame));
+            }
+            if std::mem::take(&mut state.nudged) {
+                return Some(None);
+            }
+            self.changed.wait(&mut state);
+        }
+    }
+
+    /// Wakes [`Self::wait_or_nudge`] with no new frame. Stays set until it's been seen.
+    pub(crate) fn nudge(&self) {
+        self.state.lock().nudged = true;
+        self.changed.notify_one();
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state.lock().closed
     }
 
     /// Takes back the waiting frame, if any, so it won't be drawn.
@@ -146,6 +178,30 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         mailbox.post(7, |_, _| {});
         assert_eq!(waiting.join().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn a_nudge_wakes_without_a_frame_and_stays_until_seen() {
+        let mailbox = FrameMailbox::<u32>::new();
+        mailbox.nudge();
+        assert_eq!(mailbox.wait_or_nudge(), Some(None));
+
+        let mailbox = Arc::new(mailbox);
+        let waiting = {
+            let mailbox = mailbox.clone();
+            std::thread::spawn(move || mailbox.wait_or_nudge())
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        mailbox.nudge();
+        assert_eq!(waiting.join().unwrap(), Some(None));
+
+        // A frame answers a nudge too, so that it doesn't wake the thread a second time.
+        mailbox.nudge();
+        mailbox.post(1, |_, _| {});
+        assert_eq!(mailbox.wait_or_nudge(), Some(Some(1)));
+        mailbox.close();
+        assert_eq!(mailbox.wait_or_nudge(), None);
+        assert!(mailbox.is_closed());
     }
 
     #[test]

@@ -68,6 +68,23 @@ pub fn app_badge() -> AnyElement {
         .into_any_element()
 }
 
+/// After a bot's name in the DM list, ticked once Discord's verified it.
+pub fn bot_badge(verified: bool) -> AnyElement {
+    div()
+        .flex_shrink_0()
+        .h(u(16.))
+        .px(u(5.))
+        .flex()
+        .items_center()
+        .rounded(u(4.))
+        .bg(gpui_kit::Hsla::from(gpui_kit::rgb(0x5865f2)))
+        .text_color(gpui_kit::white())
+        .text_size(u(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(if verified { "\u{2713} BOT" } else { "BOT" })
+        .into_any_element()
+}
+
 /// On Discord's own account, in place of the APP badge.
 pub fn official_badge() -> AnyElement {
     div()

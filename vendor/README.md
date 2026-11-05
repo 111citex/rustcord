@@ -9,6 +9,11 @@ gpui-pre 0.3.7, gpui-pre-wgpu 0.3.7 and gpui-pre-linux 0.3.7 from crates.io (Apa
   `ScrollLayerSpec` paints its content with `overscan` more of it into a layer of the scene, which `Window::move_scroll_layer`
   then moves with no render. The render thread composes that into a frame (`Scene::compose_scroll_layers`). A layer that's
   moved gets rendered on the next real draw, and input other than more wheel on the same spot gets a real draw first.
+- `live_scroll.rs`, `wgpu_renderer.rs` (`render_thread`, `FramePacer`), `gpui-pre-linux/wayland/frame_pacer.rs`: a layer can
+  also move with no main thread at all. The render thread keeps the last scene and steps the app's `ScrollMotion` on each frame
+  callback, which it gets on a Wayland event queue of its own. `LiveScroll::moved` counts the movement, each scene notes the
+  count it was painted at, and the difference is where it shows: so a scene can arrive whenever, and `Window::draw` first catches
+  the list up with what's moved. What stops `move_scroll_layer` hands the movement back to the main thread (`set_may_move`).
 - `gpui-pre-linux/wayland`: only `draw` going off the main thread needs this crate changed. A frame that fails to reach
   the compositor gets no frame callback, so the render thread pings the loop (`render_feedback_fired`).
   `x11/window.rs`: redraw requests from the render thread are picked up in `refresh`.

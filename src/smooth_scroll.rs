@@ -6,11 +6,12 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{
-    App, DispatchPhase, EntityId, IntoElement, ListState, ScrollDelta, ScrollHandle, ScrollLayerId, ScrollLayerSpec,
-    ScrollWheelEvent, Styled, Window, canvas, point, px,
+    App, DispatchPhase, EntityId, IntoElement, LiveScroll, ListState, ScrollDelta, ScrollHandle, ScrollLayerId,
+    ScrollLayerSpec, ScrollMotion, ScrollWheelEvent, Styled, Window, canvas, point, px,
 };
 
 /// Pixels per wheel line.
@@ -142,6 +143,35 @@ impl FrameClock {
     }
 }
 
+/// A scroll's motion, which either thread can step: the render thread does it for a layer, whether
+/// or not the main thread gets around to anything.
+#[derive(Default)]
+struct Motion(Mutex<MotionState>);
+
+#[derive(Default)]
+struct MotionState {
+    glide: Glide,
+    clock: FrameClock,
+}
+
+impl Motion {
+    fn state(&self) -> std::sync::MutexGuard<'_, MotionState> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl ScrollMotion for Motion {
+    fn step(&self, measured: Option<Duration>) -> f32 {
+        let mut state = self.state();
+        let frame = state.clock.tick(measured.unwrap_or(FIRST_FRAME).as_secs_f32());
+        state.glide.step(Duration::from_secs_f32(frame))
+    }
+
+    fn is_active(&self) -> bool {
+        self.state().glide.is_active()
+    }
+}
+
 /// What a [`SmoothScroller`] moves.
 #[derive(Clone)]
 pub enum ScrollTarget {
@@ -169,6 +199,14 @@ impl ScrollTarget {
                 f32::from((-list.scroll_px_offset_for_scrollbar().y).min(list.max_offset_for_scrollbar().y))
             }
             ScrollTarget::Handle(handle) => f32::from(-handle.offset().y),
+        }
+    }
+
+    /// How far down the content the view can go.
+    fn max_top(&self) -> f32 {
+        match self {
+            ScrollTarget::List(list) => f32::from(list.max_offset_for_scrollbar().y),
+            ScrollTarget::Handle(handle) => f32::from(handle.max_offset().y),
         }
     }
 
@@ -206,13 +244,16 @@ fn room_to_move(top: f32, max: f32, dy: f32) -> bool {
 
 #[derive(Default)]
 struct State {
-    glide: Glide,
     last_frame: Option<Instant>,
-    clock: FrameClock,
     /// Movement not yet shown, being less than a device pixel.
     carry: f32,
-    /// A step is waiting for the next frame, see [`SmoothScroller::tick`].
+    /// Another [`SmoothScroller::tick`] is on its way.
     ticking: bool,
+    /// This scroll so far, for its log line: the longest wait between steps, and how many
+    /// took long enough to see.
+    worst_gap: f32,
+    long_gaps: u32,
+    steps: u32,
 }
 
 /// Splits movement into what lands on whole device pixels and what's left over.
@@ -228,6 +269,7 @@ fn whole_pixels(wanted: f32, scale: f32) -> (f32, f32) {
 #[derive(Clone)]
 pub struct SmoothScroller {
     target: ScrollTarget,
+    motion: Arc<Motion>,
     state: Rc<RefCell<State>>,
     /// Lives inside a full profile, so that being open doesn't silence it.
     in_modal: bool,
@@ -244,6 +286,10 @@ struct LayerScrolling {
     /// Whether the rest of the view stays the same with the list's top at this place. Set each
     /// render by a view that shows anything following the scroll outside the list.
     outside_stays_right: Rc<RefCell<Option<OutsideCheck>>>,
+    /// Moves it from the render thread while nothing stops it from being moved.
+    live: Arc<LiveScroll>,
+    /// Brings the list up to what `live` has moved, given the window's scale.
+    follow: Rc<dyn Fn(f32)>,
 }
 
 /// See [`LayerScrolling::outside_stays_right`].
@@ -259,6 +305,14 @@ pub const KEPT_BEYOND_LAYER: f32 = 200.;
 
 /// How long after the last movement a list counts as still scrolling.
 const SETTLE: Duration = Duration::from_millis(180);
+
+/// How far a layer can get from where it was painted before asking for a rebuild. It's asked for
+/// this early so that even a slow one is done before the view gets to the edge of what's painted.
+const REBUILD_AFTER: f32 = LAYER_OVERSCAN / 2.;
+
+/// How often the main thread looks at what the render thread has done with a layer. There's no
+/// present here to hang this on, and missing a turn while busy does no harm.
+const FOLLOW_EVERY: Duration = Duration::from_millis(4);
 
 /// What the row left under the pointer wants done, and whose it is.
 type AfterScrolling = (gpui_kit::SharedString, Box<dyn FnOnce(&mut gpui_kit::App)>);
@@ -290,7 +344,7 @@ pub fn cancel_after_scrolling(id: &gpui_kit::SharedString) {
 
 impl SmoothScroller {
     pub fn new(target: ScrollTarget) -> Self {
-        SmoothScroller { target, state: Rc::default(), in_modal: false, calm_hover: false, layer: None }
+        SmoothScroller { target, motion: Arc::default(), state: Rc::default(), in_modal: false, calm_hover: false, layer: None }
     }
 
     /// Moves the list by moving a layer of what's painted, whenever that gives the same picture
@@ -298,7 +352,18 @@ impl SmoothScroller {
     /// move, which is what [`Self::calm_hover`] sees to.
     pub fn layered(mut self) -> Self {
         debug_assert!(self.calm_hover);
-        self.layer = Some(LayerScrolling { id: ScrollLayerId::new(), outside_stays_right: Rc::default() });
+        let live = LiveScroll::new(self.motion.clone());
+        let follow: Rc<dyn Fn(f32)> = {
+            let (target, live) = (self.target.clone(), live.clone());
+            Rc::new(move |scale| {
+                let moved = live.take_unsynced();
+                if moved != 0 {
+                    target.scroll_by(moved as f32 / scale);
+                }
+                live.set_room(target.top(), target.max_top(), scale);
+            })
+        };
+        self.layer = Some(LayerScrolling { id: ScrollLayerId::new(), outside_stays_right: Rc::default(), live, follow });
         self
     }
 
@@ -309,19 +374,56 @@ impl SmoothScroller {
         }
     }
 
-    /// One step of a layered list's glide, at the start of a frame. Done there and not in a render,
-    /// because the whole point is that no render need happen.
+    /// Keeps a layered list going while it moves, off the main thread if nothing stops that.
     fn tick(&self, layer: &LayerScrolling, view: EntityId, window: &mut Window, cx: &mut App) {
+        (layer.follow)(window.scale_factor());
+        if layer.live.render_driven() {
+            self.follow_render_thread(layer, view, window, cx);
+        } else {
+            self.step_on_this_thread(layer, view, window, cx);
+        }
+    }
+
+    /// The render thread has the movement. All that's left here is to see that there's always a new
+    /// scene coming before that runs out, and to finish up when it's over.
+    fn follow_render_thread(&self, layer: &LayerScrolling, view: EntityId, window: &mut Window, cx: &mut App) {
         let mut state = self.state.borrow_mut();
-        if state.glide.is_active() {
+        // In case the main thread takes over again in mid-glide.
+        state.last_frame = None;
+        state.carry = 0.;
+        let outside_right =
+            layer.outside_stays_right.borrow().as_ref().is_none_or(|check| check(self.target.top()));
+        if !outside_right || layer.live.distance_from_painted() > REBUILD_AFTER {
+            cx.notify(view);
+        }
+        if layer.live.is_active() {
+            SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
+        } else if self.settled(&mut state, layer, view, cx) {
+            return;
+        }
+        drop(state);
+        self.schedule_tick(layer.clone(), view, window, cx);
+    }
+
+    /// One step of a layered list's glide, at the start of a frame, for when moving it takes this
+    /// thread: something's in the way of the render thread doing it, or it can't here. Done there
+    /// and not in a render, because no render need happen.
+    fn step_on_this_thread(&self, layer: &LayerScrolling, view: EntityId, window: &mut Window, cx: &mut App) {
+        let mut state = self.state.borrow_mut();
+        if layer.live.is_active() {
             SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
             let now = Instant::now();
-            let measured = state.last_frame.map_or(FIRST_FRAME, |last| now - last).as_secs_f32();
+            let measured = state.last_frame.map(|last| now - last);
+            if let Some(measured) = measured {
+                let gap = measured.as_secs_f32() * 1000.;
+                state.worst_gap = state.worst_gap.max(gap);
+                state.long_gaps += u32::from(gap > gpui_kit::LONG_GAP_MS);
+                state.steps += 1;
+            }
             state.last_frame = Some(now);
-            let frame = state.clock.tick(measured);
-            let moved = state.glide.step(Duration::from_secs_f32(frame)) + state.carry;
+            let moved = self.motion.step(measured) + state.carry;
             let (whole, rest) = whole_pixels(moved, window.scale_factor());
-            state.carry = if state.glide.is_active() { rest } else { 0. };
+            state.carry = if self.motion.is_active() { rest } else { 0. };
             if whole != 0. {
                 let before = self.target.top();
                 self.target.scroll_by(whole);
@@ -337,36 +439,70 @@ impl SmoothScroller {
         } else {
             state.last_frame = None;
             state.carry = 0.;
-            match SCROLLING_UNTIL.get() {
-                Some(until) if Instant::now() < until => {}
-                Some(_) => {
-                    SCROLLING_UNTIL.set(None);
-                    let after = AFTER_SCROLLING.take();
-                    cx.defer(move |cx| {
-                        if let Some((_, action)) = after {
-                            action(cx);
-                        }
-                    });
-                    // Once more, for real: hover back on, and the hitboxes where the rows are.
-                    cx.notify(view);
-                    state.ticking = false;
-                    return;
-                }
-                None => {
-                    cx.notify(view);
-                    state.ticking = false;
-                    return;
-                }
+            if self.settled(&mut state, layer, view, cx) {
+                return;
             }
         }
         drop(state);
-        self.schedule_tick(layer.clone(), view, window);
+        self.schedule_tick(layer.clone(), view, window, cx);
     }
 
-    fn schedule_tick(&self, layer: LayerScrolling, view: EntityId, window: &Window) {
+    /// The motion's over: once it's been over for long enough, wraps up. Returns if it has.
+    fn settled(&self, state: &mut State, layer: &LayerScrolling, view: EntityId, cx: &mut App) -> bool {
+        match SCROLLING_UNTIL.get() {
+            Some(until) if Instant::now() < until => return false,
+            Some(_) => {
+                SCROLLING_UNTIL.set(None);
+                let (rebuilds, moves, refused, worst_draw) = gpui_kit::frame_stats::take_scroll();
+                let live = layer.live.take_stats();
+                let steps = state.steps + live.frames;
+                if steps > 0 {
+                    tracing::info!(
+                        target: "rustcord::perf",
+                        steps,
+                        moves,
+                        rebuilds,
+                        refused,
+                        long_gaps = state.long_gaps + live.long_gaps,
+                        worst_gap_ms = state.worst_gap.max(live.worst_gap_ms),
+                        worst_rebuild_ms = worst_draw as f32 / 1e6,
+                        render_thread_frames = live.frames,
+                        handed_over = live.handed_over,
+                        ran_out = live.ran_out,
+                        held_frames = live.held_frames,
+                        least_margin_px = live.least_margin_px.unwrap_or(-1.),
+                        "scroll"
+                    );
+                }
+                (state.worst_gap, state.long_gaps, state.steps) = (0., 0, 0);
+                let after = AFTER_SCROLLING.take();
+                cx.defer(move |cx| {
+                    if let Some((_, action)) = after {
+                        action(cx);
+                    }
+                });
+            }
+            None => {}
+        }
+        // Once more, for real: hover back on, and the hitboxes where the rows are.
+        cx.notify(view);
+        state.ticking = false;
+        true
+    }
+
+    fn schedule_tick(&self, layer: LayerScrolling, view: EntityId, window: &Window, cx: &App) {
         self.state.borrow_mut().ticking = true;
         let this = self.clone();
-        window.on_next_frame(move |window, cx| this.tick(&layer, view, window, cx));
+        if layer.live.render_driven() {
+            window
+                .spawn(cx, async move |cx| {
+                    cx.background_executor().timer(FOLLOW_EVERY).await;
+                    cx.update(|window, cx| this.tick(&layer, view, window, cx)).ok();
+                })
+                .detach();
+        } else {
+            window.on_next_frame(move |window, cx| this.tick(&layer, view, window, cx));
+        }
     }
 
     pub fn calm_hover(mut self) -> Self {
@@ -383,16 +519,27 @@ impl SmoothScroller {
     /// over its bounds and advances the glide each frame.
     /// Starts gliding `pixels` down the content (up, if negative).
     pub fn glide_by(&self, pixels: f32) {
-        self.state.borrow_mut().glide.add(pixels);
+        self.motion.state().glide.add(pixels);
+        if let Some(layer) = &self.layer {
+            layer.live.wake();
+        }
     }
 
     pub fn is_gliding(&self) -> bool {
-        self.state.borrow().glide.is_active()
+        match &self.layer {
+            Some(layer) => layer.live.is_active(),
+            None => self.motion.is_active(),
+        }
     }
 
-    /// Drops any glide under way: the view has been put somewhere else.
+    /// Drops any glide under way: the view has been put somewhere else. What's been shown of it
+    /// goes to the list first, so that it can't land on top of the new place later.
     pub fn stop(&self) {
-        self.state.borrow_mut().glide = Glide::default();
+        self.motion.state().glide = Glide::default();
+        if let Some(layer) = &self.layer {
+            layer.live.drop_waiting();
+            (layer.follow)(layer.live.scale());
+        }
     }
 
     pub fn layer(&self) -> impl IntoElement {
@@ -404,14 +551,15 @@ impl SmoothScroller {
             move |_, window, cx| {
                 if let Some(layer) = stepper.layer.clone() {
                     stepper.target.set_scroll_layer(ScrollLayerSpec { id: layer.id, overscan: px(LAYER_OVERSCAN) });
-                    let moving = stepper.state.borrow().glide.is_active() || SCROLLING_UNTIL.get().is_some();
+                    window.keep_scroll_layer_live(layer.id, &layer.live, &layer.follow);
+                    let moving = layer.live.is_active() || SCROLLING_UNTIL.get().is_some();
                     if moving && !stepper.state.borrow().ticking {
-                        stepper.schedule_tick(layer, window.current_view(), window);
+                        stepper.schedule_tick(layer, window.current_view(), window, cx);
                     }
                     return;
                 }
                 if stepper.calm_hover {
-                    if stepper.state.borrow().glide.is_active() {
+                    if stepper.motion.is_active() {
                         SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
                     } else if let Some(until) = SCROLLING_UNTIL.get() {
                         if Instant::now() < until {
@@ -430,14 +578,13 @@ impl SmoothScroller {
                     }
                 }
                 let mut state = stepper.state.borrow_mut();
-                if state.glide.is_active() {
+                if stepper.motion.is_active() {
                     let now = Instant::now();
-                    let measured = state.last_frame.map_or(FIRST_FRAME, |last| now - last).as_secs_f32();
+                    let measured = state.last_frame.map(|last| now - last);
                     state.last_frame = Some(now);
-                    let frame = state.clock.tick(measured);
-                    let moved = state.glide.step(Duration::from_secs_f32(frame)) + state.carry;
+                    let moved = stepper.motion.step(measured) + state.carry;
                     let (whole, rest) = whole_pixels(moved, window.scale_factor());
-                    state.carry = if state.glide.is_active() { rest } else { 0. };
+                    state.carry = if stepper.motion.is_active() { rest } else { 0. };
                     if whole != 0. {
                         stepper.target.scroll_by(whole);
                     }
@@ -465,10 +612,13 @@ impl SmoothScroller {
                         crate::profile_card::note_wheel(lines.y.abs(), cx);
                     }
                     if this.calm_hover {
+                        if SCROLLING_UNTIL.get().is_none() {
+                            gpui_kit::frame_stats::take_scroll();
+                        }
                         SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
                     }
                     let ticking = this.state.borrow().ticking;
-                    this.state.borrow_mut().glide.add(-lines.y * LINE_PX);
+                    this.glide_by(-lines.y * LINE_PX);
                     // This view alone: a window refresh redraws the other lists too. If a layer
                     // is moving already then the next step takes this along.
                     if this.layer.is_none() || !ticking {
@@ -627,5 +777,348 @@ mod tests {
         glide.add(300.0);
         assert!((glide.step(Duration::from_secs(1)) - 300.0).abs() < 1e-3);
         assert!(!glide.is_active());
+    }
+}
+
+/// The render thread's side of a layer, with stand-ins for the threads: every "frame" here is one
+/// it'd make, and every "rebuild" is what the main thread does around a draw.
+#[cfg(test)]
+mod live_layer_tests {
+    use super::*;
+    use gpui_kit::{Bounds, ContentMask, EntityId, LiveLayer, Quad, ScaledPixels, Scene, point, size};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const FRAME: Duration = Duration::from_micros(5_555);
+
+    /// Moves a set number of pixels a frame, for as many frames as it's told.
+    #[derive(Default)]
+    struct Steady {
+        left: AtomicU32,
+        per_frame: Mutex<f32>,
+        measured: Mutex<Vec<Option<Duration>>>,
+    }
+
+    impl Steady {
+        fn run(&self, frames: u32, per_frame: f32) {
+            self.left.store(frames, Ordering::SeqCst);
+            *self.per_frame.lock().unwrap() = per_frame;
+        }
+    }
+
+    impl ScrollMotion for Steady {
+        fn step(&self, measured: Option<Duration>) -> f32 {
+            self.measured.lock().unwrap().push(measured);
+            if self.left.load(Ordering::SeqCst) == 0 {
+                return 0.;
+            }
+            self.left.fetch_sub(1, Ordering::SeqCst);
+            *self.per_frame.lock().unwrap()
+        }
+
+        fn is_active(&self) -> bool {
+            self.left.load(Ordering::SeqCst) > 0
+        }
+    }
+
+    fn live(motion: &Arc<Steady>, top: f32, max: f32) -> Arc<LiveScroll> {
+        let live = LiveScroll::new(motion.clone());
+        live.set_render_waker(Some(Arc::new(|| {})));
+        live.set_may_move(true);
+        live.set_room(top, max, 1.);
+        live
+    }
+
+    fn at(frame: u32) -> Instant {
+        // A fixed start: only the differences between these are ever looked at.
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *START.get_or_init(Instant::now) + FRAME * frame
+    }
+
+    #[test]
+    fn moves_by_itself_and_the_list_catches_up_exactly_once() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        motion.run(10, 7.);
+        for frame in 0..4 {
+            let step = live.advance(at(frame), 0, -600, 600);
+            assert_eq!(step.moved, 7 * (frame as i64 + 1));
+            assert!(step.active);
+        }
+        assert_eq!(live.take_unsynced(), 28);
+        assert_eq!(live.take_unsynced(), 0, "the same movement must not be applied twice");
+        for frame in 4..10 {
+            live.advance(at(frame), 0, -600, 600);
+        }
+        assert_eq!(live.take_unsynced(), 42);
+        assert!(!live.is_active());
+    }
+
+    #[test]
+    fn a_scene_painted_mid_glide_shows_at_the_live_place() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        motion.run(100, 10.);
+        let clip = bounds(0., 400.);
+        let painted = bounds(-600., 1600.);
+
+        // What's on screen, as a place in the list: where the shown scene was painted and how
+        // far it's been moved since. The old scene goes on showing for all of a slow rebuild.
+        let mut list_top = 1000.;
+        let mut scene_top = list_top;
+        let mut scene = layered_scene(&live, 0, clip, painted);
+        let mut rebuilding = None;
+        let mut shown = Vec::new();
+        for frame in 0..100u32 {
+            if frame % 25 == 3 {
+                list_top += live.take_unsynced() as f32;
+                live.set_room(list_top, 5000., 1.);
+                let tag = live.mark_painted();
+                rebuilding = Some((frame + 7, layered_scene(&live, tag, clip, painted), list_top));
+            }
+            if rebuilding.as_ref().is_some_and(|(ready, ..)| *ready == frame) {
+                (_, scene, scene_top) = rebuilding.take().unwrap();
+            }
+            scene.advance_live_layers(at(frame));
+            shown.push(scene_top - shown_offset(&scene));
+        }
+        for pair in shown.windows(2) {
+            assert!((pair[1] - pair[0] - 10.).abs() < 0.01, "stepped {pair:?}");
+        }
+        assert_eq!(live.take_stats().handed_over, 4);
+    }
+
+    /// How far the layer's been moved in what would be drawn.
+    fn shown_offset(scene: &Scene) -> f32 {
+        let mut composed = Scene::default();
+        scene.copy_primitives_into(&mut composed);
+        composed.compose_scroll_layers();
+        composed.quads[0].bounds.origin.y.0 - PAINTED_TOP
+    }
+
+    const PAINTED_TOP: f32 = -600.;
+
+    fn bounds(top: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds { origin: point(ScaledPixels(0.), ScaledPixels(top)), size: size(ScaledPixels(100.), ScaledPixels(height)) }
+    }
+
+    fn layered_scene(live: &Arc<LiveScroll>, tag: i64, clip: Bounds<ScaledPixels>, painted: Bounds<ScaledPixels>) -> Scene {
+        let mut scene = Scene::default();
+        scene.begin_live_scroll_layer(
+            ScrollLayerId::new(),
+            EntityId::from(1u64),
+            clip,
+            painted,
+            Some(LiveLayer::new(live.clone(), tag)),
+        );
+        // All of what's painted, so that some of it is always in view.
+        scene.insert_primitive(Quad { bounds: painted, content_mask: ContentMask { bounds: painted }, ..Default::default() });
+        scene.end_scroll_layer();
+        scene
+    }
+
+    #[test]
+    fn composing_moves_the_primitives_by_the_live_distance() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        motion.run(3, 10.);
+        let mut scene = layered_scene(&live, 0, bounds(0., 400.), bounds(-600., 1600.));
+        for frame in 0..3 {
+            scene.advance_live_layers(at(frame));
+        }
+        assert_eq!(shown_offset(&scene), -30.);
+    }
+
+    #[test]
+    fn running_out_of_rows_holds_at_the_edge_and_loses_nothing() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        motion.run(10, 30.);
+        // Room for 100 pixels of the 300 coming.
+        for frame in 0..3 {
+            let step = live.advance(at(frame), 0, -600, 100);
+            assert!(step.moved <= 90);
+        }
+        let step = live.advance(at(3), 0, -600, 100);
+        assert_eq!(step.moved, 100, "goes right up to the edge");
+        assert!(step.active);
+        let left = motion.left.load(Ordering::SeqCst);
+        for frame in 4..50 {
+            let step = live.advance(at(frame), 0, -600, 100);
+            assert_eq!(step.moved, 100, "holds there");
+            assert!(step.active);
+        }
+        assert_eq!(motion.left.load(Ordering::SeqCst), left, "the motion waits too");
+
+        // A new scene with more painted: it carries on from there and gets all the way.
+        let mut frame = 50;
+        let mut step;
+        loop {
+            step = live.advance(at(frame), 100, -500, 700);
+            frame += 1;
+            if !step.active {
+                break;
+            }
+        }
+        assert_eq!(step.moved, 300);
+        let stats = live.take_stats();
+        assert_eq!(stats.ran_out, 1, "one run out, however long it lasted");
+        assert_eq!(stats.held_frames, 47);
+    }
+
+    #[test]
+    fn the_motion_lost_no_time_while_held() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        motion.run(5, 30.);
+        live.advance(at(0), 0, -600, 40);
+        live.advance(at(1), 0, -600, 40);
+        live.advance(at(500), 0, -600, 40);
+        live.advance(at(501), 40, -560, 640);
+        let measured = motion.measured.lock().unwrap();
+        assert_eq!(*measured.last().unwrap(), Some(FRAME), "picks up with one frame's time");
+    }
+
+    #[test]
+    fn stops_at_the_end_of_the_list_and_turning_back_starts_there() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 1020.);
+        motion.run(5, 10.);
+        for frame in 0..5 {
+            let step = live.advance(at(frame), 0, -600, 600);
+            assert!(step.moved <= 20);
+        }
+        assert_eq!(live.moved(), 20);
+        assert_eq!(live.take_stats().ran_out, 0, "the list's end isn't running out of rows");
+        motion.run(1, -10.);
+        assert_eq!(live.advance(at(5), 0, -600, 600).moved, 10);
+    }
+
+    #[test]
+    fn sub_pixel_movement_waits_for_a_whole_pixel_and_scale_counts() {
+        let motion = Arc::new(Steady::default());
+        let live = LiveScroll::new(motion.clone());
+        live.set_render_waker(Some(Arc::new(|| {})));
+        live.set_may_move(true);
+        live.set_room(1000., 5000., 1.5);
+        motion.run(10, 0.4);
+        let mut last = 0;
+        for frame in 0..9 {
+            last = live.advance(at(frame), 0, -900, 900).moved;
+        }
+        // 3.6 logical pixels at 1.5 is 5.4 device pixels, rounded each step as it's built up.
+        assert_eq!(last, 5);
+        let unsynced = live.take_unsynced();
+        assert_eq!(unsynced, 5);
+    }
+
+    #[test]
+    fn nothing_moves_unless_it_may() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        live.set_may_move(false);
+        motion.run(5, 10.);
+        let step = live.advance(at(0), 0, -600, 600);
+        assert!(!step.active && !step.changed);
+        assert_eq!(step.moved, 0);
+        assert_eq!(motion.left.load(Ordering::SeqCst), 5, "the main thread has it");
+    }
+
+    #[test]
+    fn may_not_move_without_a_render_thread_to_do_it() {
+        let live = LiveScroll::new(Arc::new(Steady::default()));
+        live.set_may_move(true);
+        assert!(!live.render_driven());
+    }
+
+    #[test]
+    fn gaps_are_between_frames_presented() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        motion.run(4, 10.);
+        live.presented(at(0));
+        live.presented(at(1));
+        live.presented(at(3));
+        let stats = live.take_stats();
+        assert_eq!(stats.frames, 2);
+        assert_eq!(stats.long_gaps, 1);
+        assert!((stats.worst_gap_ms - 11.11).abs() < 0.1, "{}", stats.worst_gap_ms);
+        // A later glide doesn't count the wait since the one before.
+        motion.run(0, 0.);
+        live.presented(at(4));
+        motion.run(2, 10.);
+        live.presented(at(100));
+        assert_eq!(live.take_stats().long_gaps, 0);
+    }
+
+    #[test]
+    fn calling_it_off_while_held_ends_it() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        motion.run(3, 30.);
+        live.advance(at(0), 0, -600, 40);
+        live.advance(at(1), 0, -600, 40);
+        assert!(live.is_active());
+        motion.run(0, 0.);
+        live.drop_waiting();
+        assert!(!live.is_active());
+        let step = live.advance(at(2), 0, -600, 40);
+        assert!(!step.active);
+        assert_eq!(step.moved, 40);
+        assert_eq!(live.take_unsynced(), 40, "what was shown still counts");
+    }
+
+    #[test]
+    fn a_margin_is_recorded_toward_the_way_it_went() {
+        let motion = Arc::new(Steady::default());
+        let live = live(&motion, 1000., 5000.);
+        motion.run(2, 100.);
+        live.advance(at(0), 0, -600, 600);
+        live.advance(at(1), 0, -600, 600);
+        assert_eq!(live.take_stats().least_margin_px, Some(400.));
+    }
+
+    /// The real glide, moved on the render thread, lands every notch where it did on the main
+    /// thread, in the same steps.
+    #[test]
+    fn the_glide_feels_the_same_from_the_render_thread() {
+        let scale = 1.5;
+        let run = |live_side: bool| {
+            let motion = Arc::new(Motion::default());
+            let live = LiveScroll::new(motion.clone());
+            live.set_render_waker(Some(Arc::new(|| {})));
+            live.set_may_move(true);
+            live.set_room(1000., 50_000., scale);
+            motion.state().glide.add(300.);
+            let (mut carry, mut total, mut last) = (0., 0., None);
+            let mut steps = Vec::new();
+            let mut frame = 0;
+            while motion.is_active() {
+                let now = at(frame);
+                if frame == 12 {
+                    motion.state().glide.add(150.);
+                }
+                let shown = if live_side {
+                    live.advance(now, 0, -100_000, 100_000).moved as f32 / scale
+                } else {
+                    let measured = last.map(|last| now - last);
+                    last = Some(now);
+                    let moved = motion.step(measured) + carry;
+                    let (whole, rest) = whole_pixels(moved, scale);
+                    carry = if motion.is_active() { rest } else { 0. };
+                    total += whole;
+                    total
+                };
+                steps.push(shown);
+                frame += 1;
+                assert!(frame < 1000);
+            }
+            steps
+        };
+        let (here, there) = (run(false), run(true));
+        assert_eq!(here.len(), there.len());
+        for (a, b) in here.iter().zip(&there) {
+            assert!((a - b).abs() <= 1. / scale, "{here:?}\n{there:?}");
+        }
+        assert!((there.last().unwrap() - 450.).abs() <= 1. / scale);
     }
 }

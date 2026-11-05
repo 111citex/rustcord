@@ -963,6 +963,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn supports_scroll_layers(&self) -> bool {
         false
     }
+    /// Rustcord: wakes the render thread to move scroll layers by itself, if it can pace that
+    /// on its own. `None` leaves moving them to the main thread.
+    fn scroll_compositor_waker(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

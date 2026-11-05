@@ -26,6 +26,22 @@ pub static ATLAS_USED: AtomicU64 = AtomicU64::new(0);
 /// Goes up when the atlas is emptied: images have to be decoded again.
 pub static ATLAS_RESETS: AtomicU64 = AtomicU64::new(0);
 
+/// For one scroll, from the last [`take_scroll`]: rebuilds, layer moves, refused moves, and the
+/// longest rebuild.
+pub static SCROLL_REBUILDS: AtomicU64 = AtomicU64::new(0);
+pub static SCROLL_MOVES: AtomicU64 = AtomicU64::new(0);
+pub static SCROLL_REFUSED: AtomicU64 = AtomicU64::new(0);
+pub static SCROLL_WORST_DRAW_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn take_scroll() -> (u64, u64, u64, u64) {
+    (
+        SCROLL_REBUILDS.swap(0, Relaxed),
+        SCROLL_MOVES.swap(0, Relaxed),
+        SCROLL_REFUSED.swap(0, Relaxed),
+        SCROLL_WORST_DRAW_NS.swap(0, Relaxed),
+    )
+}
+
 pub fn add(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Relaxed);
 }

@@ -148,6 +148,8 @@ pub struct ActivityCard {
     pub start_ms: Option<u64>,
     /// Large art, when it can be turned into a URL.
     pub image: Option<String>,
+    /// The game's or app's id on Discord, which knows its icon.
+    pub application_id: Option<String>,
 }
 
 /// The first game/music activity in `activities` (not custom statuses).
@@ -165,6 +167,7 @@ pub fn activity_card(activities: &[Value]) -> Option<ActivityCard> {
         details: a["details"].as_str().filter(|d| !d.is_empty()).map(one_line),
         start_ms: a["timestamps"]["start"].as_u64(),
         image,
+        application_id: a["application_id"].as_str().map(str::to_string),
     })
 }
 

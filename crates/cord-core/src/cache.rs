@@ -775,6 +775,10 @@ impl Cache {
 
     /// Whether the user may ping @everyone, @here and any role in `channel`.
     pub fn can_mention_everyone(&self, channel: Id) -> bool {
+        // Anyone in a group may: there are no permissions there.
+        if self.channels.get(&channel).is_some_and(|c| c.kind == crate::model::ChannelKind::GroupDm) {
+            return true;
+        }
         self.my_permissions(channel).is_some_and(|p| p & permissions::MENTION_EVERYONE != 0)
     }
 

@@ -132,6 +132,8 @@ pub struct RailDm {
     pub id: Id,
     pub name: String,
     pub picture: String,
+    /// A group with no picture of its own: two of its people, as Discord stacks them.
+    pub faces: Vec<String>,
     pub target: String,
     pub mentions: u32,
 }
@@ -153,8 +155,26 @@ fn dm_alerts(cache: &Cache) -> Vec<RailDm> {
                     cdn::avatar_url(id, hash.as_deref(), 64)
                 }
             },
+            faces: group_faces(cache, channel),
             target: nav::channel_path(channel),
             mentions: cache.mentions(channel.id),
+        })
+        .collect()
+}
+
+/// The first two people of a group without its own picture, which Discord shows overlapping.
+/// Empty for anything else.
+pub fn group_faces(cache: &Cache, channel: &cord_core::model::Channel) -> Vec<String> {
+    if channel.icon.is_some() || channel.recipient_ids.len() < 2 {
+        return Vec::new();
+    }
+    channel
+        .recipient_ids
+        .iter()
+        .take(2)
+        .map(|id| {
+            let hash = cache.user(*id).and_then(|u| u.avatar.clone());
+            cdn::avatar_url(*id, hash.as_deref(), 64)
         })
         .collect()
 }
@@ -229,6 +249,9 @@ pub struct DmRow {
     /// The other person, in a one-to-one DM.
     pub user: Option<Id>,
     pub bot: bool,
+    pub verified_bot: bool,
+    /// Discord's own account.
+    pub official: bool,
     pub friend: bool,
     pub label: String,
     pub path: String,
@@ -236,6 +259,7 @@ pub struct DmRow {
     pub avatar_url: String,
     pub subtitle: String,
     pub mentions: u32,
+    pub unread: bool,
     /// A one-to-one DM's status mark and what's under the name.
     pub status: Option<Status>,
     pub mobile: bool,
@@ -246,6 +270,8 @@ pub struct DmRow {
     pub tag: Option<(String, Option<String>)>,
     /// A group DM's own picture.
     pub group_icon: Option<String>,
+    /// See [`group_faces`].
+    pub faces: Vec<String>,
 }
 
 /// One line of the channel column.
@@ -303,6 +329,8 @@ pub fn build(cache: &Cache, location: Location, collapsed: &Collapsed) -> Sideba
                     nameplate_video: person.and_then(|u| u.nameplate_video_url()),
                     user: person.map(|u| u.id),
                     bot: person.is_some_and(|u| u.bot),
+                    verified_bot: person.is_some_and(|u| u.is_verified_bot()),
+                    official: person.is_some_and(|u| u.is_discord()),
                     friend: person.is_some_and(|u| cache.is_friend(u.id)),
                     status: person.map(|_| presence.map_or(Status::Offline, |p| p.status)),
                     mobile: presence.is_some_and(|p| p.mobile),
@@ -311,6 +339,7 @@ pub fn build(cache: &Cache, location: Location, collapsed: &Collapsed) -> Sideba
                     decoration: person.and_then(|u| u.decoration_url()),
                     font: person.and_then(|u| crate::name_fonts::family(u.extras.display_name_styles.as_ref()?.font_id)),
                     tag: person.and_then(|u| u.server_tag().map(|(t, b)| (t.to_string(), b))),
+                    faces: group_faces(cache, channel),
                     group_icon: channel.icon.as_ref().map(|hash| format!("{}/channel-icons/{}/{hash}.png?size=64", cdn::CDN, channel.id)),
                     id: channel.id,
                     label: nav::channel_label(cache, channel),
@@ -323,6 +352,7 @@ pub fn build(cache: &Cache, location: Location, collapsed: &Collapsed) -> Sideba
                     },
                     subtitle: dm_subtitle(cache, channel),
                     mentions: cache.mentions(channel.id),
+                    unread: cache.is_unread(channel.id),
                 }));
             }
             ("Direct Messages".to_string(), false)

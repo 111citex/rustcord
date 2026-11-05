@@ -28,6 +28,46 @@ const CLOSE_AFTER_NOTCHES: f32 = 5.;
 const BANNER: f32 = 105.;
 const AVATAR: f32 = 80.;
 
+thread_local! {
+    /// Each game's icon, fetched once. `None` is none, or not here yet.
+    static APP_ICONS: std::cell::RefCell<std::collections::HashMap<String, Option<String>>> = std::cell::RefCell::default();
+}
+
+/// `app`'s icon if it's known, and otherwise goes to find out.
+fn app_icon(app: String, core: std::sync::Arc<cord_core::Core>, cx: &mut Context<ProfileCard>) -> Option<String> {
+    if let Some(known) = APP_ICONS.with_borrow(|icons| icons.get(&app).cloned()) {
+        return known;
+    }
+    APP_ICONS.with_borrow_mut(|icons| icons.insert(app.clone(), None));
+    cx.spawn(async move |card, cx| {
+        let Ok(icon) = core.application_icon(app.clone()).await else { return };
+        APP_ICONS.with_borrow_mut(|icons| icons.insert(app, icon));
+        let _ = card.update(cx, |_, cx| cx.notify());
+    })
+    .detach();
+    None
+}
+
+/// WCAG's contrast between two colours, from 1 (the same) to 21.
+fn contrast(a: Hsla, b: Hsla) -> f32 {
+    let light = |c: Hsla| {
+        let c = gpui_kit::Rgba::from(c);
+        let part = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        0.2126 * part(c.r) + 0.7152 * part(c.g) + 0.0722 * part(c.b)
+    };
+    let (a, b) = (light(a), light(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// A button in the profile's own colour, unless that would vanish into the card behind it,
+/// then in its text colour. Returns the fill, and whichever of white or black reads on it.
+fn button_colors(main: Hsla, surface: Hsla, text: Hsla) -> (Hsla, Hsla) {
+    const STANDS_OUT: f32 = 1.6;
+    let fill = if contrast(main, surface) < STANDS_OUT { text } else { main };
+    let on_fill = if contrast(gpui_kit::white(), fill) >= contrast(gpui_kit::black(), fill) { gpui_kit::white() } else { gpui_kit::black() };
+    (fill, on_fill)
+}
+
 /// The full profile's right side.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -108,7 +148,8 @@ pub struct ProfileCard {
     opening: usize,
     /// The avatar was clicked: the whole profile, over the window.
     full: bool,
-    tab: Tab,
+    /// The tab picked, if any: otherwise their activity, or else mutual friends.
+    tab: Option<Tab>,
     /// The full profile's right side.
     right_scroll: gpui_kit::ScrollHandle,
     left_scroll: gpui_kit::ScrollHandle,
@@ -197,7 +238,7 @@ impl ProfileCard {
         let right_scroller = crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(right_scroll.clone())).in_modal();
         let card = cx.entity().downgrade();
         cx.set_global(CardWatch { card, notches: 0., last: std::time::Instant::now() });
-        ProfileCard { toggled: false, roles_full: Rc::default(), roles_closed: None, closing: None, _closing: None, effect: None, effect_began: Rc::default(), left_scroll, left_scroller, right_scroll, right_scroller, opening, full: false, tab: Tab::Friends, services, user, guild, position, beside, load: cached.map_or(Load::Loading, Load::Loaded), bio_cache: Rc::default(), frame, roles_open: false, focus, _fetch: fetch }
+        ProfileCard { toggled: false, roles_full: Rc::default(), roles_closed: None, closing: None, _closing: None, effect: None, effect_began: Rc::default(), left_scroll, left_scroller, right_scroll, right_scroller, opening, full: false, tab: None, services, user, guild, position, beside, load: cached.map_or(Load::Loading, Load::Loaded), bio_cache: Rc::default(), frame, roles_open: false, focus, _fetch: fetch }
     }
 }
 
@@ -515,7 +556,7 @@ impl Render for ProfileCard {
                                 .cursor_pointer()
                                 .hover(|d| d.underline())
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.tab = tab;
+                                    this.tab = Some(tab);
                                     this.open_full();
                                     cx.notify();
                                 }))
@@ -815,10 +856,11 @@ impl ProfileCard {
     /// has room for and more, with the people and servers you share beside it.
     /// Under the name: Message and the friend button, the way round that fits whether
     /// they're a friend, then the "…" menu. The main button takes their profile's color.
-    fn full_actions(&self, card: gpui_kit::WeakEntity<Self>, user: Id, name: &str, main: Hsla, text: Hsla, cx: &gpui_kit::App) -> AnyElement {
+    fn full_actions(&self, card: gpui_kit::WeakEntity<Self>, user: Id, name: &str, main: Hsla, surface: Hsla, text: Hsla, cx: &gpui_kit::App) -> AnyElement {
         use crate::context_menu::{self as menu, Entry};
         use gpui_kit::component::Icon;
         let friend = self.services.store.read(cx).cache().is_friend(user);
+        let (fill, on_fill) = button_colors(main, surface, text);
         let wide = |id: &'static str, icon: Icon, label: &'static str| {
             h_flex()
                 .id(id)
@@ -827,8 +869,8 @@ impl ProfileCard {
                 .gap(u(6.))
                 .items_center()
                 .rounded(u(8.))
-                .bg(main)
-                .text_color(gpui_kit::white())
+                .bg(fill)
+                .text_color(on_fill)
                 .text_size(u(14.))
                 .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
@@ -1034,7 +1076,7 @@ impl ProfileCard {
                                 })))
                             }),
                     )
-                    .when(!is_me, |d| d.child(self.full_actions(card_view.clone(), user_id, &display_for_menu, themed.map(|t| rgb_color(t.0)).unwrap_or(blurple), card_text, cx)))
+                    .when(!is_me, |d| d.child(self.full_actions(card_view.clone(), user_id, &display_for_menu, themed.map(|t| rgb_color(t.0)).unwrap_or(blurple), ring, card_text, cx)))
                     .when(matches!(self.load, Load::Private), |d| d.child(div().text_size(u(14.)).text_color(muted).child("This profile is private.")))
                     .children(bio)
                     .when_some(created, |d, v| d.child(fact("Member Since", v)))
@@ -1087,7 +1129,14 @@ impl ProfileCard {
         // Over the column, as on the card.
         let left = left.on_hover(crate::transition::track_pointer(self.effect_hover_id())).children(self.effect_layer(12.));
 
-        let tab = self.tab;
+        let activity = self.services.store.read(cx).cache().presence(user_id).and_then(|p| p.activity.clone());
+        // Also what's left when their game ended while looking at it.
+        let tab = match self.tab {
+            Some(Tab::Activity) | None if activity.is_some() => Tab::Activity,
+            Some(Tab::Activity) | None => Tab::Friends,
+            Some(tab) => tab,
+        };
+        let activity_icon = activity.as_ref().and_then(|a| a.image.clone().or_else(|| a.application_id.clone().and_then(|app| app_icon(app, self.services.core.clone(), cx))));
         let friends_list = profile.as_ref().filter(|_| !is_me).map(|p| p.mutual_friend_list.clone()).unwrap_or_default();
         let servers_list = profile.as_ref().filter(|_| !is_me).and_then(|p| p.mutual_guilds.clone()).unwrap_or_default();
         let (friend_count, server_count) = (friends_list.len(), servers_list.len());
@@ -1104,15 +1153,12 @@ impl ProfileCard {
                 .when(on, |d| d.child(div().absolute().bottom_0().left_0().right_0().h(u(2.)).bg(card_text)))
                 .when(!on, |d| d.text_color(muted))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.tab = which;
+                    this.tab = Some(which);
                     cx.notify();
                 }))
                 .child(label)
         };
         // Nobody has anything mutual with themselves.
-        let activity = self.services.store.read(cx).cache().presence(user_id).and_then(|p| p.activity.clone());
-        // Their game ended while looking at it: nothing left to show there.
-        let tab = if tab == Tab::Activity && activity.is_none() { Tab::Friends } else { tab };
         let tabs = if is_me {
             h_flex()
         } else {
@@ -1140,7 +1186,23 @@ impl ProfileCard {
                         .gap(u(12.))
                         .p(u(8.))
                         .items_center()
-                        .when_some(a.image.clone(), |d, url| d.child(img(url).size(u(64.)).flex_shrink_0().rounded(u(8.))))
+                        .child(match activity_icon.clone() {
+                            Some(url) => img(url).size(u(64.)).flex_shrink_0().rounded(u(8.)).into_any_element(),
+                            // No art anywhere: its first letter, in the profile's colours.
+                            None => div()
+                                .size(u(64.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(u(8.))
+                                .bg(card_text.opacity(0.1))
+                                .text_color(card_text)
+                                .text_size(u(24.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(a.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default())
+                                .into_any_element(),
+                        })
                         .child(
                             v_flex()
                                 .min_w_0()
@@ -1205,6 +1267,14 @@ impl ProfileCard {
                         .into_any_element()
                 })
                 .collect(),
+        };
+        // Only once their profile's here: until then, nobody knows.
+        let nothing_mutual = rows.is_empty() && profile.is_some() && !is_me;
+        let rows = if nothing_mutual {
+            let line = if tab == Tab::Servers { "You have no mutual servers with this user" } else { "You have no mutual friends with this user" };
+            vec![div().w_full().p(u(8.)).text_size(u(14.)).text_color(muted).child(line).into_any_element()]
+        } else {
+            rows
         };
         let viewport = window.viewport_size();
         let smooth = self.services.settings.read(cx).get().smooth_scrolling;
@@ -1341,6 +1411,7 @@ fn no_op_shared(parsed: Rc<RefCell<crate::markdown_view::ParseCache>>) -> crate:
         poll_ui: Rc::default(),
         in_card: false,
         inert: false,
+        emoji_cap: None,
         remeasure: Rc::new(|_, _| {}),
         vote: Rc::new(|_, _, _| {}),
         revealed: Rc::default(),
@@ -1364,6 +1435,23 @@ fn placeholder_message() -> cord_core::model::Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_button_stays_visible_on_any_profile() {
+        let (near_white, near_black) = (rgb_color(0xf5f5f5), rgb_color(0x101010));
+        // Its colour is the card's: takes the text colour instead, with a readable label.
+        let (fill, label) = button_colors(rgb_color(0xffffff), near_white, near_black);
+        assert_eq!(fill, near_black);
+        assert_eq!(label, gpui_kit::white());
+        // A light colour on a dark card keeps its colour, with a dark label.
+        let (fill, label) = button_colors(near_white, near_black, near_white);
+        assert_eq!(fill, near_white);
+        assert_eq!(label, gpui_kit::black());
+        for (main, surface, text) in [(0xffffff, 0xf5f5f5, 0x101010), (0x5865f2, 0x101010, 0xf5f5f5), (0xffe000, 0x202020, 0xffffff)] {
+            let (fill, label) = button_colors(rgb_color(main), rgb_color(surface), rgb_color(text));
+            assert!(contrast(fill, label) >= 4.5, "{main:x}");
+        }
+    }
 
     fn role(id: u64, name: &str, color: u32, position: i32) -> Role {
         Role { id: Id(id), name: name.into(), color, position, permissions: 0, hoist: false, icon: None, unicode_emoji: None, colors: None, mentionable: false }

@@ -583,6 +583,8 @@ impl WaylandWindowState {
             // say so from `draw`. This wakes the loop, see `render_feedback_fired`.
             let frame_ping = globals.frame_ping.clone();
             renderer.set_feedback_waker(Box::new(move || frame_ping.ping()));
+            // And it hears about frames for itself, for when this thread is too busy to tell it.
+            renderer.set_frame_pacer(Box::new(super::frame_pacer::WaylandFramePacer::new(&surface)));
             renderer
         };
 
@@ -1968,6 +1970,10 @@ impl PlatformWindow for WaylandWindow {
 
     fn supports_scroll_layers(&self) -> bool {
         true
+    }
+
+    fn scroll_compositor_waker(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+        self.borrow().renderer.scroll_compositor_waker()
     }
 
     fn draw(&self, scene: &Scene) {

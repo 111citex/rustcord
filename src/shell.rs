@@ -331,7 +331,11 @@ impl SidePane {
                 dm.mentions,
                 dm.name.clone().into(),
                 (clear, idle_fg, clear, idle_fg),
-                img(dm.picture.clone()).size(u(RAIL_ICON)).object_fit(ObjectFit::Cover).rounded_full().into_any_element(),
+                if dm.faces.len() == 2 {
+                    stacked_faces(&dm.faces, RAIL_ICON, theme.sidebar)
+                } else {
+                    img(dm.picture.clone()).size(u(RAIL_ICON)).object_fit(ObjectFit::Cover).rounded_full().into_any_element()
+                },
             )
             .on_click(move |_, _, cx| navigate(&router, target.clone(), cx))
             // Fades in as it arrives; once per DM.
@@ -730,6 +734,7 @@ impl SidePane {
             let active = location.channel == Some(dm.id);
             let avatar: AnyElement = match (&dm.group_icon, dm.group) {
                 (Some(url), _) => img(url.clone()).size(u(32.)).flex_shrink_0().rounded_full().object_fit(ObjectFit::Cover).into_any_element(),
+                (None, true) if dm.faces.len() == 2 => stacked_faces(&dm.faces, 32., theme.sidebar),
                 (None, true) => div()
                     .size(u(32.))
                     .flex_shrink_0()
@@ -750,13 +755,16 @@ impl SidePane {
                             .absolute()
                             .right(u(-3.))
                             .bottom(u(-3.))
-                            .h(u(13.))
+                            .h(u(15.))
                             .px(u(3.))
                             .gap(u(2.))
                             .items_center()
                             .rounded_full()
-                            .bg(theme.sidebar)
-                            .children((0..3).map(|_| div().size(u(3.)).rounded_full().bg(bright)))
+                            // In their status's colour, cut out of the avatar as the dot is.
+                            .border_2()
+                            .border_color(theme.sidebar)
+                            .bg(crate::members::status_color(dm.status.unwrap_or(cord_core::member_list::Status::Offline)))
+                            .children((0..3).map(|_| div().size(u(3.)).rounded_full().bg(theme.sidebar)))
                             .into_any_element()
                     });
                     crate::members::avatar_with_overlay(
@@ -773,7 +781,9 @@ impl SidePane {
             };
             let line = crate::members::status_element(&dm.line, dm.in_voice, cx);
             // Measured in Discord: 42px rows, a 32px avatar, a 16/20 name over a 12/16 line.
-            row_shell(SharedString::from(format!("channel-{}", dm.id)), active, true, dm.path.clone())
+            let unread = dm.unread && !active;
+            let row = row_shell(SharedString::from(format!("channel-{}", dm.id)), active, true, dm.path.clone())
+                .when(unread, |this| this.text_color(bright))
                 .on_mouse_down(gpui_kit::MouseButton::Right, {
                     let (dm, store) = (dm.clone(), self.services.store.clone());
                     move |event: &gpui_kit::MouseDownEvent, _, cx: &mut gpui_kit::App| {
@@ -783,7 +793,6 @@ impl SidePane {
                     }
                 })
                 .h(u(42.))
-                .mb(u(2.))
                 .flex_shrink_0()
                 .relative()
                 .overflow_hidden()
@@ -842,7 +851,7 @@ impl SidePane {
                                         .min_w_0()
                                         .text_size(u(16.))
                                         .line_height(u(20.))
-                                        .font_weight(FontWeight::MEDIUM)
+                                        .font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
                                         .map(|d| crate::badges::name_clip(d, &dm.stops))
                                         .when_some(dm.font, |d, f| d.font_family(f))
                                         .when_some(dm.color, |d, c| d.text_color(c))
@@ -855,14 +864,20 @@ impl SidePane {
                                 )
                                 .when_some(dm.tag.clone(), |d, (tag, badge)| {
                                     d.child(crate::badges::tag_pill(SharedString::from(format!("dm-tag-{}", dm.id)), &tag, badge.as_deref(), cx))
-                                }),
+                                })
+                                .when(dm.official, |d| d.child(crate::badges::official_badge()))
+                                .when(dm.bot && !dm.official, |d| d.child(crate::badges::bot_badge(dm.verified_bot))),
                         )
                         .map(|d| match line {
                             Some(line) => d.child(line),
                             None if !dm.subtitle.is_empty() => d.child(div().text_size(u(12.)).line_height(u(16.)).truncate().child(dm.subtitle.clone())),
                             None => d,
                         }),
-                )
+                );
+            // Discord's small white pill, outside the row, which clips to its own corners.
+            div().relative().w_full().flex_shrink_0().mb(u(2.)).child(row).when(unread, |this| {
+                this.child(div().absolute().left_0().top(u(17.)).w(u(4.)).h(u(8.)).rounded_tr(u(4.)).rounded_br(u(4.)).bg(bright))
+            })
         };
 
         let category_row = |id: cord_core::Id, label: &str, folded: bool, can_add: bool| {
@@ -2115,6 +2130,32 @@ const PILL_HOVER: f32 = 20.;
 const PILL_UNREAD: f32 = 8.;
 /// Discord's online green (also the rail's hover green).
 /// Channel rows: inset from the column's left, and from the right (scrollbar room).
+/// Two faces filling a `size` square, as Discord shows a group with no picture: one at the top
+/// left, the other over it at the bottom right, cut out of it by a ring of `ring`.
+fn stacked_faces(faces: &[String], size: f32, ring: gpui_kit::Hsla) -> AnyElement {
+    let face = size * 0.625;
+    let edge = (size / 16.).max(1.5);
+    let picture = |url: &String| img(url.clone()).size_full().rounded_full().object_fit(ObjectFit::Cover);
+    div()
+        .relative()
+        .size(u(size))
+        .flex_shrink_0()
+        .child(div().absolute().top_0().left_0().size(u(face)).child(picture(&faces[0])))
+        .child(
+            div()
+                .absolute()
+                .right(u(-edge))
+                .bottom(u(-edge))
+                .size(u(face + edge * 2.))
+                .rounded_full()
+                .border(u(edge))
+                .border_color(ring)
+                .bg(ring)
+                .child(picture(&faces[1])),
+        )
+        .into_any_element()
+}
+
 const ROW_LEFT: f32 = 8.;
 const ROW_RIGHT: f32 = 8.;
 const GREEN: u32 = 0x23a55a;

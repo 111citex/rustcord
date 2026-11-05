@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    LiveLayer,
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, EntityId, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
@@ -59,6 +60,15 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
 }
 
+/// Rustcord: what a scene's live layers came to in one frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveAdvance {
+    /// There's more movement to come after this frame.
+    pub active: bool,
+    /// This frame is part of the movement, and is to be presented.
+    pub changed: bool,
+}
+
 /// Rustcord: names a scroll layer across frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScrollLayerId(u64);
@@ -99,10 +109,14 @@ pub(crate) struct ScrollLayer {
     pub(crate) clip: Bounds<ScaledPixels>,
     /// What was painted, where it was when painted.
     pub(crate) painted: Bounds<ScaledPixels>,
-    /// How far it's moved since then.
+    /// How far the main thread has moved it since then.
     pub(crate) offset_y: ScaledPixels,
     /// Whether the orderings in here hold when it moves.
     pub(crate) movable: bool,
+    /// What moves it on the render thread, if anything does.
+    pub(crate) live: Option<LiveLayer>,
+    /// How far that's moved it since it was painted. The render thread's to set.
+    pub(crate) live_offset: ScaledPixels,
     shadows: Vec<Shadow>,
     quads: Vec<Quad>,
     paths: Vec<Path<ScaledPixels>>,
@@ -114,6 +128,15 @@ pub(crate) struct ScrollLayer {
 }
 
 impl ScrollLayer {
+    /// Whether it's somewhere else than it was painted, on either thread's account.
+    pub(crate) fn has_moved(&self) -> bool {
+        self.offset_y.0 != 0.
+            || self
+                .live
+                .as_ref()
+                .is_some_and(|live| live.live.moved() != live.painted_at)
+    }
+
     /// Whether the view would still be inside what was painted, `offset_y` from there.
     pub(crate) fn covers_view_at(&self, offset_y: ScaledPixels) -> bool {
         self.clip.top() - offset_y >= self.painted.top()
@@ -127,6 +150,8 @@ impl ScrollLayer {
         self.painted = other.painted;
         self.offset_y = other.offset_y;
         self.movable = other.movable;
+        self.live.clone_from(&other.live);
+        self.live_offset = other.live_offset;
         self.shadows.clone_from(&other.shadows);
         self.quads.clone_from(&other.quads);
         self.paths.clone_from(&other.paths);
@@ -193,6 +218,18 @@ impl Scene {
         clip: Bounds<ScaledPixels>,
         painted: Bounds<ScaledPixels>,
     ) {
+        self.begin_live_scroll_layer(id, view, clip, painted, None);
+    }
+
+    /// Rustcord: [`Self::begin_scroll_layer`] for one the render thread can move by itself.
+    pub fn begin_live_scroll_layer(
+        &mut self,
+        id: ScrollLayerId,
+        view: EntityId,
+        clip: Bounds<ScaledPixels>,
+        painted: Bounds<ScaledPixels>,
+        live: Option<LiveLayer>,
+    ) {
         debug_assert!(self.active_scroll_layer.is_none());
         let inside_layer = !self.layer_stack.is_empty();
         self.scroll_layer_bounds.clear();
@@ -209,10 +246,11 @@ impl Scene {
             painted,
             offset_y: ScaledPixels(0.),
             movable: !inside_layer,
+            live: live.clone(),
             ..ScrollLayer::default()
         });
         self.paint_operations
-            .push(PaintOperation::StartScrollLayer { id, view, clip, painted });
+            .push(PaintOperation::StartScrollLayer { id, view, clip, painted, live });
     }
 
     pub fn end_scroll_layer(&mut self) {
@@ -259,6 +297,41 @@ impl Scene {
             .map(|layer| layer.offset_y.0)
     }
 
+    /// Whether the render thread may want to show this again with its layers moved.
+    pub fn has_live_layers(&self) -> bool {
+        self.scroll_layers.iter().any(|layer| layer.live.is_some())
+    }
+
+    /// One frame on the render thread: its live layers take their next step and get placed at
+    /// the live position, wherever this scene was painted. Says if there's more to come, and
+    /// if this frame is to be presented for it.
+    pub fn advance_live_layers(&mut self, now: std::time::Instant) -> LiveAdvance {
+        let mut advance = LiveAdvance::default();
+        for layer in &mut self.scroll_layers {
+            let Some(live) = &layer.live else { continue };
+            let base = layer.offset_y.0 as i64;
+            let tag = live.painted_at;
+            // The move that takes the view to the edge of what's painted, on either side.
+            let lowest = tag + base - (layer.clip.top() - layer.painted.top()).0.floor() as i64;
+            let highest = tag + base + (layer.painted.bottom() - layer.clip.bottom()).0.floor() as i64;
+            let step = live.live.advance(now, tag, lowest, highest);
+            // Rows only as far as they're painted, even if the scene came in too late for this.
+            layer.live_offset = ScaledPixels(-(step.moved.clamp(lowest, highest) - tag) as f32);
+            advance.active |= step.active;
+            advance.changed |= step.changed;
+        }
+        advance
+    }
+
+    /// The frame last advanced has gone to the compositor.
+    pub fn note_live_presented(&self, now: std::time::Instant) {
+        for layer in &self.scroll_layers {
+            if let Some(live) = &layer.live {
+                live.live.presented(now);
+            }
+        }
+    }
+
     /// Puts the scroll layers' primitives where they belong by now, clipped to their views.
     /// The outcome is what the renderers draw. They take scenes that aren't finished with
     /// this yet off the main thread, because it's part of drawing and costs that thread nothing.
@@ -267,7 +340,7 @@ impl Scene {
             return;
         }
         for layer in std::mem::take(&mut self.scroll_layers) {
-            let (offset_y, clip) = (layer.offset_y, layer.clip);
+            let (offset_y, clip) = (layer.offset_y + layer.live_offset, layer.clip);
             macro_rules! bring_in {
                 ($list:ident) => {
                     self.$list.extend(layer.$list.into_iter().filter_map(|mut primitive| {
@@ -427,8 +500,8 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
-                PaintOperation::StartScrollLayer { id, view, clip, painted } => {
-                    self.begin_scroll_layer(*id, *view, *clip, *painted)
+                PaintOperation::StartScrollLayer { id, view, clip, painted, live } => {
+                    self.begin_live_scroll_layer(*id, *view, *clip, *painted, live.clone())
                 }
                 PaintOperation::EndScrollLayer => self.end_scroll_layer(),
             }
@@ -507,6 +580,7 @@ pub(crate) enum PaintOperation {
         view: EntityId,
         clip: Bounds<ScaledPixels>,
         painted: Bounds<ScaledPixels>,
+        live: Option<LiveLayer>,
     },
     EndScrollLayer,
 }

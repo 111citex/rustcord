@@ -1184,10 +1184,16 @@ fn time_ago(seconds: i64) -> String {
 /// its client to lay out: its heading, when, what it says, and a link.
 fn discord_notice(env: &Env, e: &Embed, cx: &App) -> Option<AnyElement> {
     let field = |name: &str| e.fields.iter().find(|f| f.name == name).map(|f| f.value.as_str());
-    let (header, body) = (field("header")?, field("body")?);
+    // `client_version_message` is what Discord leaves for a client that can't show one: it marks
+    // these, and is the only words some have. The rest of those fields are for its own client.
+    if field("header").is_none() && field("client_version_message").is_none() {
+        return None;
+    }
+    let header = field("header").or(e.title.as_deref())?;
+    let body = field("body").or(field("client_version_message"))?;
     let theme = cx.theme();
     let link_blue = gpui_kit::Hsla::from(gpui_kit::rgb(0x00a8fc));
-    let when = field("timestamp").and_then(|t| t.parse::<f64>().ok()).map(|at| time_ago(chrono::Utc::now().timestamp() - at as i64));
+    let when = field("timestamp").or(field("incident_time")).and_then(|t| t.parse::<f64>().ok()).map(|at| time_ago(chrono::Utc::now().timestamp() - at as i64));
     let link = field("learn_more_link").map(str::to_string);
     Some(
         v_flex()
@@ -1717,7 +1723,8 @@ pub fn reply_line(env: &Env, indent: f32, cx: &App) -> Option<AnyElement> {
                     .when(media, |d| d.child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Image).size(u(16.)).flex_shrink_0()))
                     .into_any_element()
             } else {
-                let preview_shared = Shared { inert: true, ..env.shared.clone() };
+                // One line of fixed height: its emoji shrink to fit it, rather than it growing.
+                let preview_shared = Shared { inert: true, emoji_cap: Some(18.), ..env.shared.clone() };
                 let inner = Env { shared: &preview_shared, cache: env.cache, message: m, guild: env.guild };
                 markdown_view::runs_line(&inner, "reply", &markdown::parse_inline(markdown::preview_line(first_line)), cx)
             };

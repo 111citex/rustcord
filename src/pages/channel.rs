@@ -404,7 +404,7 @@ impl ChannelPage {
         let mut page = ChannelPage {
             ctx,
             channel,
-            scroller: SmoothScroller::new(ScrollTarget::List(list.clone())),
+            scroller: SmoothScroller::new(ScrollTarget::List(list.clone())).calm_hover().layered(),
             list,
             rendered: Vec::new(),
             revisions: HashMap::new(),
@@ -1804,7 +1804,8 @@ impl ChannelPage {
         let lower = query.to_lowercase();
         let may_ping_all = cache.can_mention_everyone(channel);
         let mut others: Vec<SuggestItem> = Vec::new();
-        if let Some(guild) = self.guild.filter(|_| may_ping_all || !query.is_empty()) {
+        // Groups have @everyone and @here too, just no roles.
+        {
             if may_ping_all {
                 for (word, note) in [("everyone", "Notify everyone who can see this channel"), ("here", "Notify everyone online here")] {
                     if word.starts_with(&lower) {
@@ -1819,6 +1820,8 @@ impl ChannelPage {
                     }
                 }
             }
+        }
+        if let Some(guild) = self.guild.filter(|_| may_ping_all || !query.is_empty()) {
             let mut roles: Vec<_> = cache.guild(guild).map(|g| g.roles.iter().collect()).unwrap_or_default();
             roles.retain(|r: &&cord_core::model::Role| r.id != guild && (r.mentionable || may_ping_all) && r.name.to_lowercase().contains(&lower));
             roles.sort_by_key(|r| std::cmp::Reverse(r.position));
@@ -2741,7 +2744,10 @@ fn hover_actions(
                 let now = if *over { Some(id) } else if cell.get() == Some(id) { None } else { return };
                 if cell.get() != now {
                     cell.set(now);
-                    let _ = page.update(cx, |_, cx| cx.notify());
+                    // Moving under the pointer: the render when it stops shows this.
+                    if !crate::smooth_scroll::list_scrolling() {
+                        let _ = page.update(cx, |_, cx| cx.notify());
+                    }
                 }
             }
         })
@@ -2911,8 +2917,7 @@ fn message_row(
                 )
             })
             .map(|this| {
-                // Discord's own account, whose messages tell you about yours.
-                if author.id == Id(643_945_264_868_098_049) {
+                if author.is_discord() {
                     this.child(crate::badges::official_badge())
                 } else {
                     this.when(by.bot, |this| this.child(crate::badges::app_badge()))
@@ -2927,7 +2932,7 @@ fn message_row(
             )
     });
 
-    let lit = hovered.get() == Some(m.message.id) || hovered_tools.get() == Some(m.message.id);
+    let lit = !crate::smooth_scroll::list_scrolling() && (hovered.get() == Some(m.message.id) || hovered_tools.get() == Some(m.message.id));
     let ephemeral = m.message.is_ephemeral();
     let row = div()
         .id(("message", ix))
@@ -2938,7 +2943,10 @@ fn message_row(
                 let now = if *over { Some(id) } else if cell.get() == Some(id) { None } else { return };
                 if cell.get() != now {
                     cell.set(now);
-                    let _ = page.update(cx, |_, cx| cx.notify());
+                    // Moving under the pointer: the render when it stops shows this.
+                    if !crate::smooth_scroll::list_scrolling() {
+                        let _ = page.update(cx, |_, cx| cx.notify());
+                    }
                 }
             }
         })
@@ -3563,6 +3571,7 @@ impl Render for ChannelPage {
                     poll_ui: self.poll_ui.clone(),
                     in_card: false,
                     inert: false,
+                    emoji_cap: None,
                     remeasure: {
                         let page = page.clone();
                         Rc::new(move |message, cx| {
@@ -3791,6 +3800,21 @@ impl Render for ChannelPage {
                         // Read from the list each frame: the smooth scroller moves it
                         // without firing the list's scroll events.
                         let older = !self.list.is_following_tail() && self.list.logical_scroll_top().item_ix + JUMP_PILL_AFTER < self.rendered.len();
+                        // The jump bar follows the scroll from outside the list, so the list
+                        // moves as a layer only while the bar's place in that stays the same.
+                        {
+                            let (list, rows) = (self.list.clone(), self.rendered.len());
+                            let extra = unread.is_some() || self.unseen > 0;
+                            let wants_bar = move |list: &gpui_kit::ListState, top: f32| {
+                                const NEARLY: f32 = 200.;
+                                let following = list.is_following_tail();
+                                let near = following || f32::from(list.max_offset_for_scrollbar().y) - top <= NEARLY;
+                                let older = !following && list.logical_scroll_top().item_ix + JUMP_PILL_AFTER < rows;
+                                !near && (extra || older)
+                            };
+                            let now = wants_bar(&list, f32::from((-list.scroll_px_offset_for_scrollbar().y).min(list.max_offset_for_scrollbar().y)));
+                            self.scroller.outside_stays_right(move |top| wants_bar(&list, top) == now);
+                        }
                         if !self.near_newest() && (unread.is_some() || older || self.unseen > 0) {
                             this.child(self.jump_bar(unread, cx))
                         } else {

@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -286,7 +287,24 @@ struct RenderShared {
     thread_died: AtomicBool,
     /// Called when the main thread should look at the flags above.
     feedback_waker: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Paces frames that only the render thread knows about. See [`FramePacer`].
+    pacer: Mutex<Option<Box<dyn FramePacer>>>,
 }
+
+/// Rustcord: tells the render thread when the compositor wants another frame, with no help from
+/// the main thread, which may be busy just then. Frames for a glide are made at that pace.
+pub trait FramePacer: Send {
+    /// Asks to hear about the frame after the next commit. A request not answered yet still holds.
+    fn request_frame(&mut self);
+    /// Blocks until it's heard about, for `timeout` at most, since it won't be for a surface
+    /// that isn't showing. No frame comes of waiting here, so this can't busy-loop.
+    fn wait_for_frame(&mut self, timeout: Duration);
+}
+
+/// How long to wait for the compositor's word before moving on anyway: just over a 30 Hz frame.
+/// A glide is over in moments, so a hidden window doesn't spend long at this.
+#[cfg(not(target_family = "wasm"))]
+const LONGEST_FRAME_WAIT: Duration = Duration::from_millis(34);
 
 impl RenderShared {
     fn wake_main_thread(&self) {
@@ -316,18 +334,75 @@ impl Drop for RenderThreadWatch {
 #[cfg(not(target_family = "wasm"))]
 fn render_thread(shared: Arc<RenderShared>) {
     let _watch = RenderThreadWatch(shared.clone());
-    while let Some(mut frame) = shared.mailbox.wait() {
-        let presented = shared.target.lock().render_packet(&mut frame, &shared);
-        frame.scene.clear();
-        frame.atlas.reset();
-        shared.mailbox.recycle(frame);
+    // The frame on screen, kept for as long as its live layers may have to move, and the scene
+    // composed from it for each showing.
+    let mut shown: Option<FramePacket> = None;
+    let mut composed = Scene::default();
+    let mut gliding = false;
+    loop {
+        let arrived = if gliding {
+            // Pace with the compositor: a new frame from the main thread waits for this too,
+            // which is the same frame it'd have made it into at the earliest.
+            if let Some(pacer) = shared.pacer.lock().as_mut() {
+                pacer.wait_for_frame(LONGEST_FRAME_WAIT);
+            }
+            if shared.mailbox.is_closed() {
+                return;
+            }
+            shared.mailbox.take_pending()
+        } else {
+            match shared.mailbox.wait_or_nudge() {
+                Some(arrived) => arrived,
+                None => return,
+            }
+        };
+
+        let fresh = arrived.is_some();
+        if let Some(frame) = arrived {
+            if let Some(older) = shown.replace(frame) {
+                recycle_frame(older, &shared);
+            }
+        }
+        // Painted for a surface that's gone: only the next paint can show anything.
+        let generation = shared.surface_generation.load(Ordering::Acquire);
+        if !fresh && shown.as_ref().is_some_and(|frame| frame.surface_generation != generation) {
+            recycle_frame(shown.take().unwrap(), &shared);
+        }
+        let Some(frame) = shown.as_mut() else {
+            gliding = false;
+            continue;
+        };
+
+        let advance = frame.scene.advance_live_layers(std::time::Instant::now());
+        gliding = advance.active;
+        if !fresh && !advance.changed {
+            continue;
+        }
+        if gliding && let Some(pacer) = shared.pacer.lock().as_mut() {
+            pacer.request_frame();
+        }
+        let presented = shared.target.lock().render_packet(frame, &mut composed, &shared);
+        if presented {
+            frame.scene.note_live_presented(std::time::Instant::now());
+        }
+        if !frame.scene.has_live_layers() {
+            recycle_frame(shown.take().unwrap(), &shared);
+        }
         // Without a commit the compositor won't send the frame callback that the main thread
-        // is waiting for, so it has to hear about this some other way.
-        if !presented {
+        // is waiting for, so it has to hear about this some other way. A frame shown again is
+        // nothing the main thread is waiting on.
+        if fresh && !presented {
             shared.frame_failed.store(true, Ordering::Release);
             shared.wake_main_thread();
         }
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn recycle_frame(mut frame: FramePacket, shared: &RenderShared) {
+    frame.scene.clear();
+    frame.atlas.reset();
+    shared.mailbox.recycle(frame);
 }
 
 /// The main thread's handle on a window's rendering. Rustcord: frames are drawn by
@@ -348,6 +423,7 @@ pub struct WgpuRenderer {
     /// Asked on every frame, so this stays off the target's lock too.
     device_errors: Arc<DeviceErrorState>,
     shared: Arc<RenderShared>,
+    has_pacer: bool,
     #[cfg(not(target_family = "wasm"))]
     render_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -464,6 +540,7 @@ impl WgpuRenderer {
             atlas_reset_wanted: AtomicBool::new(false),
             thread_died: AtomicBool::new(false),
             feedback_waker: Mutex::new(None),
+            pacer: Mutex::new(None),
         });
         #[cfg(not(target_family = "wasm"))]
         let render_thread = {
@@ -485,6 +562,7 @@ impl WgpuRenderer {
             surface_ready: true,
             device_errors: Arc::clone(context.errors()),
             shared,
+            has_pacer: false,
             #[cfg(not(target_family = "wasm"))]
             render_thread: Some(render_thread),
         })
@@ -616,8 +694,14 @@ impl RenderTarget {
         }
     }
 
-    /// Draws a frame and presents it. Returns whether it reached the compositor.
-    fn render_packet(&mut self, frame: &mut FramePacket, shared: &RenderShared) -> bool {
+    /// Draws a frame and presents it. Returns whether it reached the compositor. The scene is
+    /// left as it came if it has live layers, for showing it again, and `composed` is drawn.
+    fn render_packet(
+        &mut self,
+        frame: &mut FramePacket,
+        composed: &mut Scene,
+        shared: &RenderShared,
+    ) -> bool {
         self.flush_uploads(frame);
         if frame.surface_generation != shared.surface_generation.load(Ordering::Acquire) {
             return false;
@@ -669,7 +753,14 @@ impl RenderTarget {
         }
 
         // Rustcord: part of drawing, so that it costs the main thread nothing.
-        frame.scene.compose_scroll_layers();
+        let scene = if frame.scene.has_live_layers() {
+            frame.scene.copy_primitives_into(composed);
+            composed.compose_scroll_layers();
+            &*composed
+        } else {
+            frame.scene.compose_scroll_layers();
+            &frame.scene
+        };
 
         let render_start = std::time::Instant::now();
         // Rustcord: reconfiguring and trying again right here saves the main thread a trip
@@ -712,7 +803,7 @@ impl RenderTarget {
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
         if let Err(error) = core.render_frame(
-            &frame.scene,
+            scene,
             &mut frame.atlas,
             &frame_view,
             size,
@@ -1407,7 +1498,10 @@ impl WgpuRenderer {
         #[cfg(target_family = "wasm")]
         {
             let shared = self.shared.clone();
-            let presented = shared.target.lock().render_packet(&mut frame, &shared);
+            let presented = shared
+                .target
+                .lock()
+                .render_packet(&mut frame, &mut Scene::default(), &shared);
             self.apply_render_feedback();
             frame.scene.clear();
             frame.atlas.reset();
@@ -1434,6 +1528,19 @@ impl WgpuRenderer {
     /// thread, and only in those cases, never for a frame that went fine.
     pub fn set_feedback_waker(&mut self, waker: Box<dyn Fn() + Send + Sync>) {
         *self.shared.feedback_waker.lock() = Some(waker);
+    }
+
+    /// Sets what paces the frames the render thread makes by itself. Without one it won't.
+    pub fn set_frame_pacer(&mut self, pacer: Box<dyn FramePacer>) {
+        *self.shared.pacer.lock() = Some(pacer);
+        self.has_pacer = true;
+    }
+
+    /// What wakes the render thread to move a scroll layer by itself, if it can do that.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn scroll_compositor_waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let shared = self.shared.clone();
+        self.has_pacer.then(|| Arc::new(move || shared.mailbox.nudge()) as Arc<dyn Fn() + Send + Sync>)
     }
 
     /// Whether a frame failed since the last [`draw`](Self::draw). Calling this clears it.

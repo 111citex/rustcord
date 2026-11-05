@@ -70,6 +70,8 @@ pub struct Shared {
     /// A preview, like the line above a reply: nothing in it can be clicked, so
     /// the click goes to the preview itself.
     pub inert: bool,
+    /// The most an inline emoji may be, for a line that has to stay its own height.
+    pub emoji_cap: Option<f32>,
     /// Inside an embed: a bot's text there, so `@everyone` looks the part without pinging.
     pub in_card: bool,
     /// The chat text size in px; headers and code are sized from it.
@@ -577,8 +579,9 @@ fn flow(env: &Env, key: &str, runs: &[Run], jumbo: bool, wrap: bool, cx: &App) -
             .into_any_element();
     }
     let now = chrono::Local::now();
-    // Inline emoji are 1.375em, whatever size the text around them is.
-    let size = u(if jumbo { 48. } else { env.shared.text_size * 1.375 });
+    // Inline emoji are 1.375em, whatever size the text around them is, unless the line can't grow.
+    let inline = (env.shared.text_size * 1.375).min(env.shared.emoji_cap.unwrap_or(f32::MAX));
+    let size = u(if jumbo { 48. } else { inline });
     let mono = cx.theme().mono_font_family.clone();
     let mut parts: Vec<AnyElement> = Vec::new();
     let mut n = 0;
@@ -603,7 +606,7 @@ fn flow(env: &Env, key: &str, runs: &[Run], jumbo: bool, wrap: bool, cx: &App) -
             }
             Content::CustomEmoji { name, url } if url.contains(".gif") => {
                 let subject = custom_subject(name, url);
-                parts.push(card_on_click(env, crate::anim::emoji(url.clone(), f32::from(env.shared.text_size) * if jumbo { 48. / env.shared.text_size } else { 1.375 }), (key, n), subject));
+                parts.push(card_on_click(env, crate::anim::emoji(url.clone(), if jumbo { 48. } else { inline }), (key, n), subject));
                 n += 1;
             }
             Content::CustomEmoji { name, url } => {

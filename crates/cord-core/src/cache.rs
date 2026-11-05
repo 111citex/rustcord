@@ -108,6 +108,18 @@ fn still_muted(muted: &std::collections::HashMap<Id, Option<i64>>, id: Id) -> bo
     muted.get(&id).is_some_and(|end| end.is_none_or(|end| end > chrono::Utc::now().timestamp_millis()))
 }
 
+/// What we may do to one person in a server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Moderation {
+    pub kick: bool,
+    pub ban: bool,
+    pub timeout: bool,
+    pub nickname: bool,
+    pub roles: bool,
+    /// Whether Discord's mod view is ours to open.
+    pub mod_view: bool,
+}
+
 #[derive(Default)]
 pub struct Cache {
     me: Option<User>,
@@ -265,6 +277,12 @@ impl Cache {
             self.read.insert(channel, ReadMark { last, mentions: 0 });
             self.bump_sidebar();
         }
+    }
+
+    /// Marks `channel` unread from the message after `before` on.
+    pub fn mark_unread_after(&mut self, channel: Id, before: Id) {
+        self.read.insert(channel, ReadMark { last: Some(before), mentions: 0 });
+        self.bump_sidebar();
     }
 
     pub fn guild_folders(&self) -> &[GuildFolder] {
@@ -696,6 +714,33 @@ impl Cache {
         match (self.guilds.get(&guild), me, member) {
             (Some(g), Some(me), Some(member)) => permissions::base(g, me, &member.roles),
             _ => 0,
+        }
+    }
+
+    /// What we call a friend, if we gave them a name of our own.
+    pub fn friend_nickname(&self, user: Id) -> Option<&str> {
+        self.friend_nicks.get(&user).map(String::as_str).filter(|n| !n.is_empty())
+    }
+
+    /// What we may do to `target` in `guild`: each action needs its permission and, but for
+    /// our own nickname, a higher place in the server's ranking than they have.
+    pub fn moderation(&self, guild: Id, target: Id) -> Moderation {
+        let (Some(me), Some(g)) = (self.me.as_ref().map(|u| u.id), self.guilds.get(&guild)) else { return Moderation::default() };
+        let held = self.guild_permissions(guild);
+        let may = |p: u64| held & p != 0;
+        let roles = |user: Id| self.member(guild, user).map(|m| m.roles.clone()).unwrap_or_default();
+        if target == me {
+            return Moderation { nickname: may(permissions::CHANGE_NICKNAME), ..Moderation::default() };
+        }
+        let ranks = permissions::outranks(g, me, &roles(me), target, &roles(target));
+        let admin = permissions::base(g, target, &roles(target)) & permissions::ADMINISTRATOR != 0;
+        Moderation {
+            kick: ranks && may(permissions::KICK_MEMBERS),
+            ban: ranks && may(permissions::BAN_MEMBERS),
+            timeout: ranks && !admin && may(permissions::MODERATE_MEMBERS),
+            nickname: ranks && may(permissions::MANAGE_NICKNAMES),
+            roles: ranks && may(permissions::MANAGE_ROLES),
+            mod_view: may(permissions::KICK_MEMBERS | permissions::BAN_MEMBERS | permissions::MODERATE_MEMBERS),
         }
     }
 

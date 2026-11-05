@@ -63,6 +63,8 @@ pub struct Shared {
     pub react: Rc<dyn Fn(Id, cord_core::model::ReactionEmoji, bool, &mut App)>,
     /// Clicking a user mention: (user, where).
     pub open_user: Rc<dyn Fn(Id, gpui_kit::Point<gpui_kit::Pixels>, &mut gpui_kit::Window, &mut App)>,
+    /// Right click on a user mention: (user, where).
+    pub open_user_menu: Rc<dyn Fn(Id, gpui_kit::Point<gpui_kit::Pixels>, &mut App)>,
     /// The pointer rests on a reaction pill (or left one, with `None`).
     pub who_reacted: Rc<dyn Fn(Option<(Id, cord_core::model::ReactionEmoji, u32)>, &mut App)>,
     /// A message's height changed from outside: it needs measuring again.
@@ -449,6 +451,8 @@ fn text(env: &Env, key: &str, runs: &[Run], cx: &App) -> AnyElement {
     let actions: Vec<_> = clicks.iter().map(|(_, c)| run_click(c, env.message.id, env.shared)).collect();
     let users: Vec<Option<Id>> = clicks.iter().map(|(_, c)| if let Click::User(id) = c { Some(*id) } else { None }).collect();
     let open_user = env.shared.open_user.clone();
+    let user_menu = env.shared.open_user_menu.clone();
+    let mentioned: Vec<(Range<usize>, Id)> = clicks.iter().filter_map(|(r, c)| if let Click::User(id) = c { Some((r.clone(), *id)) } else { None }).collect();
     let id = ElementId::from((ElementId::from(("md", env.message.id.0)), key.to_string()));
     let mut interactive = InteractiveText::new(id, styled);
     if !ranges.is_empty() {
@@ -466,6 +470,10 @@ fn text(env: &Env, key: &str, runs: &[Run], cx: &App) -> AnyElement {
             Some(user) => open_user(user, window.mouse_position(), window, cx),
             None => actions[i](cx),
         });
+    }
+    if !mentioned.is_empty() {
+        let (spans, people): (Vec<_>, Vec<_>) = mentioned.into_iter().unzip();
+        interactive = interactive.on_right_click(spans, move |i, at, _, cx| user_menu(people[i], at, cx));
     }
     if !tips.is_empty() {
         interactive = interactive.tooltip(move |ix, window, cx| {
@@ -687,8 +695,13 @@ fn pill_element(env: &Env, look: &Look, mono: &SharedString, text: String, id: (
     match (&look.click, click) {
         (Some(Click::User(user)), _) => {
             let (open, user, spot) = (env.shared.open_user.clone(), *user, NameSpot::default());
-            let target = spot.clone();
-            spotted(&spot, styled.id(id).cursor_pointer().hover(|d| d.underline()).on_click(move |e, window, cx| open(user, card_at(&target, e.position()), window, cx))).into_any_element()
+            let (target, menu) = (spot.clone(), env.shared.open_user_menu.clone());
+            spotted(&spot, styled.id(id).cursor_pointer().hover(|d| d.underline())
+                .on_mouse_down(gpui_kit::MouseButton::Right, move |e, _, cx| {
+                    cx.stop_propagation();
+                    menu(user, e.position, cx);
+                })
+                .on_click(move |e, window, cx| open(user, card_at(&target, e.position()), window, cx))).into_any_element()
         }
         (_, Some(click)) => styled.id(id).cursor_pointer().hover(|d| d.underline()).on_click(move |_, _, cx| click(cx)).into_any_element(),
         _ => styled.into_any_element(),

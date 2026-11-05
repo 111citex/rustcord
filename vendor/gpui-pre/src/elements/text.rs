@@ -1,7 +1,7 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
     WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
@@ -1041,7 +1041,10 @@ pub struct InteractiveText {
     tooltip_builder: Option<Rc<dyn Fn(usize, &mut Window, &mut App) -> Option<AnyView>>>,
     tooltip_id: Option<TooltipId>,
     clickable_ranges: Vec<Range<usize>>,
+    right_click: Option<(Vec<Range<usize>>, RightClickListener)>,
 }
+
+type RightClickListener = Box<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App)>;
 
 struct InteractiveTextClickEvent {
     mouse_down_index: usize,
@@ -1069,7 +1072,19 @@ impl InteractiveText {
             tooltip_builder: None,
             tooltip_id: None,
             clickable_ranges: Vec::new(),
+            right_click: None,
         }
+    }
+
+    /// Called with the index of the range and the pointer's position when the user
+    /// right-clicks one of the given ranges. The click goes no further.
+    pub fn on_right_click(
+        mut self,
+        ranges: Vec<Range<usize>>,
+        listener: impl Fn(usize, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.right_click = Some((ranges, Box::new(listener)));
+        self
     }
 
     /// on_click is called when the user clicks on one of the given ranges, passing the index of
@@ -1233,6 +1248,7 @@ impl Element for InteractiveText {
                         let hitbox = hitbox.clone();
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _| {
                             if phase == DispatchPhase::Bubble
+                                && event.button == MouseButton::Left
                                 && hitbox.is_hovered(window)
                                 && let Ok(mouse_down_index) =
                                     text_layout.index_for_position(event.position)
@@ -1242,6 +1258,21 @@ impl Element for InteractiveText {
                             }
                         });
                     }
+                }
+
+                if let Some((ranges, listener)) = self.right_click.take() {
+                    let (hitbox, text_layout) = (hitbox.clone(), text_layout.clone());
+                    window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble
+                            && event.button == MouseButton::Right
+                            && hitbox.is_hovered(window)
+                            && let Ok(at) = text_layout.index_for_position(event.position)
+                            && let Some(which) = ranges.iter().position(|range| range.contains(&at))
+                        {
+                            cx.stop_propagation();
+                            listener(which, event.position, window, cx);
+                        }
+                    });
                 }
 
                 window.on_mouse_event({

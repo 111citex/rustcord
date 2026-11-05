@@ -1419,6 +1419,7 @@ fn no_op_shared(parsed: Rc<RefCell<crate::markdown_view::ParseCache>>) -> crate:
         jump: Rc::new(|_, _| {}),
         react: Rc::new(|_, _, _, _| {}),
         open_user: Rc::new(|_, _, _, _| {}),
+        open_user_menu: Rc::new(|_, _, _| {}),
         who_reacted: Rc::new(|_, _| {}),
         text_size: 14.,
         parsed,

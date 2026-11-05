@@ -397,6 +397,24 @@ impl Store {
         cx.notify();
     }
 
+    /// "Mark Unread": `message` becomes the first one unread.
+    pub fn mark_unread(&mut self, channel: Id, message: Id, cx: &mut Context<Self>) {
+        let before = Id(message.0.saturating_sub(1));
+        self.cache.mark_unread_after(channel, before);
+        self.acked.remove(&channel);
+        if self.open == Some(channel) {
+            self.new_after = Some(before);
+        }
+        let core = self.core.clone();
+        cx.spawn(async move |_, _| {
+            if let Err(error) = core.mark_unread_from(channel, before).await {
+                tracing::warn!(%error, "couldn't mark the message unread");
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub fn reload_channel(&mut self, channel: Id, cx: &mut Context<Self>) {
         if self.open == Some(channel) {
             self.load_history(channel, cx);
@@ -800,6 +818,78 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let result = core.remove_friend(user).await;
             Self::report(this, result, "Couldn't remove them", cx);
+        })
+        .detach();
+    }
+
+    pub fn kick_member(&mut self, guild: Id, user: Id, reason: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.kick_member(guild, user, reason).await;
+            Self::report(this, result, "Couldn't kick them", cx);
+        })
+        .detach();
+    }
+
+    pub fn ban_member(&mut self, guild: Id, user: Id, delete_seconds: u32, reason: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.ban_member(guild, user, delete_seconds, reason).await;
+            Self::report(this, result, "Couldn't ban them", cx);
+        })
+        .detach();
+    }
+
+    pub fn timeout_member(&mut self, guild: Id, user: Id, until: Option<String>, reason: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.timeout_member(guild, user, until, reason).await;
+            Self::report(this, result, "Couldn't time them out", cx);
+        })
+        .detach();
+    }
+
+    pub fn set_nickname(&mut self, guild: Id, user: Id, me: bool, nick: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_nickname(guild, user, me, nick).await;
+            Self::report(this, result, "Couldn't change the nickname", cx);
+        })
+        .detach();
+    }
+
+    pub fn block_user(&mut self, user: Id, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.block_user(user).await;
+            Self::report(this, result, "Couldn't block them", cx);
+        })
+        .detach();
+    }
+
+    pub fn set_friend_nickname(&mut self, user: Id, nick: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_friend_nickname(user, nick).await;
+            Self::report(this, result, "Couldn't change the nickname", cx);
+        })
+        .detach();
+    }
+
+    pub fn set_note(&mut self, user: Id, note: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_note(user, note).await;
+            Self::report(this, result, "Couldn't save the note", cx);
+        })
+        .detach();
+    }
+
+    pub fn forward_message(&mut self, to: Id, from: Id, message: Id, guild: Option<Id>, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.forward_message(to, from, message, guild).await;
+            Self::report(this, result, "Couldn't forward the message", cx);
         })
         .detach();
     }

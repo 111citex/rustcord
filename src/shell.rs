@@ -1719,6 +1719,7 @@ impl Render for Shell {
             .child(self.mouse_side_buttons())
             .children(crate::confirm::overlay(window, cx))
             .children(crate::add_people::overlay(window, cx))
+            .children(crate::panels::overlay(window, cx))
             .children(crate::emoji_card::overlay(cx))
             .when_some(self.info.clone(), |this, monitor| {
                 this.child(
@@ -1864,7 +1865,8 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
     let in_channel = cache.voice_state(guild, user).and_then(|v| v.channel_id);
     let may = |permission: u64| in_channel.is_some_and(|c| cache.has_permission(c, permission));
     let (can_mute, can_deafen, can_move) = (may(perms::MUTE_MEMBERS), may(perms::DEAFEN_MEMBERS), may(perms::MOVE_MEMBERS));
-    let can_kick = cache.guild_permissions(guild) & perms::KICK_MEMBERS != 0;
+    let can_kick = cache.moderation(guild, user).kick;
+    let handle = cache.user(user).map_or_else(|| name.clone(), |u| u.username.clone());
     let state = cache.voice_state(guild, user).map(|v| (v.mute, v.deaf)).unwrap_or_default();
     let core = store.core().clone();
     let mut entries = vec![Entry::item("Profile", move |_, cx| crate::links::show_profile(user, card_at, cx))];
@@ -1932,17 +1934,10 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
             .detach();
         }).danger());
     }
-    if can_kick && !itself {
-        let (core, title, body) = (core.clone(), format!("Kick {name}"), format!("Kick {name} from this server? They can come back with a new invite."));
-        entries.push(Entry::item(format!("Kick {name}"), move |_, cx| {
-            let core = core.clone();
-            crate::confirm::ask(title.clone(), body.clone(), "Kick", move |cx| {
-                let core = core.clone();
-                cx.spawn(async move |_| {
-                    let _ = core.kick_member(guild, user).await;
-                })
-                .detach();
-            }, cx);
+    if can_kick {
+        let (store, handle, who) = (services.store.clone(), handle, name.clone());
+        entries.push(Entry::item(format!("Kick {name}"), move |window, cx| {
+            crate::panels::open(store.clone(), crate::panels::What::Kick { guild, user, name: who.clone(), handle: handle.clone() }, window, cx);
         }).danger());
     }
     entries.push(Entry::Separator);

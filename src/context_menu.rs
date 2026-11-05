@@ -18,7 +18,7 @@ use crate::ui::u;
 pub type Action = Rc<dyn Fn(&mut Window, &mut App)>;
 
 pub enum Entry {
-    Item { label: SharedString, icon: Option<IconName>, picture: Option<&'static str>, danger: bool, action: Option<Action> },
+    Item { label: SharedString, icon: Option<IconName>, picture: Option<&'static str>, danger: bool, action: Option<Action>, hint: Option<&'static str> },
     Separator,
     /// Drags from silent to double, staying open.
     Slider { label: SharedString, value: Rc<Cell<f32>>, set: Rc<dyn Fn(f32, &mut App)> },
@@ -30,7 +30,7 @@ pub enum Entry {
 
 impl Entry {
     pub fn item(label: impl Into<SharedString>, action: impl Fn(&mut Window, &mut App) + 'static) -> Self {
-        Entry::Item { label: label.into(), icon: None, picture: None, danger: false, action: Some(Rc::new(action)) }
+        Entry::Item { label: label.into(), icon: None, picture: None, danger: false, action: Some(Rc::new(action)), hint: None }
     }
 
     pub fn slider(label: impl Into<SharedString>, value: f32, set: impl Fn(f32, &mut App) + 'static) -> Self {
@@ -44,7 +44,7 @@ impl Entry {
 
     /// Discord has it, rustcord doesn't do it yet.
     pub fn later(label: impl Into<SharedString>) -> Self {
-        Entry::Item { label: label.into(), icon: None, picture: None, danger: false, action: None }
+        Entry::Item { label: label.into(), icon: None, picture: None, danger: false, action: None, hint: None }
     }
 
     pub fn copy(label: impl Into<SharedString>, text: String) -> Self {
@@ -66,6 +66,14 @@ impl Entry {
         self
     }
 
+    /// A line in small type under the label.
+    pub fn hint(mut self, text: &'static str) -> Self {
+        if let Entry::Item { hint, .. } = &mut self {
+            *hint = Some(text);
+        }
+        self
+    }
+
     pub fn danger(mut self) -> Self {
         if let Entry::Item { danger, .. } = &mut self {
             *danger = true;
@@ -81,7 +89,25 @@ struct Open {
 
 impl Global for Open {}
 
-pub fn show(position: Point<Pixels>, entries: Vec<Entry>, cx: &mut App) {
+/// Drops separators that have nothing on one side of them, so menus can be put together
+/// from optional groups without checking each.
+fn tidy(entries: &mut Vec<Entry>) {
+    let mut kept: Vec<Entry> = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        let separator = matches!(entry, Entry::Separator);
+        if separator && kept.last().is_none_or(|last| matches!(last, Entry::Separator)) {
+            continue;
+        }
+        kept.push(entry);
+    }
+    if matches!(kept.last(), Some(Entry::Separator)) {
+        kept.pop();
+    }
+    *entries = kept;
+}
+
+pub fn show(position: Point<Pixels>, mut entries: Vec<Entry>, cx: &mut App) {
+    tidy(&mut entries);
     cx.set_global(Open { position, entries: Rc::new(entries) });
     cx.refresh_windows();
 }
@@ -197,13 +223,14 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
                     .child(crate::badges::emoji_image(emoji, 24.))
             }))
             .into_any_element(),
-        Entry::Item { label, icon, picture, danger: red, action } => {
+        Entry::Item { label, icon, picture, danger: red, action, hint } => {
             let enabled = action.is_some();
             let action = action.clone();
             let color = if *red { danger } else { fg };
             h_flex()
                 .id(("menu-item", i))
-                .h(u(32.))
+                .when(hint.is_none(), |d| d.h(u(32.)))
+                .when(hint.is_some(), |d| d.min_h(u(32.)).py(u(4.)))
                 .px(u(8.))
                 .gap(u(8.))
                 .items_center()
@@ -220,7 +247,15 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
                 })
                 .when_some(*picture, |d, path| d.child(Icon::default().path(path).size(u(18.)).flex_shrink_0()))
                 .when_some(icon.clone(), |d, icon| d.child(Icon::new(icon).size(u(18.)).flex_shrink_0()))
-                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                .child(match hint {
+                    Some(hint) => v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().child(label.clone()))
+                        .child(div().truncate().text_size(u(12.)).font_weight(FontWeight::NORMAL).text_color(muted).child(*hint))
+                        .into_any_element(),
+                    None => div().flex_1().min_w_0().truncate().child(label.clone()).into_any_element(),
+                })
                 .into_any_element()
         }
     });
@@ -241,4 +276,17 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
             .with_priority(2)
             .into_any_element(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn separators_only_stand_between_entries() {
+        let mut entries = vec![Entry::Separator, Entry::later("a"), Entry::Separator, Entry::Separator, Entry::later("b"), Entry::Separator];
+        tidy(&mut entries);
+        let shape: Vec<bool> = entries.iter().map(|e| matches!(e, Entry::Separator)).collect();
+        assert_eq!(shape, [false, true, false]);
+    }
 }

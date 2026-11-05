@@ -10,6 +10,7 @@ pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const MANAGE_MESSAGES: u64 = 1 << 13;
 pub const PIN_MESSAGES: u64 = 1 << 51;
+pub const CHANGE_NICKNAME: u64 = 1 << 26;
 pub const MANAGE_NICKNAMES: u64 = 1 << 27;
 pub const MANAGE_ROLES: u64 = 1 << 28;
 pub const MODERATE_MEMBERS: u64 = 1 << 40;
@@ -71,6 +72,21 @@ pub fn compute(guild: &Guild, channel: &Channel, user: Id, member_roles: &[Id]) 
         perms = perms & !o.deny | o.allow;
     }
     perms
+}
+
+/// The position of the highest of `roles` in the server's ranking (@everyone is 0).
+pub fn top_position(guild: &Guild, roles: &[Id]) -> i32 {
+    guild.roles.iter().filter(|r| roles.contains(&r.id)).map(|r| r.position).max().unwrap_or(0)
+}
+
+/// Whether `actor` ranks above `target`, which kicking, banning, timing out and
+/// renaming someone all need: the owner outranks everyone and is outranked by none,
+/// anyone else needs a higher top role.
+pub fn outranks(guild: &Guild, actor: Id, actor_roles: &[Id], target: Id, target_roles: &[Id]) -> bool {
+    if actor == target || guild.owner_id == Some(target) {
+        return false;
+    }
+    guild.owner_id == Some(actor) || top_position(guild, actor_roles) > top_position(guild, target_roles)
 }
 
 #[cfg(test)]
@@ -187,5 +203,20 @@ mod tests {
     fn empty_overwrites_leave_the_base() {
         let g = guild(vec![role(GUILD, BASIC | ATTACH_FILES)]);
         assert_eq!(compute(&g, &channel(vec![]), ME, &[]), BASIC | ATTACH_FILES);
+    }
+
+    #[test]
+    fn rank_comes_from_the_top_role_and_the_owner_is_above_all() {
+        let mut high = role(MOD, 0);
+        high.position = 5;
+        let mut low = role(MUTED, 0);
+        low.position = 2;
+        let g = guild(vec![high, low]);
+        assert!(outranks(&g, ME, &[MOD], Id(2), &[MUTED]));
+        assert!(!outranks(&g, ME, &[MUTED], Id(2), &[MOD]), "a lower role can't act on a higher");
+        assert!(!outranks(&g, ME, &[MOD], Id(2), &[MOD]), "equal doesn't outrank");
+        assert!(!outranks(&g, ME, &[MOD], ME, &[MOD]), "never ourselves");
+        assert!(outranks(&g, Id(999), &[], Id(2), &[MOD]), "the owner");
+        assert!(!outranks(&g, ME, &[MOD], Id(999), &[]), "nobody outranks the owner");
     }
 }

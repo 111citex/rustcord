@@ -335,7 +335,7 @@ impl ChannelPage {
                             // Up in an empty box: edit our latest message.
                             let in_box = gpui_kit::Focusable::focus_handle(page.input.read(cx), cx).is_focused(window);
                             // Whatever's on top of the page gets Esc first, and handles it itself.
-                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx)) {
+                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx) || crate::panels::is_open(cx)) {
                                 return;
                             }
                             if key == "up" && in_box && page.editing.is_none() && page.input.read(cx).value().is_empty() && page.pending.is_empty() {
@@ -869,16 +869,41 @@ impl ChannelPage {
         self.seek_jump_target(cx);
     }
 
-    /// Right click on a person.
+    /// Right click on a person, in Discord's order: what to do with them, what to change
+    /// about them, what a moderator may do, then their ID. Only what we may do is listed.
     fn user_menu(&mut self, user: Id, name: String, position: Point<Pixels>, cx: &mut Context<Self>) {
         use crate::context_menu::{self as menu, Entry};
+        use crate::panels::{self, What};
         let page = cx.entity().downgrade();
-        let me = self.ctx.services.store.read(cx).cache().me().map(|u| u.id) == Some(user);
+        let store = self.ctx.services.store.clone();
+        let guild = self.guild;
+        let (is_me, friend, friend_nick, mods, owned_group, handle, bot, server_nick) = {
+            let cache = store.read(cx).cache();
+            let me = cache.me().map(|u| u.id);
+            let owned = self.channel.filter(|channel| {
+                cache.channel(*channel).is_some_and(|c| c.kind == ChannelKind::GroupDm && c.owner_id.is_some() && c.owner_id == me && c.recipient_ids.contains(&user))
+            });
+            let known = cache.user(user);
+            (
+                me == Some(user),
+                cache.is_friend(user),
+                cache.friend_nickname(user).map(str::to_string),
+                guild.map(|g| cache.moderation(g, user)).unwrap_or_default(),
+                owned,
+                known.map_or_else(|| name.clone(), |u| u.username.clone()),
+                known.is_some_and(|u| u.bot),
+                guild.and_then(|g| cache.member(g, user)).and_then(|m| m.nick.clone()).unwrap_or_default(),
+            )
+        };
         let with = |f: fn(&mut ChannelPage, Id, String, Point<Pixels>, &mut Window, &mut Context<ChannelPage>)| {
             let (page, name) = (page.clone(), name.clone());
             move |window: &mut Window, cx: &mut App| {
                 let _ = page.update(cx, |page, cx| f(page, user, name.clone(), position, window, cx));
             }
+        };
+        let panel = |what: What| {
+            let store = store.clone();
+            move |window: &mut Window, cx: &mut App| panels::open(store.clone(), what.clone(), window, cx)
         };
         let mut entries = vec![
             Entry::item("Profile", with(|p, u, _, at, w, cx| {
@@ -887,58 +912,82 @@ impl ChannelPage {
             })),
             Entry::item("Mention", with(|p, u, n, _, w, cx| p.mention(u, n, w, cx))),
         ];
-        if !me {
+        if !is_me {
             entries.push(Entry::item("Message", with(|p, u, _, _, _, cx| p.message(u, cx))));
-            entries.push(Entry::later("Start a Call"));
-            entries.push(Entry::later("Add Note"));
-            // A group's owner may remove people or hand it over. Both ask first.
-            let my_id = self.ctx.services.store.read(cx).cache().me().map(|u| u.id);
-            let owned_group = self.channel.filter(|channel| {
-                let cache = self.ctx.services.store.read(cx).cache();
-                cache.channel(*channel).is_some_and(|c| c.kind == cord_core::model::ChannelKind::GroupDm && c.owner_id.is_some() && c.owner_id == my_id && c.recipient_ids.contains(&user))
-            });
-            if let Some(channel) = owned_group {
-                entries.push(Entry::Separator);
-                let store = self.ctx.services.store.clone();
-                let who = name.clone();
-                entries.push(Entry::item("Remove From Group", move |_, cx| {
-                    let store = store.clone();
-                    crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from this group?"), "Remove", move |cx| {
-                        store.update(cx, |store, cx| store.remove_from_group(channel, user, cx));
-                    }, cx);
-                }).danger());
-                let store = self.ctx.services.store.clone();
-                let who = name.clone();
-                entries.push(Entry::item("Make Group Owner", move |_, cx| {
-                    let store = store.clone();
-                    crate::confirm::ask(format!("Make {who} the owner"), format!("Hand this group over to {who}? You won't own it anymore."), "Make Owner", move |cx| {
-                        store.update(cx, |store, cx| store.make_group_owner(channel, user, cx));
-                    }, cx);
-                }).danger());
+            if !bot {
+                entries.push(Entry::later("Start a Call"));
             }
+            entries.push(Entry::item("Add Note", panel(What::Note { user, name: name.clone() })).hint("Only visible to you"));
+            if friend {
+                let label = if friend_nick.is_some() { "Change Friend Nickname" } else { "Add Friend Nickname" };
+                entries.push(Entry::item(label, panel(What::FriendNickname { user, name: name.clone(), current: friend_nick.unwrap_or_default() })));
+            }
+        }
+        entries.push(Entry::Separator);
+        // A group's owner may remove people or hand it over. Both ask first.
+        if let Some(channel) = owned_group {
+            let (remove, give) = (store.clone(), store.clone());
+            let (who, whom) = (name.clone(), name.clone());
+            entries.push(Entry::item("Remove From Group", move |_, cx| {
+                let store = remove.clone();
+                crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from this group?"), "Remove", move |cx| {
+                    store.update(cx, |store, cx| store.remove_from_group(channel, user, cx));
+                }, cx);
+            }).danger());
+            entries.push(Entry::item("Make Group Owner", move |_, cx| {
+                let store = give.clone();
+                crate::confirm::ask(format!("Make {whom} the owner"), format!("Hand this group over to {whom}? You won't own it anymore."), "Make Owner", move |cx| {
+                    store.update(cx, |store, cx| store.make_group_owner(channel, user, cx));
+                }, cx);
+            }).danger());
             entries.push(Entry::Separator);
+        }
+        if let Some(guild) = guild.filter(|_| mods.nickname) {
+            entries.push(Entry::item("Change Nickname", panel(What::Nickname { guild, user, me: is_me, name: name.clone(), current: server_nick })));
+        }
+        if !is_me {
+            entries.push(Entry::later("Apps"));
+            if friend {
+                entries.push(Entry::later("Invite to Server"));
+                let (store, who) = (store.clone(), name.clone());
+                entries.push(Entry::item("Remove Friend", move |_, cx| {
+                    let store = store.clone();
+                    crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from your friends?"), "Remove Friend", move |cx| {
+                        store.update(cx, |store, cx| store.remove_friend(user, cx));
+                    }, cx);
+                }));
+            } else if !bot {
+                let store = store.clone();
+                entries.push(Entry::item("Add Friend", move |_, cx| store.update(cx, |store, cx| store.add_friend(user, cx))));
+            }
             entries.push(Entry::later("Ignore"));
-            entries.push(Entry::later("Block"));
-            // Only what we may do. All dimmed for now: each needs a confirm step when built.
-            if let Some(guild) = self.guild {
-                use cord_core::permissions as perm;
-                let held = self.ctx.services.store.read(cx).cache().guild_permissions(guild);
-                let can = |p: u64| held & (p | perm::ADMINISTRATOR) != 0;
-                let actions = [
-                    (perm::MANAGE_NICKNAMES, "Change Nickname".to_string(), false),
-                    (perm::MANAGE_ROLES, "Roles".to_string(), false),
-                    (perm::MODERATE_MEMBERS, format!("Timeout {name}"), true),
-                    (perm::KICK_MEMBERS, format!("Kick {name}"), true),
-                    (perm::BAN_MEMBERS, format!("Ban {name}"), true),
-                ];
-                if actions.iter().any(|(p, _, _)| can(*p)) {
-                    entries.push(Entry::Separator);
+            let (store, who) = (store.clone(), name.clone());
+            entries.push(Entry::item("Block", move |_, cx| {
+                let store = store.clone();
+                crate::confirm::ask(format!("Block {who}"), format!("Block {who}? They won't be able to message you, and you won't see them in your friends."), "Block", move |cx| {
+                    store.update(cx, |store, cx| store.block_user(user, cx));
+                }, cx);
+            }).danger());
+        }
+        // Server moderation: each opens its own panel, which is the confirmation.
+        if let Some(guild) = guild {
+            if mods.roles {
+                entries.push(Entry::Separator);
+                entries.push(Entry::later("Roles"));
+            }
+            if mods.mod_view || mods.timeout || mods.kick || mods.ban {
+                entries.push(Entry::Separator);
+                if mods.mod_view {
+                    entries.push(Entry::later("Open in Mod View"));
                 }
-                for (permission, label, danger) in actions {
-                    if can(permission) {
-                        let entry = Entry::later(label);
-                        entries.push(if danger { entry.danger() } else { entry });
-                    }
+                if mods.timeout {
+                    entries.push(Entry::item(format!("Timeout {name}"), panel(What::Timeout { guild, user, name: name.clone() })).danger());
+                }
+                if mods.kick {
+                    entries.push(Entry::item(format!("Kick {name}"), panel(What::Kick { guild, user, name: name.clone(), handle: handle.clone() })).danger());
+                }
+                if mods.ban {
+                    entries.push(Entry::item(format!("Ban {name}"), panel(What::Ban { guild, user, handle: name.clone() })).danger());
                 }
             }
         }
@@ -3615,6 +3664,18 @@ impl Render for ChannelPage {
                         let page = page.clone();
                         Rc::new(move |user, position, window, cx| {
                             let _ = page.update(cx, |page, cx| page.open_profile(user, position, window, cx));
+                        })
+                    },
+                    open_user_menu: {
+                        let page = page.clone();
+                        Rc::new(move |user, position, cx| {
+                            let _ = page.update(cx, |page, cx| {
+                                let name = {
+                                    let cache = page.ctx.services.store.read(cx).cache();
+                                    cache.user(user).map_or_else(|| "this person".to_string(), |u| cache.display_name(page.guild, u).to_string())
+                                };
+                                page.user_menu(user, name, position, cx);
+                            });
                         })
                     },
                     who_reacted: {

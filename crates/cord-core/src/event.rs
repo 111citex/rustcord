@@ -77,6 +77,8 @@ pub enum CoreEvent {
     /// Someone joined or left a group chat.
     RecipientAdd { channel_id: Id, user: User },
     RecipientRemove { channel_id: Id, user_id: Id },
+    /// A message was pinned or unpinned in this channel.
+    PinsChanged { channel_id: Id },
     /// A call in a DM or group started, or changed who it's ringing.
     CallUpdate(crate::call::Call),
     /// The last person left a DM or group call.
@@ -231,7 +233,8 @@ impl ReactionEvent {
 }
 
 #[derive(Deserialize)]
-struct CallGone {
+/// Anything that only names a channel.
+struct ChannelOnly {
     channel_id: Id,
 }
 
@@ -509,8 +512,9 @@ pub fn decode_dispatch(t: &str, d: Value) -> Option<CoreEvent> {
         "GUILD_MEMBER_LIST_UPDATE" => from_value(d).map(|u| CoreEvent::MemberListUpdate(Box::new(u))),
         "CHANNEL_RECIPIENT_ADD" => from_value::<RecipientEvent>(d).map(|e| CoreEvent::RecipientAdd { channel_id: e.channel_id, user: e.user }),
         "CHANNEL_RECIPIENT_REMOVE" => from_value::<RecipientEvent>(d).map(|e| CoreEvent::RecipientRemove { channel_id: e.channel_id, user_id: e.user.id }),
+        "CHANNEL_PINS_UPDATE" => from_value::<ChannelOnly>(d).map(|c| CoreEvent::PinsChanged { channel_id: c.channel_id }),
         "CALL_CREATE" | "CALL_UPDATE" => from_value(d).map(CoreEvent::CallUpdate),
-        "CALL_DELETE" => from_value::<CallGone>(d).map(|c| CoreEvent::CallDelete { channel_id: c.channel_id }),
+        "CALL_DELETE" => from_value::<ChannelOnly>(d).map(|c| CoreEvent::CallDelete { channel_id: c.channel_id }),
         "VOICE_SERVER_UPDATE" => from_value(d).map(CoreEvent::VoiceServer),
         "VOICE_STATE_UPDATE" => match from_value::<VoiceEvent>(d) {
             Ok(v) => match v.guild_id.or(v.state.guild_id) {

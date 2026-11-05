@@ -580,6 +580,24 @@ impl Core {
         self.on_rt(async move { reqwest::get(url).await?.error_for_status()?.text().await }).await
     }
 
+    /// A channel's pinned messages, newest pin first.
+    pub async fn pins(&self, channel: Id) -> Result<Vec<Message>, HttpError> {
+        let http = self.http.clone();
+        let result = self.on_rt(async move { http.get::<Value>(&format!("/channels/{channel}/messages/pins?limit=50")).await }).await;
+        self.watch(result).map(crate::search::read_pins)
+    }
+
+    /// One page of a message search: in a whole server, or in one DM or group.
+    pub async fn search(&self, guild: Option<Id>, channel: Id, query: &crate::search::Query) -> Result<crate::search::Answer, HttpError> {
+        let http = self.http.clone();
+        let path = match guild {
+            Some(guild) => format!("/guilds/{guild}/messages/search?{}", query.query_string()),
+            None => format!("/channels/{channel}/messages/search?{}", query.query_string()),
+        };
+        let result = self.on_rt(async move { http.get::<Value>(&path).await }).await;
+        self.watch(result).map(crate::search::read_answer)
+    }
+
     /// Rings a DM or group call: everyone in it when `users` is `None`.
     pub async fn ring(&self, channel: Id, users: Option<Vec<Id>>) -> Result<(), HttpError> {
         let http = self.http.clone();

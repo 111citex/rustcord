@@ -192,6 +192,17 @@ pub struct Store {
     declined: std::collections::HashSet<Id>,
     /// The ring playing: someone calling us (`true`), or us calling them.
     ring: Option<(bool, cord_voice::Looping)>,
+    /// Pinned messages fetched, by channel, and the channel whose pins are on screen.
+    pins: HashMap<Id, Pins>,
+    pins_shown: Option<Id>,
+}
+
+/// A channel's pinned messages, as far as they've been fetched.
+#[derive(Clone, Debug)]
+pub enum Pins {
+    Loading,
+    Loaded(Vec<Message>),
+    Failed(String),
 }
 
 /// How long a TYPING_START counts, as in Discord.
@@ -201,7 +212,7 @@ impl EventEmitter<StoreEvent> for Store {}
 
 impl Store {
     pub fn new(core: Arc<Core>, toasts: Entity<Toasts>) -> Self {
-        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None, declined: Default::default(), ring: None }
+        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None, declined: Default::default(), ring: None, pins: HashMap::new(), pins_shown: None }
     }
 
     pub fn core(&self) -> &Arc<Core> {
@@ -689,6 +700,43 @@ impl Store {
             Err(error) => Self::report(this, Err(error), "Couldn't start the call", cx),
         })
         .detach();
+    }
+
+    pub fn pins(&self, channel: Id) -> Option<&Pins> {
+        self.pins.get(&channel)
+    }
+
+    /// The pins of `channel` are on screen (or none are): fetched once, then kept
+    /// current by the gateway saying when they change.
+    pub fn show_pins(&mut self, channel: Option<Id>, cx: &mut Context<Self>) {
+        self.pins_shown = channel;
+        if let Some(channel) = channel.filter(|c| !matches!(self.pins.get(c), Some(Pins::Loading | Pins::Loaded(_)))) {
+            self.fetch_pins(channel, cx);
+        }
+    }
+
+    fn fetch_pins(&mut self, channel: Id, cx: &mut Context<Self>) {
+        self.pins.insert(channel, Pins::Loading);
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.pins(channel).await;
+            let _ = this.update(cx, |store, cx| {
+                store.pins.insert(channel, match result {
+                    Ok(messages) => Pins::Loaded(messages),
+                    Err(error) => Pins::Failed(error.to_string()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Pins changed in `channel`: what we hold is out of date.
+    fn pins_changed(&mut self, channel: Id, cx: &mut Context<Self>) {
+        self.pins.remove(&channel);
+        if self.pins_shown == Some(channel) {
+            self.fetch_pins(channel, cx);
+        }
     }
 
     /// Answers a call ringing here.
@@ -1206,6 +1254,12 @@ impl Store {
                     cx.notify();
                 }
                 return;
+            }
+            CoreEvent::PinsChanged { channel_id } => self.pins_changed(channel_id, cx),
+            CoreEvent::MessageUpdate(edit) if edit.pinned.is_some() => {
+                let channel = edit.channel_id;
+                self.cache.apply(CoreEvent::MessageUpdate(edit));
+                self.pins_changed(channel, cx);
             }
             CoreEvent::PrivateVoiceState(state) => {
                 self.own_voice_state(&state, cx);

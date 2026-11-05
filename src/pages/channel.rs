@@ -111,6 +111,9 @@ pub struct ChannelPage {
     delete_closing: bool,
     /// The composer says "Message #name" (not just "Message") yet.
     placeholder_named: bool,
+    /// The pinned messages popout is open, hanging from this point (the pin button).
+    pins_at: Option<Point<Pixels>>,
+    pins_scroll: gpui_kit::ScrollHandle,
     /// RUSTCORD_BENCH=1: scroll on its own every frame and log the frame rate.
     bench: Option<Bench>,
     _subscriptions: Vec<Subscription>,
@@ -331,6 +334,11 @@ impl ChannelPage {
                         return;
                     }
                     let _ = page.update(cx, |page, cx| {
+                        if key == "escape" && page.pins_at.is_some() && !crate::confirm::is_open(cx) {
+                            page.toggle_pins(None, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         if page.suggest.is_none() {
                             // Up in an empty box: edit our latest message.
                             let in_box = gpui_kit::Focusable::focus_handle(page.input.read(cx), cx).is_focused(window);
@@ -448,6 +456,8 @@ impl ChannelPage {
             highlight: Rc::default(),
             jumps: 0,
             bench: std::env::var_os("RUSTCORD_BENCH").map(|_| Bench::new()),
+            pins_at: None,
+            pins_scroll: gpui_kit::ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         page.guild = page.server(cx);
@@ -554,6 +564,105 @@ impl ChannelPage {
                 .child(controls)
                 .into_any_element(),
         )
+    }
+
+    /// Opens the pinned messages under `at`, or closes them (`None`, or a second click).
+    fn toggle_pins(&mut self, at: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        self.pins_at = if self.pins_at.is_some() { None } else { at };
+        let shown = self.pins_at.and(self.channel);
+        self.ctx.services.store.update(cx, |store, cx| store.show_pins(shown, cx));
+        cx.notify();
+    }
+
+    /// Discord's pinned messages popout: newest pin first, each with Jump, and Unpin
+    /// for whoever may.
+    fn pins_popout(&self, channel: Id, at: Point<Pixels>, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let store = self.ctx.services.store.read(cx);
+        let cache = store.cache();
+        let guild = self.guild;
+        let may_unpin = guild.is_none() || cache.has_permission(channel, cord_core::permissions::PIN_MESSAGES) || cache.has_permission(channel, cord_core::permissions::MANAGE_MESSAGES);
+        let note = |text: String| div().py(u(32.)).px(u(16.)).text_center().text_size(u(14.)).text_color(theme.muted_foreground).child(text);
+        let body = match store.pins(channel) {
+            None | Some(crate::store::Pins::Loading) => note("Loading…".into()).into_any_element(),
+            Some(crate::store::Pins::Failed(error)) => note(format!("Couldn't load the pinned messages: {error}")).into_any_element(),
+            Some(crate::store::Pins::Loaded(list)) if list.is_empty() => note("This channel doesn't have any pinned messages... yet.".into()).into_any_element(),
+            Some(crate::store::Pins::Loaded(list)) => {
+                let channel_of = Rc::new(list.iter().map(|m| (m.id, channel)).collect());
+                let shared = crate::message_card::shared(&self.ctx.services.store, channel_of, self.parsed.clone(), self.revealed.clone(), self.ctx.services.settings.read(cx).get().chat_text as f32);
+                v_flex()
+                    .gap(u(8.))
+                    .p(u(12.))
+                    .children(list.iter().map(|m| {
+                        let unpin = may_unpin.then(|| {
+                            let (store, id) = (self.ctx.services.store.clone(), m.id);
+                            div()
+                                .id(SharedString::from(format!("unpin-{id}")))
+                                .size(u(24.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(u(4.))
+                                .bg(theme.background)
+                                .cursor_pointer()
+                                .hover(|d| d.bg(theme.danger.opacity(0.3)))
+                                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Unpin").build(window, cx))
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let store = store.clone();
+                                    crate::confirm::ask("Unpin Message".into(), "You sure you want to remove this pinned message?".into(), "Remove it please!", move |cx| {
+                                        store.update(cx, |store, cx| store.unpin_message(channel, id, cx));
+                                    }, cx);
+                                })
+                                .child(Icon::new(IconName::Close).size(u(14.)))
+                                .into_any_element()
+                        });
+                        crate::message_card::card(SharedString::from(format!("pin-{}", m.id)), m, guild, cache, &shared, unpin, cx)
+                    }))
+                    .into_any_element()
+            }
+        };
+        let page = cx.entity().downgrade();
+        let viewport = window.viewport_size();
+        let panel = v_flex()
+            .id("pins-popout")
+            .occlude()
+            .w(u(420.))
+            .max_h(u(560.))
+            .rounded(u(8.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .shadow_lg()
+            .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .h(u(48.))
+                    .px(u(16.))
+                    .gap(u(8.))
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(Icon::default().path("icons/toolbar-pin.svg").size(u(20.)))
+                    .child(div().text_size(u(16.)).font_weight(FontWeight::SEMIBOLD).child("Pinned Messages")),
+            )
+            .child(div().id("pins-list").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.pins_scroll).child(body));
+        // A click anywhere else closes it, as Discord's popouts do.
+        gpui_kit::deferred(
+            gpui_kit::anchored().position(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.))).child(
+                div()
+                    .id("pins-outside")
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
+                        let _ = page.update(cx, |page, cx| page.toggle_pins(None, cx));
+                    })
+                    .child(gpui_kit::anchored().anchor(gpui_kit::Anchor::TopRight).position(gpui_kit::point(at.x + gpui_kit::px(16.), at.y + gpui_kit::px(20.))).snap_to_window_with_margin(gpui_kit::px(8.)).child(panel)),
+            ),
+        )
+        .with_priority(3)
+        .into_any_element()
     }
 
     fn is_voice(&self, cx: &App) -> bool {
@@ -3551,6 +3660,10 @@ impl Render for ChannelPage {
             }
         }
         if let Some(target) = self.channel.and_then(|c| crate::links::take_jump(c, cx)) {
+            // Jumping from the pins: they've done their job.
+            if self.pins_at.take().is_some() {
+                self.ctx.services.store.update(cx, |store, cx| store.show_pins(None, cx));
+            }
             self.jump_target = Some((target, 0));
             self.seek_jump_target(cx);
         }
@@ -3979,7 +4092,9 @@ impl Render for ChannelPage {
                     store.update(cx, |store, cx| store.start_call(channel_id, cx));
                 }))
             })
-            .child(tool_button("pin", "icons/toolbar-pin.svg", "Pinned Messages", cx))
+            .child(tool_button("pin", "icons/toolbar-pin.svg", "Pinned Messages", cx).on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                this.toggle_pins(Some(event.position()), cx);
+            })))
             .when(self.guild.is_some() || channel.kind == ChannelKind::GroupDm, |this| {
                 this.child(
                     Button::new("toggle-members")
@@ -4321,6 +4436,7 @@ impl Render for ChannelPage {
             .when_some(top_header, |d, header| d.child(div().absolute().top_0().left_0().right_0().h(u(TOP_BAR)).occlude().child(header)))
             .children(self.profile.as_ref().map(|(card, _)| card.clone()))
             .when_some(self.confirm_delete, |d, message| d.child(self.delete_dialog(message, window, cx)))
+            .when_some(self.pins_at, |d, at| d.child(self.pins_popout(channel_id, at, window, cx)))
             .into_any_element()
     }
 }

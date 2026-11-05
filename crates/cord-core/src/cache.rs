@@ -1487,6 +1487,8 @@ impl Cache {
                 }
                 self.bump_sidebar();
             }
+            // The store keeps pins.
+            CoreEvent::PinsChanged { .. } => {}
             CoreEvent::CallDelete { channel_id } => {
                 self.calls.remove(&channel_id);
                 self.bump_sidebar();

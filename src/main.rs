@@ -42,6 +42,7 @@ mod badges;
 mod markdown;
 mod markdown_view;
 mod members;
+mod message_card;
 mod message_text;
 mod nav;
 mod pages;

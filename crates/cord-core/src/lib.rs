@@ -19,6 +19,7 @@ pub mod paths;
 pub mod permissions;
 pub mod profile;
 pub mod rich;
+pub mod search;
 pub mod settings_proto;
 
 pub use crate::client::{API_BASE, Core, CoreConfig, startup_identity};

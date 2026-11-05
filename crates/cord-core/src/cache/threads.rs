@@ -344,6 +344,7 @@ mod tests {
             voice_states: vec![], emojis: vec![], premium_tier: 0, banner: None, rules_channel: None,
         });
         c.insert_member(Id(1), super::tests_support::member(7));
+        c.insert_channel(parent());
         c.insert_channel(thread(20, true));
         assert!(c.can_view(Id(20)));
         // No Send Messages in Threads: the thread's composer is closed, the channel's isn't.
@@ -353,6 +354,30 @@ mod tests {
         hidden.permission_overwrites = vec![PermissionOverwrite { id: Id(1), kind: OverwriteKind::Role, allow: 0, deny: permissions::VIEW_CHANNEL }];
         c.insert_channel(hidden);
         assert!(!c.can_view(Id(20)));
+    }
+
+    #[test]
+    fn starting_and_managing_threads_follow_permissions() {
+        use crate::model::Role;
+        let role = |id: u64, permissions: u64| Role { id: Id(id), name: String::new(), color: 0, position: 0, permissions, hoist: false, icon: None, unicode_emoji: None, colors: None, mentionable: false };
+        let guild = |everyone: u64| Guild {
+            id: Id(1), name: "g".into(), icon: None, unavailable: false, channels: vec![], roles: vec![role(1, everyone)], owner_id: Some(Id(99)),
+            voice_states: vec![], emojis: vec![], premium_tier: 0, banner: None, rules_channel: None,
+        };
+        let with = |everyone: u64| {
+            let mut c = cache();
+            c.insert_guild(guild(everyone));
+            c.insert_member(Id(1), super::tests_support::member(7));
+            c.insert_channel(parent());
+            c.insert_channel(thread(20, true));
+            c
+        };
+        assert!(!with(permissions::VIEW_CHANNEL | permissions::SEND_MESSAGES).can_start_thread(Id(10)));
+        let c = with(permissions::VIEW_CHANNEL | permissions::CREATE_PUBLIC_THREADS | permissions::MANAGE_THREADS);
+        assert!(c.can_start_thread(Id(10)));
+        assert!(c.can_manage_threads(Id(20)));
+        // A thread can't have a thread of its own.
+        assert!(!c.can_start_thread(Id(20)));
     }
 }
 

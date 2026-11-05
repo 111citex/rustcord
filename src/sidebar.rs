@@ -65,6 +65,7 @@ pub fn channel_icon(kind: ChannelKind) -> IconName {
         ChannelKind::Announcement => IconName::Megaphone,
         ChannelKind::Voice | ChannelKind::Stage => IconName::Volume2,
         ChannelKind::Forum => IconName::MessageSquare,
+        ChannelKind::Media => IconName::Image,
         _ => IconName::Hash,
     }
 }
@@ -375,7 +376,7 @@ pub fn build(cache: &Cache, location: Location, collapsed: &Collapsed) -> Sideba
                         label: nav::channel_label(cache, channel),
                         path: nav::channel_path(channel),
                         // A voice row itself is for joining, later; its chat opens from the icon.
-                        clickable: channel.kind.is_text_like() || channel.kind == ChannelKind::Forum,
+                        clickable: channel.kind.is_text_like() || channel.kind.is_forum_like(),
                         can_invite: cache.has_permission(channel.id, cord_core::permissions::CREATE_INSTANT_INVITE),
                         can_edit: cache.has_permission(channel.id, cord_core::permissions::MANAGE_CHANNELS),
                         unread: cache.is_unread(channel.id),
@@ -392,12 +393,8 @@ pub fn build(cache: &Cache, location: Location, collapsed: &Collapsed) -> Sideba
                     if matches!(channel.kind, ChannelKind::Voice | ChannelKind::Stage) {
                         rows.extend(participants(cache, guild, channel.id).into_iter().map(Row::Participant));
                     }
-                    let mut threads: Vec<&Channel> = cache
-                        .guild_channels(guild)
-                        .into_iter()
-                        .filter(|t| t.kind == ChannelKind::Thread && t.parent_id == Some(channel.id))
-                        .collect();
-                    threads.sort_by_key(|t| t.id);
+                    // Threads we're in, and the one being read whatever its state.
+                    let threads = cache.listed_threads(guild, channel.id, location.channel);
                     rows.extend(threads.into_iter().map(|t| {
                         Row::Thread(ChannelRow {
                             id: t.id,
@@ -549,6 +546,7 @@ mod tests {
         assert_eq!(path(ChannelKind::Voice), IconName::Volume2.path().to_string());
         assert_eq!(path(ChannelKind::Stage), IconName::Volume2.path().to_string());
         assert_eq!(path(ChannelKind::Forum), IconName::MessageSquare.path().to_string());
+        assert_eq!(path(ChannelKind::Media), IconName::Image.path().to_string());
     }
 
     fn vs(user: u64, channel: u64, f: impl FnOnce(&mut VoiceState)) -> VoiceState {

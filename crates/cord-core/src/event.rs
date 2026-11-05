@@ -616,6 +616,68 @@ mod tests {
     }
 
     #[test]
+    fn decodes_thread_dispatches() {
+        let thread = json!({"id": "20", "type": 11, "guild_id": "1", "parent_id": "10", "name": "a thread", "owner_id": "7", "newly_created": true, "member": {"user_id": "7"},
+            "thread_metadata": {"archived": false, "locked": true, "auto_archive_duration": 4320}});
+        let Some(CoreEvent::ThreadUpsert { thread: t, created }) = decode_dispatch("THREAD_CREATE", thread.clone()) else { panic!("no thread") };
+        assert!(created);
+        let info = t.thread.unwrap();
+        assert!(info.joined && info.locked && !info.archived);
+        assert_eq!(info.auto_archive, 4320);
+        let Some(CoreEvent::ThreadUpsert { created, .. }) = decode_dispatch("THREAD_UPDATE", thread) else { panic!("no update") };
+        assert!(!created);
+        assert!(matches!(decode_dispatch("THREAD_DELETE", json!({"id": "20", "guild_id": "1", "parent_id": "10", "type": 11})), Some(CoreEvent::ThreadDelete { id: Id(20) })));
+    }
+
+    #[test]
+    fn decodes_thread_lists_and_members() {
+        let Some(CoreEvent::ThreadListSync { guild_id, parents, threads, joined }) = decode_dispatch(
+            "THREAD_LIST_SYNC",
+            json!({"guild_id": "1", "channel_ids": ["10"], "threads": [{"id": "20", "type": 11, "parent_id": "10"}, {"junk": 1}], "members": [{"id": "20", "user_id": "7"}]}),
+        ) else {
+            panic!("no sync")
+        };
+        assert_eq!((guild_id, parents, threads.len(), joined), (Id(1), Some(vec![Id(10)]), 1, vec![Id(20)]));
+        let Some(CoreEvent::ThreadListSync { parents, .. }) = decode_dispatch("THREAD_LIST_SYNC", json!({"guild_id": "1", "threads": []})) else { panic!("no sync") };
+        assert_eq!(parents, None);
+        assert!(matches!(
+            decode_dispatch("THREAD_MEMBER_UPDATE", json!({"id": "20", "guild_id": "1", "user_id": "7"})),
+            Some(CoreEvent::ThreadJoined { id: Id(20), user_id: Some(Id(7)) })
+        ));
+        let Some(CoreEvent::ThreadMembers { id, count, added, removed }) = decode_dispatch(
+            "THREAD_MEMBERS_UPDATE",
+            json!({"id": "20", "guild_id": "1", "member_count": 3, "added_members": [{"user_id": "7", "id": "20"}], "removed_member_ids": ["8"]}),
+        ) else {
+            panic!("no members")
+        };
+        assert_eq!((id, count, added, removed), (Id(20), Some(3), vec![Id(7)], vec![Id(8)]));
+    }
+
+    #[test]
+    fn a_forum_decodes_with_its_tags_and_rules() {
+        let forum: Channel = serde_json::from_value(json!({
+            "id": "9", "type": 15, "guild_id": "1", "name": "help", "topic": "Be kind.\nSearch first.", "flags": 16,
+            "available_tags": [{"id": "1", "name": "Solved", "moderated": true, "emoji_name": "ok"}, {"id": "2", "name": "Open", "emoji_id": "55"}],
+            "default_sort_order": 1, "default_forum_layout": 2, "default_reaction_emoji": {"emoji_name": "x"}, "template": "Describe it",
+        }))
+        .unwrap();
+        let info = forum.forum.unwrap();
+        assert!(info.requires_tag());
+        assert_eq!((info.sort_order, info.layout), (1, 2));
+        assert_eq!(info.tags.len(), 2);
+        assert!(info.tag(Id(1)).unwrap().moderated);
+        assert_eq!(info.tag(Id(2)).unwrap().emoji_id, Some(Id(55)));
+        assert_eq!(info.template.as_deref(), Some("Describe it"));
+        assert!(forum.thread.is_none());
+        let media: Channel = serde_json::from_value(json!({"id": "9", "type": 16})).unwrap();
+        assert!(media.kind.is_forum_like() && media.forum.is_some());
+        let post: Channel = serde_json::from_value(json!({"id": "30", "type": 11, "parent_id": "9", "applied_tags": ["1"], "flags": 2, "message_count": 4})).unwrap();
+        let post = post.thread.unwrap();
+        assert!(post.pinned());
+        assert_eq!((post.applied_tags, post.message_count), (vec![Id(1)], 4));
+    }
+
+    #[test]
     fn decodes_reaction_dispatches() {
         let add = decode_dispatch(
             "MESSAGE_REACTION_ADD",

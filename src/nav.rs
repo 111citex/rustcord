@@ -210,6 +210,10 @@ pub fn composer_lock(cache: &Cache, channel: &Channel) -> Option<String> {
     if let Some(until) = channel.guild_id.and_then(|g| cache.timed_out_until(g)) {
         return Some(timeout_notice(&until, &chrono::Local::now()));
     }
+    // A locked thread listens to people who manage threads only.
+    if channel.thread.as_ref().is_some_and(|t| t.locked) && !cache.can_manage_threads(channel.id) {
+        return Some("This thread is locked.".to_string());
+    }
     (!cache.can_send(channel.id)).then(|| "You do not have permission to send messages in this channel.".to_string())
 }
 

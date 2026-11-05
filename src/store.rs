@@ -16,6 +16,8 @@ use gpui_kit::{App, Context, Entity, EventEmitter, Task};
 
 use crate::toasts::{Toast, Toasts};
 
+mod threads;
+
 #[derive(Clone)]
 pub struct Services {
     pub core: Arc<Core>,

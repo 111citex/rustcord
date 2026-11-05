@@ -544,6 +544,7 @@ impl WgpuRenderer {
         });
         #[cfg(not(target_family = "wasm"))]
         let render_thread = {
+            gpui::frame_stats::PRESENTED_BY_RENDER_THREAD.store(true, std::sync::atomic::Ordering::Relaxed);
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("gpui-render".to_string())
@@ -814,7 +815,9 @@ impl RenderTarget {
             return false;
         }
 
+        let present_start = std::time::Instant::now();
         surface_texture.present();
+        gpui::frame_stats::presented(present_start, std::time::Instant::now());
         gpui::frame_stats::since(&gpui::frame_stats::RENDER_NS, render_start);
         gpui::frame_stats::add(&gpui::frame_stats::RENDER_FRAMES, 1);
         true

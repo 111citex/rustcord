@@ -8,6 +8,7 @@ static ALLOCATOR: perf::CountingAlloc = perf::CountingAlloc;
 
 mod animated;
 mod add_people;
+mod call_ring;
 mod confirm;
 mod discord_icons;
 mod emoji_card;

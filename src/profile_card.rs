@@ -892,6 +892,8 @@ impl ProfileCard {
                 .hover(|d| d.bg(text.opacity(0.2)))
         };
         let store = self.services.store.clone();
+        let call_store = store.clone();
+        let card_for_menu = card.clone();
         let message_icon = || Icon::new(gpui_kit::assets::IconName::MessageCircle);
         let row = h_flex().gap(u(8.)).items_center();
         let row = if friend {
@@ -920,9 +922,20 @@ impl ProfileCard {
             square("full-more")
                 .child(h_flex().gap(u(3.)).children((0..3).map(|_| div().size(u(4.)).rounded_full().bg(text))))
                 .on_click(move |event, _, cx| {
+                    let card = card_for_menu.clone();
+                    let bot = call_store.read(cx).cache().user(user).is_some_and(|u| u.bot);
+                    let me = call_store.read(cx).cache().me().is_some_and(|m| m.id == user);
+                    let call = (!bot && !me).then(|| {
+                        let store = call_store.clone();
+                        Entry::item("Start a Call", move |_, cx| {
+                            let _ = card.update(cx, |_, cx| cx.emit(ProfileEvent::Close));
+                            store.update(cx, |store, cx| store.call_user(user, cx));
+                        })
+                        .picture("icons/phone.svg")
+                    });
                     menu::show(
                         event.position(),
-                        vec![
+                        call.into_iter().chain([
                             Entry::later("Share Profile"),
                             Entry::later("Shop This Look"),
                             Entry::later("Invite to Server"),
@@ -932,7 +945,8 @@ impl ProfileCard {
                             Entry::later("Report User Profile").danger(),
                             Entry::Separator,
                             Entry::copy("Copy User ID", user.to_string()).icon(gpui_kit::assets::IconName::Copy),
-                        ],
+                        ])
+                        .collect(),
                         cx,
                     );
                 }),

@@ -580,6 +580,32 @@ impl Core {
         self.on_rt(async move { reqwest::get(url).await?.error_for_status()?.text().await }).await
     }
 
+    /// Rings a DM or group call: everyone in it when `users` is `None`.
+    pub async fn ring(&self, channel: Id, users: Option<Vec<Id>>) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let body = json!({"recipients": users.map(|u| u.iter().map(Id::to_string).collect::<Vec<_>>())});
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.post(&format!("/channels/{channel}/call/ring"), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Stops ringing `users` (ourselves, to decline).
+    pub async fn stop_ringing(&self, channel: Id, users: Vec<Id>) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let body = json!({"recipients": users.iter().map(Id::to_string).collect::<Vec<_>>()});
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.post(&format!("/channels/{channel}/call/stop-ringing"), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
     /// Takes a DM off the list. Nothing is deleted; it comes back with the next message.
     pub async fn close_dm(&self, channel: Id) -> Result<(), HttpError> {
         let http = self.http.clone();

@@ -77,6 +77,12 @@ pub enum CoreEvent {
     /// Someone joined or left a group chat.
     RecipientAdd { channel_id: Id, user: User },
     RecipientRemove { channel_id: Id, user_id: Id },
+    /// A call in a DM or group started, or changed who it's ringing.
+    CallUpdate(crate::call::Call),
+    /// The last person left a DM or group call.
+    CallDelete { channel_id: Id },
+    /// Someone joined, left or changed in a DM or group call.
+    PrivateVoiceState(VoiceState),
     /// Which voice server to connect to, for the call we asked to join.
     VoiceServer(VoiceServer),
     /// Someone started typing (it lasts ten seconds, or until they send).
@@ -222,6 +228,11 @@ impl ReactionEvent {
     fn emoji(&self) -> Result<ReactionEmoji, serde_json::Error> {
         self.emoji.clone().ok_or_else(|| serde::de::Error::missing_field("emoji"))
     }
+}
+
+#[derive(Deserialize)]
+struct CallGone {
+    channel_id: Id,
 }
 
 #[derive(Deserialize)]
@@ -498,12 +509,13 @@ pub fn decode_dispatch(t: &str, d: Value) -> Option<CoreEvent> {
         "GUILD_MEMBER_LIST_UPDATE" => from_value(d).map(|u| CoreEvent::MemberListUpdate(Box::new(u))),
         "CHANNEL_RECIPIENT_ADD" => from_value::<RecipientEvent>(d).map(|e| CoreEvent::RecipientAdd { channel_id: e.channel_id, user: e.user }),
         "CHANNEL_RECIPIENT_REMOVE" => from_value::<RecipientEvent>(d).map(|e| CoreEvent::RecipientRemove { channel_id: e.channel_id, user_id: e.user.id }),
+        "CALL_CREATE" | "CALL_UPDATE" => from_value(d).map(CoreEvent::CallUpdate),
+        "CALL_DELETE" => from_value::<CallGone>(d).map(|c| CoreEvent::CallDelete { channel_id: c.channel_id }),
         "VOICE_SERVER_UPDATE" => from_value(d).map(CoreEvent::VoiceServer),
         "VOICE_STATE_UPDATE" => match from_value::<VoiceEvent>(d) {
             Ok(v) => match v.guild_id.or(v.state.guild_id) {
                 Some(guild_id) => Ok(CoreEvent::VoiceStateUpdate { guild_id, state: v.state, member: v.member }),
-                // A private call: there is no server list to show it in.
-                None => return None,
+                None => Ok(CoreEvent::PrivateVoiceState(v.state)),
             },
             Err(error) => Err(error),
         },
@@ -542,6 +554,15 @@ mod tests {
         assert!(kept.to_string().find("secret").is_none());
     }
     use serde_json::json;
+
+    #[test]
+    fn decodes_private_calls() {
+        let create = decode_dispatch("CALL_CREATE", json!({"channel_id": "9", "ringing": ["3"], "voice_states": []}));
+        assert!(matches!(create, Some(CoreEvent::CallUpdate(c)) if c.ringing == vec![Id(3)]));
+        assert!(matches!(decode_dispatch("CALL_DELETE", json!({"channel_id": "9"})), Some(CoreEvent::CallDelete { channel_id: Id(9) })));
+        let joined = decode_dispatch("VOICE_STATE_UPDATE", json!({"user_id": "2", "channel_id": "9", "guild_id": null}));
+        assert!(matches!(joined, Some(CoreEvent::PrivateVoiceState(v)) if v.channel_id == Some(Id(9))));
+    }
 
     #[test]
     fn decodes_poll_votes() {

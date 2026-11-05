@@ -126,7 +126,8 @@ pub enum StoreEvent {
 
 /// A call being joined or under way. Both of the gateway's answers are needed first.
 struct VoiceJoin {
-    guild: Id,
+    /// `None` in a DM or group call.
+    guild: Option<Id>,
     channel: Id,
     session: Option<String>,
     server: Option<(String, String)>,
@@ -137,7 +138,8 @@ struct VoiceJoin {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VoiceStatus {
     pub channel: Id,
-    pub guild: Id,
+    /// `None` in a DM or group call.
+    pub guild: Option<Id>,
     pub connected: bool,
     pub ping_ms: Option<u32>,
     pub deaf: bool,
@@ -186,6 +188,10 @@ pub struct Store {
     new_after: Option<Id>,
     /// Channel → who is typing there and since when.
     typing: HashMap<Id, Vec<(Id, std::time::Instant)>>,
+    /// Calls we said no to, by channel: they stop ringing here while Discord catches up.
+    declined: std::collections::HashSet<Id>,
+    /// The ring playing: someone calling us (`true`), or us calling them.
+    ring: Option<(bool, cord_voice::Looping)>,
 }
 
 /// How long a TYPING_START counts, as in Discord.
@@ -195,7 +201,7 @@ impl EventEmitter<StoreEvent> for Store {}
 
 impl Store {
     pub fn new(core: Arc<Core>, toasts: Entity<Toasts>) -> Self {
-        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None }
+        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None, declined: Default::default(), ring: None }
     }
 
     pub fn core(&self) -> &Arc<Core> {
@@ -602,14 +608,16 @@ impl Store {
         cx.notify();
     }
 
-    /// Joins a voice channel, just listening so far.
-    pub fn join_voice(&mut self, guild: Id, channel: Id, cx: &mut Context<Self>) {
+    /// Joins a voice channel, or a DM or group call (`guild` `None`), just listening so far.
+    pub fn join_voice(&mut self, guild: Option<Id>, channel: Id, cx: &mut Context<Self>) {
         if self.voice.as_ref().is_some_and(|v| v.channel == channel) {
             return;
         }
         self.voice = Some(VoiceJoin { guild, channel, session: None, server: None, call: None });
+        // Answering a call here stops it ringing here.
+        self.declined.remove(&channel);
         self.core.send_gateway(serde_json::json!({"op": 4, "d": {
-            "guild_id": guild.to_string(),
+            "guild_id": guild.map(|g| g.to_string()),
             "channel_id": channel.to_string(),
             "self_mute": true,
             "self_deaf": false,
@@ -650,10 +658,105 @@ impl Store {
         cx.notify();
     }
 
+    /// Starts a call in a DM or group, or joins the one under way. A new call rings
+    /// everyone in the conversation, as Discord's own client does.
+    pub fn start_call(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let under_way = self.cache.call(channel).is_some_and(|c| c.participants().next().is_some());
+        self.join_voice(None, channel, cx);
+        if under_way {
+            return;
+        }
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.ring(channel, None).await;
+            Self::report(this, result, "Couldn't ring them", cx);
+        })
+        .detach();
+    }
+
+    /// Calls `user`: opens (or finds) the DM with them, starts the call there, and goes to it.
+    pub fn call_user(&mut self, user: Id, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| match core.open_dm(user).await {
+            Ok(channel) => {
+                let id = channel.id;
+                let _ = this.update(cx, |store, cx| {
+                    store.add_channel(channel, cx);
+                    store.start_call(id, cx);
+                });
+                cx.update(|cx| crate::links::go(format!("/channels/@me/{id}"), cx));
+            }
+            Err(error) => Self::report(this, Err(error), "Couldn't start the call", cx),
+        })
+        .detach();
+    }
+
+    /// Answers a call ringing here.
+    pub fn accept_call(&mut self, channel: Id, cx: &mut Context<Self>) {
+        self.join_voice(None, channel, cx);
+        self.update_ring();
+    }
+
+    /// Says no to a call: it stops ringing here and on our other devices.
+    pub fn decline_call(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let Some(me) = self.cache.me().map(|u| u.id) else { return };
+        self.declined.insert(channel);
+        self.update_ring();
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.stop_ringing(channel, vec![me]).await;
+            Self::report(this, result, "Couldn't decline the call", cx);
+        })
+        .detach();
+    }
+
+    /// Calls ringing here now, newest conversation first.
+    pub fn incoming_calls(&self) -> Vec<Id> {
+        let ours = self.voice.as_ref().map(|v| v.channel);
+        let mut calls: Vec<Id> = self
+            .cache
+            .calls()
+            .filter(|c| Some(c.channel_id) != ours && !self.declined.contains(&c.channel_id) && self.cache.call_rings(c))
+            .map(|c| c.channel_id)
+            .collect();
+        calls.sort_by(|a, b| b.cmp(a));
+        calls
+    }
+
+    /// Whether the DM or group call we're in is still ringing people with nobody else in it yet.
+    fn calling_out(&self) -> bool {
+        let Some(voice) = self.voice.as_ref().filter(|v| v.guild.is_none()) else { return false };
+        let me = self.cache.me().map(|u| u.id);
+        self.cache.call(voice.channel).is_some_and(|c| !c.ringing.is_empty() && c.participants().all(|u| Some(u) == me))
+    }
+
+    /// Starts or stops the ring to match what's ringing, after anything that may change it.
+    fn update_ring(&mut self) {
+        let Some(me) = self.cache.me().map(|u| u.id) else { return };
+        // A no only lasts while Discord is still ringing us for it.
+        self.declined.retain(|channel| self.cache.call(*channel).is_some_and(|c| c.ringing.contains(&me)));
+        let wanted = if !self.incoming_calls().is_empty() {
+            Some(true)
+        } else if self.calling_out() {
+            Some(false)
+        } else {
+            None
+        };
+        if self.ring.as_ref().map(|(incoming, _)| *incoming) == wanted {
+            return;
+        }
+        self.ring = wanted.map(|incoming| {
+            let sound = if incoming { cord_voice::Sound::Incoming } else { cord_voice::Sound::Outgoing };
+            (incoming, cord_voice::play_looping(cord_voice::stand_in(sound), std::time::Duration::from_millis(if incoming { 900 } else { 1600 })))
+        });
+    }
+
     pub fn leave_voice(&mut self, cx: &mut Context<Self>) {
         let Some(voice) = self.voice.take() else { return };
+        self.update_ring();
         self.core.send_gateway(serde_json::json!({"op": 4, "d": {
-            "guild_id": voice.guild.to_string(),
+            "guild_id": voice.guild.map(|g| g.to_string()),
             "channel_id": null,
             "self_mute": false,
             "self_deaf": false,
@@ -687,7 +790,7 @@ impl Store {
         call.set_deaf(deaf);
         call.play_sound(if deaf { cord_voice::Sound::Deafened } else { cord_voice::Sound::Undeafened });
         self.core.send_gateway(serde_json::json!({"op": 4, "d": {
-            "guild_id": voice.guild.to_string(),
+            "guild_id": voice.guild.map(|g| g.to_string()),
             "channel_id": voice.channel.to_string(),
             "self_mute": true,
             "self_deaf": deaf,
@@ -753,7 +856,8 @@ impl Store {
         let call = cord_voice::VoiceCall::join(
             cord_voice::JoinInfo {
                 endpoint,
-                server_id: voice.guild.0,
+                // A private call is its own server.
+                server_id: voice.guild.unwrap_or(voice.channel).0,
                 channel_id: voice.channel.0,
                 user_id: me.0,
                 session_id: session,
@@ -1033,6 +1137,28 @@ impl Store {
         .detach();
     }
 
+    /// Our own voice state: the session the call needs, or that we've been moved or removed.
+    fn own_voice_state(&mut self, state: &cord_core::model::VoiceState, cx: &mut Context<Self>) {
+        if self.cache.me().is_none_or(|me| me.id != state.user_id) {
+            return;
+        }
+        match &mut self.voice {
+            Some(_) if state.channel_id.is_none() => self.voice = None,
+            Some(voice) => {
+                if let Some(channel) = state.channel_id {
+                    voice.channel = channel;
+                }
+                if voice.session != state.session_id {
+                    voice.session = state.session_id.clone();
+                    if voice.call.is_none() {
+                        self.start_voice(cx);
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
     fn apply(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         if self.connection.is_none() {
             return; // late events from a session that was signed out
@@ -1081,28 +1207,12 @@ impl Store {
                 }
                 return;
             }
+            CoreEvent::PrivateVoiceState(state) => {
+                self.own_voice_state(&state, cx);
+                self.cache.apply(CoreEvent::PrivateVoiceState(state));
+            }
             CoreEvent::VoiceStateUpdate { guild_id, state, member } => {
-                if self.cache.me().is_some_and(|me| me.id == state.user_id) {
-                    match &mut self.voice {
-                        // Moved, or removed from the call.
-                        Some(voice) if state.channel_id.is_none() => {
-                            let _ = voice;
-                            self.voice = None;
-                        }
-                        Some(voice) => {
-                            if let Some(channel) = state.channel_id {
-                                voice.channel = channel;
-                            }
-                            if voice.session != state.session_id {
-                                voice.session = state.session_id.clone();
-                                if voice.call.is_none() {
-                                    self.start_voice(cx);
-                                }
-                            }
-                        }
-                        None => {}
-                    }
-                }
+                self.own_voice_state(&state, cx);
                 // Someone in our call starting or stopping a screen share.
                 let ours = self.voice.as_ref().map(|v| v.channel);
                 if ours.is_some() && state.channel_id == ours && self.cache.me().is_some_and(|me| me.id != state.user_id) {
@@ -1157,6 +1267,7 @@ impl Store {
             }
             other => self.cache.apply(other),
         }
+        self.update_ring();
         cx.notify();
     }
 
@@ -1180,6 +1291,7 @@ impl Store {
         crate::image_disk::forget_all();
         crate::places::forget();
         self.voice = None;
+        self.ring = None;
         // Stops the gateway (which ends the event loop above) and clears the keyring.
         self.core.sign_out();
         self.cache = Cache::default();

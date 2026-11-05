@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod build_number;
 pub mod cache;
+pub mod call;
 pub mod cdn;
 mod client;
 pub mod event;

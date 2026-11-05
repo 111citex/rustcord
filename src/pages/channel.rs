@@ -457,6 +457,105 @@ impl ChannelPage {
         page
     }
 
+    /// A DM or group call, over the chat while there is one: who's in it, who's being
+    /// rung, and joining or leaving it.
+    fn call_area(&self, channel: Id, cx: &Context<Self>) -> Option<AnyElement> {
+        let store = self.ctx.services.store.read(cx);
+        let cache = store.cache();
+        let call = cache.call(channel)?;
+        let place = cache.channel(channel).filter(|c| c.guild_id.is_none())?;
+        let status = store.voice_status().filter(|v| v.channel == channel);
+        let me = cache.me().map(|u| u.id);
+        let mut people: Vec<(Id, bool)> = call.participants().map(|u| (u, false)).collect();
+        // Whoever's being rung, faded, after those already in.
+        let rung: Vec<(Id, bool)> = call.ringing.iter().filter(|u| !people.iter().any(|(p, _)| p == *u)).map(|u| (*u, true)).collect();
+        people.extend(rung);
+        // We started it and left: nothing to show but the chat.
+        if status.is_none() && people.iter().all(|(u, rung)| *rung || Some(*u) == me) && call.participants().next().is_none() {
+            return None;
+        }
+        let theme = cx.theme();
+        let green = Hsla::from(gpui_kit::rgb(0x23a55a));
+        let speaking = store.speaking();
+        let faces = people.iter().filter_map(|(id, rung)| {
+            let user = cache.user(*id)?;
+            let lit = !rung && speaking.contains(id);
+            let face = div()
+                .relative()
+                .size(u(80.))
+                .flex_shrink_0()
+                .child(Avatar::new().border_0().src(cache.avatar_url(None, user, 128)).name(cache.display_name(None, user).to_string()).size(u(80.)))
+                .when(lit, |d| d.child(div().absolute().top(u(-4.)).left(u(-4.)).size(u(88.)).rounded_full().border_3().border_color(green)));
+            // Being rung: faded, breathing.
+            Some(if *rung {
+                face.with_animation(("call-rung", id.0), gpui_kit::Animation::new(std::time::Duration::from_millis(1400)).repeat(), |d, t| {
+                    d.opacity(0.35 + 0.25 * (1. - (t * 2. - 1.).abs()))
+                })
+                .into_any_element()
+            } else {
+                face.into_any_element()
+            })
+        });
+        let button = |id: &'static str, bg: Hsla, tip: &'static str| {
+            div()
+                .id(id)
+                .size(u(48.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(bg)
+                .text_color(gpui_kit::white())
+                .cursor_pointer()
+                .hover(|d| d.opacity(0.85))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+        };
+        let store_entity = self.ctx.services.store.clone();
+        let controls = match &status {
+            Some(status) => {
+                let (deafen, leave) = (store_entity.clone(), store_entity.clone());
+                h_flex()
+                    .gap(u(16.))
+                    .child(
+                        button("call-deafen", theme.foreground.opacity(0.15), if status.deaf { "Undeafen" } else { "Deafen" })
+                            .on_click(move |_, _, cx| deafen.update(cx, |store, cx| store.toggle_deaf(cx)))
+                            .child(Icon::new(if status.deaf { IconName::HeadphoneOff } else { IconName::Headphones }).size(u(22.))),
+                    )
+                    .child(
+                        button("call-leave", Hsla::from(gpui_kit::rgb(0xda373c)), "Disconnect")
+                            .on_click(move |_, _, cx| leave.update(cx, |store, cx| store.leave_voice(cx)))
+                            .child(Icon::new(IconName::PhoneOff).size(u(22.))),
+                    )
+            }
+            None => h_flex().child(
+                button("call-join", Hsla::from(gpui_kit::rgb(0x248046)), "Join Call")
+                    .on_click(move |_, _, cx| store_entity.update(cx, |store, cx| store.join_voice(None, channel, cx)))
+                    .child(Icon::default().path("icons/phone.svg").size(u(22.))),
+            ),
+        };
+        let line = match (&status, place.kind) {
+            (Some(s), _) if !s.connected => "Connecting…".to_string(),
+            (Some(_), _) if call.participants().all(|u| Some(u) == me) && !call.ringing.is_empty() => "Calling…".to_string(),
+            (Some(_), _) => String::new(),
+            (None, _) => format!("{} in the call", call.participants().count()),
+        };
+        Some(
+            v_flex()
+                .flex_shrink_0()
+                .h(u(240.))
+                .items_center()
+                .justify_center()
+                .gap(u(16.))
+                .bg(gpui_kit::black().opacity(0.35))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(h_flex().gap(u(16.)).items_center().justify_center().children(faces))
+                .when(!line.is_empty(), |d| d.child(div().text_size(u(14.)).text_color(theme.muted_foreground).child(line)))
+                .child(controls)
+                .into_any_element(),
+        )
+    }
+
     fn is_voice(&self, cx: &App) -> bool {
         let store = self.ctx.services.store.read(cx);
         self.channel.and_then(|c| store.cache().channel(c)).is_some_and(|c| matches!(c.kind, ChannelKind::Voice | ChannelKind::Stage))
@@ -889,7 +988,10 @@ impl ChannelPage {
         ];
         if !me {
             entries.push(Entry::item("Message", with(|p, u, _, _, _, cx| p.message(u, cx))));
-            entries.push(Entry::later("Start a Call"));
+            if self.ctx.services.store.read(cx).cache().user(user).is_none_or(|u| !u.bot) {
+                let store = self.ctx.services.store.clone();
+                entries.push(Entry::item("Start a Call", move |_, cx| store.update(cx, |store, cx| store.call_user(user, cx))));
+            }
             entries.push(Entry::later("Add Note"));
             // A group's owner may remove people or hand it over. Both ask first.
             let my_id = self.ctx.services.store.read(cx).cache().me().map(|u| u.id);
@@ -3842,6 +3944,12 @@ impl Render for ChannelPage {
             Some(g) => format!("Search {}", g.name),
             None => "Search".to_string(),
         };
+        // The call button's tip, in a DM or group we're not already calling in; none elsewhere.
+        let in_this_call = store.voice_status().is_some_and(|v| v.channel == channel_id);
+        let bot_dm = channel.kind == ChannelKind::Dm && channel.recipient_ids.first().and_then(|u| cache.user(*u)).is_some_and(|u| u.bot);
+        let private_call = (channel.guild_id.is_none() && !in_this_call && !bot_dm)
+            .then(|| if cache.call(channel_id).is_some_and(|c| c.participants().next().is_some()) { "Join Call" } else { "Start Voice Call" });
+        let call_area = self.call_area(channel_id, cx);
         // Measured in Discord: 49px with 8px padding (16px on the left).
         let header = h_flex()
             .h(u(49.))
@@ -3860,8 +3968,17 @@ impl Render for ChannelPage {
             })
             // With a topic, it's what fills the row: a spacer would take half its room.
             .when(!has_topic, |this| this.child(div().flex_1()))
-            .child(tool_button("threads", "icons/toolbar-threads.svg", "Threads", cx))
-            .child(tool_button("bell", "icons/toolbar-bell.svg", "Notification Settings", cx))
+            .when(channel.guild_id.is_some(), |this| {
+                this.child(tool_button("threads", "icons/toolbar-threads.svg", "Threads", cx))
+                    .child(tool_button("bell", "icons/toolbar-bell.svg", "Notification Settings", cx))
+            })
+            // DMs and groups call from here, or join the call already going.
+            .when(private_call.is_some(), |this| {
+                let (store, tip) = (self.ctx.services.store.clone(), private_call.unwrap_or("Start Voice Call"));
+                this.child(tool_button("start-call", "icons/phone.svg", tip, cx).on_click(move |_, _, cx| {
+                    store.update(cx, |store, cx| store.start_call(channel_id, cx));
+                }))
+            })
             .child(tool_button("pin", "icons/toolbar-pin.svg", "Pinned Messages", cx))
             .when(self.guild.is_some() || channel.kind == ChannelKind::GroupDm, |this| {
                 this.child(
@@ -3982,6 +4099,7 @@ impl Render for ChannelPage {
                     })
                     .h_full()
                     .children(chat_header)
+                    .children(call_area)
                     .child(div().flex_1().min_h_0().child(messages))
                     .when(!forbidden, |this| {
                         let composer = match nav::composer_lock(cache, channel) {

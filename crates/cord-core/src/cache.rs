@@ -157,6 +157,8 @@ pub struct Cache {
     /// When each friendship began, ISO 8601.
     friends_since: HashMap<Id, String>,
     presences: HashMap<Id, UserPresence>,
+    /// Calls under way in DMs and groups, by channel.
+    calls: HashMap<Id, crate::call::Call>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -762,6 +764,26 @@ impl Cache {
             }
         }
         usable
+    }
+
+    /// The call under way in a DM or group, if there is one.
+    pub fn call(&self, channel: Id) -> Option<&crate::call::Call> {
+        self.calls.get(&channel)
+    }
+
+    pub fn calls(&self) -> impl Iterator<Item = &crate::call::Call> {
+        self.calls.values()
+    }
+
+    /// Whether `call` should ring here, by `call::should_ring`'s rules.
+    pub fn call_rings(&self, call: &crate::call::Call) -> bool {
+        let Some(me) = self.me.as_ref().map(|u| u.id) else { return false };
+        let Some(channel) = self.channels.get(&call.channel_id) else { return false };
+        let place = match channel.kind {
+            crate::model::ChannelKind::GroupDm => crate::call::CallPlace::Group { muted: self.is_muted(channel.id) },
+            _ => crate::call::CallPlace::Dm { friend: channel.recipient_ids.first().is_some_and(|u| self.is_friend(*u)) },
+        };
+        crate::call::should_ring(place, call.ringing.contains(&me), call.participants().any(|u| u == me))
     }
 
     pub fn is_friend(&self, user: Id) -> bool {
@@ -1449,7 +1471,43 @@ impl Cache {
                     self.bump_sidebar();
                 }
             }
+            CoreEvent::CallUpdate(call) => {
+                match self.calls.get_mut(&call.channel_id) {
+                    // CALL_UPDATE leaves who's in it out: that comes as voice states.
+                    Some(held) => {
+                        held.ringing = call.ringing;
+                        held.message_id = call.message_id.or(held.message_id);
+                        if !call.voice_states.is_empty() {
+                            held.voice_states = call.voice_states;
+                        }
+                    }
+                    None => {
+                        self.calls.insert(call.channel_id, call);
+                    }
+                }
+                self.bump_sidebar();
+            }
+            CoreEvent::CallDelete { channel_id } => {
+                self.calls.remove(&channel_id);
+                self.bump_sidebar();
+            }
+            CoreEvent::PrivateVoiceState(state) => {
+                // Someone is in one call at most: this one, or none.
+                for call in self.calls.values_mut() {
+                    call.apply_state(&state);
+                }
+                if let Some(channel) = state.channel_id.filter(|c| !self.calls.contains_key(c)) {
+                    let mut call = crate::call::Call { channel_id: channel, ..Default::default() };
+                    call.apply_state(&state);
+                    self.calls.insert(channel, call);
+                }
+                self.bump_sidebar();
+            }
             CoreEvent::VoiceStateUpdate { guild_id, state, member } => {
+                // In a server's voice channel means out of any DM or group call.
+                for call in self.calls.values_mut() {
+                    call.apply_state(&state);
+                }
                 if let Some(member) = member {
                     self.insert_member(guild_id, member);
                 }
@@ -2335,6 +2393,34 @@ mod tests {
         let mut v: Vec<u64> = c.voice_participants(Id(ch)).iter().map(|s| s.user_id.0).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn calls_ring_by_friendship_and_group_mute() {
+        let mut c = ready_cache();
+        let mut dm = channel(400, None, ChannelKind::Dm, None);
+        dm.recipient_ids = vec![Id(2)];
+        c.apply(CoreEvent::ChannelUpsert(dm));
+        let ringing = |channel| crate::call::Call { channel_id: Id(channel), ringing: vec![Id(1)], ..Default::default() };
+        c.apply(CoreEvent::CallUpdate(ringing(400)));
+        c.apply(CoreEvent::CallUpdate(ringing(401)));
+        assert!(!c.call_rings(c.call(Id(400)).unwrap()), "not friends yet");
+        assert!(c.call_rings(c.call(Id(401)).unwrap()), "a group that isn't muted");
+        c.friends_since.insert(Id(2), "2026-01-01".into());
+        assert!(c.call_rings(c.call(Id(400)).unwrap()));
+        c.muted_channels.insert(Id(401), None);
+        assert!(!c.call_rings(c.call(Id(401)).unwrap()), "muted group");
+        // Joining it, here or elsewhere, stops it ringing; the call ending removes it.
+        c.apply(CoreEvent::PrivateVoiceState(voice(1, Some(400))));
+        assert!(!c.call_rings(c.call(Id(400)).unwrap()));
+        c.apply(CoreEvent::VoiceStateUpdate { guild_id: Id(300), state: voice(1, Some(311)), member: None });
+        assert_eq!(c.call(Id(400)).unwrap().participants().count(), 0, "moved to a server");
+        c.apply(CoreEvent::CallDelete { channel_id: Id(400) });
+        assert!(c.call(Id(400)).is_none());
+        // CALL_UPDATE keeps who's in it.
+        c.apply(CoreEvent::PrivateVoiceState(voice(2, Some(401))));
+        c.apply(CoreEvent::CallUpdate(crate::call::Call { channel_id: Id(401), ..Default::default() }));
+        assert_eq!(c.call(Id(401)).unwrap().participants().collect::<Vec<_>>(), vec![Id(2)]);
     }
 
     #[test]

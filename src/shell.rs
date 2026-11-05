@@ -635,7 +635,7 @@ impl SidePane {
                     let (store, guild, id) = (self.services.store.clone(), location.guild.unwrap_or_default(), channel.id);
                     this.cursor_pointer()
                         .when(!active, |this| this.hover(|this| this.bg(hover_bg).text_color(bright)))
-                        .on_click(move |_, _, cx| store.update(cx, |store, cx| store.join_voice(guild, id, cx)))
+                        .on_click(move |_, _, cx| store.update(cx, |store, cx| store.join_voice(Some(guild), id, cx)))
                 })
                 .when(voice && !can_join, |this| this.opacity(0.6))
                 .group(group)
@@ -1270,8 +1270,14 @@ impl SidePane {
         let status = store.voice_status()?;
         let cache = store.cache();
         let theme = cx.theme();
-        let channel = cache.channel(status.channel).map_or_else(|| "Voice".to_string(), |c| c.name.clone().unwrap_or_default());
-        let guild = cache.guild(status.guild).map_or_else(String::new, |g| g.name.clone());
+        // A DM or group call names the conversation, as Discord's panel does.
+        let place = match status.guild {
+            Some(guild) => {
+                let channel = cache.channel(status.channel).map_or_else(|| "Voice".to_string(), |c| c.name.clone().unwrap_or_default());
+                format!("{channel} / {}", cache.guild(guild).map_or_else(String::new, |g| g.name.clone()))
+            }
+            None => cache.channel(status.channel).map_or_else(|| "Call".to_string(), |c| nav::channel_label(cache, c)),
+        };
         let green = gpui_kit::Hsla::from(gpui_kit::rgb(0x23a55a));
         let yellow = gpui_kit::Hsla::from(gpui_kit::rgb(0xf0b232));
         let red = gpui_kit::Hsla::from(gpui_kit::rgb(0xf23f43));
@@ -1316,7 +1322,7 @@ impl SidePane {
                         .flex_1()
                         .min_w_0()
                         .child(div().truncate().text_size(u(14.)).font_weight(FontWeight::SEMIBOLD).text_color(color).child(if status.connected { "Voice Connected" } else { "Connecting" }))
-                        .child(div().truncate().text_size(u(12.)).text_color(theme.muted_foreground).child(format!("{channel} / {guild}"))),
+                        .child(div().truncate().text_size(u(12.)).text_color(theme.muted_foreground).child(place)),
                 )
                 .child(
                     round("voice-leave")
@@ -1720,6 +1726,7 @@ impl Render for Shell {
             .children(crate::confirm::overlay(window, cx))
             .children(crate::add_people::overlay(window, cx))
             .children(crate::emoji_card::overlay(cx))
+            .children(crate::call_ring::overlay(&self.services.store.clone(), window, cx))
             .when_some(self.info.clone(), |this, monitor| {
                 this.child(
                     v_flex()
@@ -1976,7 +1983,8 @@ fn dm_menu(
         Some(user) => {
             entries.push(Entry::item("Profile", move |_, cx| crate::links::show_profile(user, position, cx)));
             if !dm.bot {
-                entries.push(Entry::later("Start a Call"));
+                let store = store.clone();
+                entries.push(Entry::item("Start a Call", move |_, cx| store.update(cx, |store, cx| store.start_call(channel, cx))));
             }
             entries.push(Entry::later("Add Note"));
             if dm.friend {

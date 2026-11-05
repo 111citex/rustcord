@@ -114,6 +114,8 @@ pub struct ChannelPage {
     /// The pinned messages popout is open, hanging from this point (the pin button).
     pins_at: Option<Point<Pixels>>,
     pins_scroll: gpui_kit::ScrollHandle,
+    /// The app's message search, which this page shows when it's for here.
+    search: Entity<crate::search::Search>,
     /// RUSTCORD_BENCH=1: scroll on its own every frame and log the frame rate.
     bench: Option<Bench>,
     _subscriptions: Vec<Subscription>,
@@ -334,6 +336,13 @@ impl ChannelPage {
                         return;
                     }
                     let _ = page.update(cx, |page, cx| {
+                        // Esc in the search box leaves it for the message box.
+                        let search_input = page.search.read(cx).input.clone();
+                        if key == "escape" && gpui_kit::Focusable::focus_handle(search_input.read(cx), cx).is_focused(window) {
+                            page.input.update(cx, |input, cx| input.focus(window, cx));
+                            cx.stop_propagation();
+                            return;
+                        }
                         if key == "escape" && page.pins_at.is_some() && !crate::confirm::is_open(cx) {
                             page.toggle_pins(None, cx);
                             cx.stop_propagation();
@@ -409,6 +418,19 @@ impl ChannelPage {
             input.update(cx, |input, cx| input.focus(window, cx));
         }
 
+        let search = crate::search::get(&ctx.services.core, window, cx);
+        let mut subscriptions = subscriptions;
+        subscriptions.push(cx.observe(&search, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(&search, |this: &mut Self, search, event: &crate::search::SearchEvent, cx| match event {
+            // Only the page on screen searches: kept pages hear it too.
+            crate::search::SearchEvent::Submit => {
+                let here = nav::parse_location(this.ctx.router.read(cx).current_path()).and_then(|l| l.channel);
+                let Some(channel) = this.channel.filter(|c| here == Some(*c)) else { return };
+                let scope = crate::search::Scope { guild: this.guild, channel };
+                let store = this.ctx.services.store.clone();
+                search.update(cx, |search, cx| search.run(scope, &store, cx));
+            }
+        }));
         let mut page = ChannelPage {
             ctx,
             channel,
@@ -458,9 +480,15 @@ impl ChannelPage {
             bench: std::env::var_os("RUSTCORD_BENCH").map(|_| Bench::new()),
             pins_at: None,
             pins_scroll: gpui_kit::ScrollHandle::new(),
+            search,
             _subscriptions: subscriptions,
         };
         page.guild = page.server(cx);
+        // Somewhere the search wasn't for: it's over, as in Discord.
+        let (guild, here) = (page.guild, page.channel);
+        if page.search.read(cx).scope.is_some_and(|s| here.is_none_or(|c| !s.covers(guild, c))) {
+            page.search.update(cx, |search, cx| search.close(window, cx));
+        }
         page.sync_members(window, cx);
         page.restore_draft(window, cx);
         page.sync_list(cx);
@@ -3732,6 +3760,19 @@ impl Render for ChannelPage {
         let width = f32::from(window.viewport_size().width) / f32::from(window.rem_size()) * 16.;
         let layout = self.ctx.services.settings.read(cx).get();
         let (column_width, members_width) = (layout.column_width, layout.members_width);
+        // The search box, built before the store's borrowed for the rest; voice channels have none.
+        let mut search_box = match self.channel.filter(|_| !self.is_voice(cx)) {
+            Some(channel) => {
+                let placeholder = match self.guild.and_then(|g| self.ctx.services.store.read(cx).cache().guild(g)) {
+                    Some(g) => format!("Search {}", g.name),
+                    None => "Search".to_string(),
+                };
+                let scope = crate::search::Scope { guild: self.guild, channel };
+                Some(crate::search_view::search_box(&self.search, &self.ctx.services.store, scope, placeholder, window, cx))
+            }
+            None => None,
+        };
+        let searching = search_box.is_some() && self.search.read(cx).scope.is_some_and(|s| self.channel.is_some_and(|c| s.covers(self.guild, c)));
         let members_fit = width - 72. - column_width - members_width >= CHAT_MIN
             || std::env::var_os("RUSTCORD_FORCE_MEMBERS").is_some();
         let store = self.ctx.services.store.read(cx);
@@ -4053,10 +4094,10 @@ impl Render for ChannelPage {
         // marks dropped (the full styling would need a whole message to render in).
         let topic = channel.topic.as_deref().map(plain_topic);
         let has_topic = topic.is_some();
-        let search = match channel.guild_id.and_then(|g| cache.guild(g)) {
-            Some(g) => format!("Search {}", g.name),
-            None => "Search".to_string(),
-        };
+        // Discord's search sits atop the column on the right (members, or results);
+        // with no column there, at the header's end.
+        let side_list = members_fit && (self.members.is_some() || group_list.is_some());
+        let header_search = if side_list || searching { None } else { search_box.take() };
         // The call button's tip, in a DM or group we're not already calling in; none elsewhere.
         let in_this_call = store.voice_status().is_some_and(|v| v.channel == channel_id);
         let bot_dm = channel.kind == ChannelKind::Dm && channel.recipient_ids.first().and_then(|u| cache.user(*u)).is_some_and(|u| u.bot);
@@ -4106,24 +4147,7 @@ impl Render for ChannelPage {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_members(cx))),
                 )
             })
-            .child(
-                h_flex()
-                    .id("search-box")
-                    .cursor_default()
-                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Search — arrives later").build(window, cx))
-                    .w(u(240.))
-                    .h(u(32.))
-                    .px_2()
-                    .ml_2()
-                    .items_center()
-                    .justify_between()
-                    .rounded(u(4.))
-                    .bg(theme.popover)
-                    .text_size(u(14.))
-                    .text_color(muted)
-                    .child(div().min_w_0().truncate().child(search))
-                    .child(Icon::new(IconName::Search).size(u(16.))),
-            );
+            .when_some(header_search, |this, search| this.child(div().w(u(240.)).ml_2().flex_shrink_0().child(search)));
         // A voice channel: who's in it on the left, its chat in a panel beside
         // them that opens from the channel list and drags wider or narrower.
         let voice = matches!(channel.kind, ChannelKind::Voice | ChannelKind::Stage);
@@ -4169,8 +4193,44 @@ impl Render for ChannelPage {
                     cx.notify();
                 })))
         });
-        // In a voice channel the chat has its own header; elsewhere the bar spans the page.
+        // In a voice channel the chat has its own header; elsewhere the bar tops the chat
+        // alone, and the column on the right reaches the top with the search over it.
         let top_header = chat_header.is_none().then_some(header);
+        let strip = |search: AnyElement| h_flex().flex_shrink_0().h(u(TOP_BAR)).px(u(8.)).items_center().border_b_1().border_color(border).child(search);
+        let right_column = if searching {
+            // Wider while searching, without touching the width the member list was given.
+            let text_size = self.ctx.services.settings.read(cx).get().chat_text as f32;
+            let results = crate::search_view::results(&self.search, &self.ctx.services.store, self.parsed.clone(), self.revealed.clone(), text_size, cx);
+            Some(
+                v_flex()
+                    .w(u(members_width.max(crate::search_view::RESULTS_WIDTH)))
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_l_1()
+                    .border_color(border)
+                    .children(search_box.take().map(strip))
+                    .child(div().flex_1().min_h_0().child(results))
+                    .into_any_element(),
+            )
+        } else if side_list {
+            let list: AnyElement = match (&self.members, group_list) {
+                // Cached: while the chat scrolls the member list reuses its last frame.
+                (Some((panel, _)), _) => AnyView::from(panel.clone()).cached(gpui_kit::StyleRefinement::default().size_full()).into_any_element(),
+                (None, Some(list)) => list,
+                (None, None) => div().into_any_element(),
+            };
+            Some(
+                v_flex()
+                    .w(u(members_width))
+                    .h_full()
+                    .flex_shrink_0()
+                    .children(search_box.take().map(strip))
+                    .child(div().flex_1().min_h_0().child(list))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         h_flex()
             .relative()
             .size_full()
@@ -4202,7 +4262,6 @@ impl Render for ChannelPage {
                     cx.notify();
                 }
             }))
-            .when(top_header.is_some(), |d| d.relative().pt(u(TOP_BAR)))
             .children(stage)
             .children(edge)
             .child(
@@ -4213,6 +4272,7 @@ impl Render for ChannelPage {
                         (true, false) => d.w_0().overflow_hidden(),
                     })
                     .h_full()
+                    .children(top_header)
                     .children(chat_header)
                     .children(call_area)
                     .child(div().flex_1().min_h_0().child(messages))
@@ -4407,8 +4467,7 @@ impl Render for ChannelPage {
                         )
                     }),
             )
-            // Cached: while the chat scrolls the member list reuses its last frame.
-            .when(self.members.is_some() && members_fit, |d| {
+            .when(side_list && !searching, |d| {
                 d.child(
                     div().relative().w_0().h_full().flex_shrink_0().child(
                         div()
@@ -4426,14 +4485,7 @@ impl Render for ChannelPage {
                     ),
                 )
             })
-            .children(self.members.as_ref().filter(|_| members_fit).map(|(panel, _)| {
-                AnyView::from(panel.clone()).cached(
-                    gpui_kit::StyleRefinement::default().h_full().w(u(members_width)).flex_shrink_0(),
-                )
-            }))
-            .when_some(group_list, |this, list| this.child(list))
-            // The bar runs over the member list too, with the search above it, as Discord's.
-            .when_some(top_header, |d, header| d.child(div().absolute().top_0().left_0().right_0().h(u(TOP_BAR)).occlude().child(header)))
+            .when_some(right_column, |d, column| d.child(column))
             .children(self.profile.as_ref().map(|(card, _)| card.clone()))
             .when_some(self.confirm_delete, |d, message| d.child(self.delete_dialog(message, window, cx)))
             .when_some(self.pins_at, |d, at| d.child(self.pins_popout(channel_id, at, window, cx)))

@@ -51,6 +51,8 @@ mod reaction_names;
 mod profile_preload;
 mod rich_view;
 mod router;
+mod search;
+mod search_view;
 mod settings;
 mod shell;
 mod sidebar;

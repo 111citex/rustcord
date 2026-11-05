@@ -207,6 +207,24 @@ impl Core {
         self.watch(result)
     }
 
+    /// The messages around `message`, newest first: half before it, half after.
+    pub async fn messages_around(&self, channel: Id, message: Id, limit: u8) -> Result<Vec<Message>, HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move { http.get(&format!("/channels/{channel}/messages?around={message}&limit={limit}")).await })
+            .await;
+        self.watch(result)
+    }
+
+    /// The page after `after`, newest first.
+    pub async fn messages_after(&self, channel: Id, after: Id, limit: u8) -> Result<Vec<Message>, HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move { http.get(&format!("/channels/{channel}/messages?after={after}&limit={limit}")).await })
+            .await;
+        self.watch(result)
+    }
+
     /// Sends a message, as a reply to `reply` when given.
     pub async fn send_message(
         &self,

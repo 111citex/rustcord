@@ -179,6 +179,7 @@ pub struct Store {
     send_chains: HashMap<Id, Task<()>>,
     /// The channel whose older page is being fetched, if any.
     loading_older: Option<Id>,
+    loading_newer: Option<Id>,
     members: Option<MemberSub>,
     /// When each channel was last acked to Discord.
     acked: HashMap<Id, std::time::Instant>,
@@ -195,7 +196,7 @@ impl EventEmitter<StoreEvent> for Store {}
 
 impl Store {
     pub fn new(core: Arc<Core>, toasts: Entity<Toasts>) -> Self {
-        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None }
+        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, loading_newer: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None }
     }
 
     pub fn core(&self) -> &Arc<Core> {
@@ -361,6 +362,7 @@ impl Store {
             self.history.remove(&gone);
         }
         self.loading_older = None;
+        self.loading_newer = None;
         // Remember where the unread part began, for the NEW line, before reading it.
         self.new_after = self.cache.unread_after(channel);
         self.cache.open_messages(channel);
@@ -484,6 +486,74 @@ impl Store {
         .detach();
     }
 
+    /// Whether `channel` shows a window back in its history, not its end.
+    pub fn is_detached(&self, channel: Id) -> bool {
+        self.cache.has_newer(channel)
+    }
+
+    pub fn is_loading_newer(&self, channel: Id) -> bool {
+        self.loading_newer == Some(channel)
+    }
+
+    /// Shows the messages around `target`, which is too far back to page to: one request
+    /// instead of a page for every fifty in between. Done once it's replaced the view.
+    pub fn load_around(&mut self, channel: Id, target: Id, cx: &mut Context<Self>) {
+        if self.loading_older.is_some() || self.open != Some(channel) {
+            return;
+        }
+        self.loading_older = Some(channel);
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.messages_around(channel, target, HISTORY_PAGE).await;
+            let _ = this.update(cx, |store, cx| {
+                store.loading_older = None;
+                if store.open == Some(channel) {
+                    match result {
+                        Ok(messages) => store.cache.set_around(channel, messages, HISTORY_PAGE as usize),
+                        Err(HttpError::Unauthorized) => {} // AuthFailed signs out
+                        Err(error) => store.toasts.update(cx, |_, cx| cx.emit(Toast::error("Couldn't load that part of the channel", error.to_string()))),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fetches the page below the newest message held, in a window back in the history.
+    pub fn load_newer(&mut self, channel: Id, cx: &mut Context<Self>) {
+        if self.loading_newer.is_some() || self.loading_older.is_some() || self.open != Some(channel) || !self.cache.has_newer(channel) {
+            return;
+        }
+        let Some(after) = self.cache.newest(channel) else { return };
+        self.loading_newer = Some(channel);
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.messages_after(channel, after, HISTORY_PAGE).await;
+            let _ = this.update(cx, |store, cx| {
+                store.loading_newer = None;
+                if store.open == Some(channel) {
+                    match result {
+                        Ok(messages) => store.cache.append_newer(channel, messages, HISTORY_PAGE as usize),
+                        Err(HttpError::Unauthorized) => {}
+                        Err(error) => store.toasts.update(cx, |_, cx| cx.emit(Toast::error("Couldn't load newer messages", error.to_string()))),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Leaves a window back in the history for the newest messages again.
+    pub fn return_to_present(&mut self, channel: Id, cx: &mut Context<Self>) {
+        if self.open == Some(channel) && self.cache.has_newer(channel) {
+            self.load_history(channel, cx);
+        }
+    }
+
     /// Back at the bottom of `channel`: let go of the scrollback.
     pub fn trim_channel(&mut self, channel: Id, cx: &mut Context<Self>) {
         let over = self.cache.messages(channel).is_some_and(|m| m.len() > cord_core::cache::MESSAGE_CAP);
@@ -497,6 +567,8 @@ impl Store {
     /// stays in the chat marked failed (Retry/Delete arrive in plan 1b).
     pub fn send(&mut self, channel: Id, content: String, reply: Option<(Id, bool)>, files: Vec<cord_core::http::Upload>, cx: &mut Context<Self>) {
         let Some(me) = self.cache.me().cloned() else { return };
+        // Sending from a window back in the history goes to the end of the channel, as Discord's does.
+        self.return_to_present(channel, cx);
         // A snowflake for "now", made unique per send within the same millisecond.
         self.nonce_seq = self.nonce_seq.wrapping_add(1);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;

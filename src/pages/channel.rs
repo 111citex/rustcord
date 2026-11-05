@@ -783,11 +783,9 @@ impl ChannelPage {
         }
     }
 
-    /// Scrolls to the linked message once it's loaded, fetching older pages
-    /// (a few at most) until it turns up.
+    /// Scrolls to the linked message once it's loaded, asking for the part of the channel
+    /// around it when it isn't held.
     fn seek_jump_target(&mut self, cx: &mut Context<Self>) {
-        // One page at a time, each waiting for the last: quite far back, but not forever.
-        const MAX_PAGES: u16 = 400;
         let (Some((target, pages)), Some(channel)) = (self.jump_target, self.channel) else { return };
         if let Some(ix) = self.rendered.iter().position(|r| *r == target) {
             self.jump_target = None;
@@ -823,16 +821,16 @@ impl ChannelPage {
         if store.history(channel) != Some(&History::Loaded) || store.is_loading_older(channel) {
             return;
         }
-        let cache = store.cache();
-        let older = cache.messages(channel).is_some_and(|m| m.has_older) && !cache.scrollback_full(channel);
-        // Older than everything loaded, and still more to fetch.
-        let before_loaded = cache.oldest(channel).is_some_and(|oldest| target < oldest);
-        if older && before_loaded && pages < MAX_PAGES {
-            self.jump_target = Some((target, pages + 1));
-            self.ctx.services.store.update(cx, |store, cx| store.load_older(channel, cx));
+        if pages == 0 {
+            // Not held: one request for the stretch of the channel around it, and the view
+            // moves there, rather than a page for every fifty messages in between.
+            self.jump_target = Some((target, 1));
+            self.ctx.services.store.update(cx, |store, cx| store.load_around(channel, target, cx));
         } else {
+            // Asked for what's around it and it isn't there: it was deleted, or isn't in this channel.
             self.jump_target = None;
-            self.ctx.services.toast(Toast::warning("Couldn't find that message", "It may have been deleted, or is too far back."), cx);
+            self.ctx.services.store.update(cx, |store, cx| store.return_to_present(channel, cx));
+            self.ctx.services.toast(Toast::warning("Couldn't find that message", "It may have been deleted."), cx);
         }
     }
 
@@ -1624,6 +1622,13 @@ impl ChannelPage {
     fn jump_to_present(&mut self, cx: &mut Context<Self>) {
         self.unseen = 0;
         self.banner_closed = true;
+        // Looking at a stretch back in the history: the present is a fetch away, not a scroll.
+        if let Some(channel) = self.channel.filter(|c| self.ctx.services.store.read(cx).is_detached(*c)) {
+            self.ctx.services.store.update(cx, |store, cx| store.return_to_present(channel, cx));
+            self.list.set_follow_mode(FollowMode::Tail);
+            cx.notify();
+            return;
+        }
         let last = self.rendered.len().saturating_sub(1);
         if !self.ctx.services.settings.read(cx).get().smooth_scrolling {
             self.list.set_follow_mode(FollowMode::Tail);
@@ -3481,6 +3486,13 @@ fn locked_composer(reason: String, cx: &App) -> impl IntoElement {
 
 impl Render for ChannelPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // In a stretch back in the history, reaching its bottom fetches the messages below.
+        if let Some(channel) = self.channel.filter(|c| self.ctx.services.store.read(cx).is_detached(*c)) {
+            if !self.list.is_following_tail() && self.near_newest() {
+                let store = self.ctx.services.store.clone();
+                cx.defer(move |cx| store.update(cx, |store, cx| store.load_newer(channel, cx)));
+            }
+        }
         crate::ui::note_chat_view(cx.entity_id());
         crate::perf::count("page");
         crate::perf::tick();
@@ -3861,22 +3873,26 @@ impl Render for ChannelPage {
                         // Read from the list each frame: the smooth scroller moves it
                         // without firing the list's scroll events.
                         let older = !self.list.is_following_tail() && self.list.logical_scroll_top().item_ix + JUMP_PILL_AFTER < self.rendered.len();
+                        // A stretch back in the history: its end isn't the channel's, and reaching it
+                        // fetches the messages below.
+                        let detached = self.ctx.services.store.read(cx).is_detached(channel_id);
+
                         // The jump bar follows the scroll from outside the list, so the list
                         // moves as a layer only while the bar's place in that stays the same.
                         {
                             let (list, rows) = (self.list.clone(), self.rendered.len());
-                            let extra = unread.is_some() || self.unseen > 0;
+                            let extra = unread.is_some() || self.unseen > 0 || detached;
                             let wants_bar = move |list: &gpui_kit::ListState, top: f32| {
                                 const NEARLY: f32 = 200.;
                                 let following = list.is_following_tail();
                                 let near = following || f32::from(list.max_offset_for_scrollbar().y) - top <= NEARLY;
                                 let older = !following && list.logical_scroll_top().item_ix + JUMP_PILL_AFTER < rows;
-                                !near && (extra || older)
+                                (!near || detached) && (extra || older)
                             };
                             let now = wants_bar(&list, f32::from((-list.scroll_px_offset_for_scrollbar().y).min(list.max_offset_for_scrollbar().y)));
                             self.scroller.outside_stays_right(move |top| wants_bar(&list, top) == now);
                         }
-                        if !self.near_newest() && (unread.is_some() || older || self.unseen > 0) {
+                        if (!self.near_newest() || detached) && (unread.is_some() || older || self.unseen > 0 || detached) {
                             this.child(self.jump_bar(unread, cx))
                         } else {
                             this

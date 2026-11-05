@@ -54,13 +54,16 @@ pub struct ChannelMessages {
     items: VecDeque<ChatMessage>,
     /// Older messages exist on the server than the ones held here.
     pub has_older: bool,
+    /// Newer messages exist than the ones held here: it's a window somewhere back in
+    /// the channel (a linked message), not the end of it. Live ones aren't added to it.
+    pub has_newer: bool,
     /// Live messages evict the oldest beyond this.
     cap: usize,
 }
 
 impl Default for ChannelMessages {
     fn default() -> Self {
-        ChannelMessages { items: VecDeque::new(), has_older: false, cap: MESSAGE_CAP }
+        ChannelMessages { items: VecDeque::new(), has_older: false, has_newer: false, cap: MESSAGE_CAP }
     }
 }
 
@@ -917,6 +920,52 @@ impl Cache {
         buf.has_older = !(reached_start && fits);
     }
 
+    /// Shows only a window of `channel` found by asking for the messages around one
+    /// (newest first, as Discord returns it): what's held now is dropped, since the two
+    /// wouldn't join up. Unsent messages stay.
+    pub fn set_around(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        let last = self.channels.get(&channel).and_then(|c| c.last_message_id);
+        let newest = newest_first.first().map(|m| m.id);
+        let full = newest_first.len() >= limit;
+        let old = self.messages.remove(&channel).unwrap_or_default();
+        let mut buf = ChannelMessages { cap: SCROLLBACK_CAP, ..Default::default() };
+        for m in newest_first.into_iter().rev() {
+            buf.items.push_back(ChatMessage::new(m, SendState::Sent));
+        }
+        buf.has_older = full;
+        buf.has_newer = full && newest.is_none_or(|n| last.is_none_or(|last| n < last));
+        buf.items.extend(old.items.into_iter().filter(|m| m.state != SendState::Sent));
+        self.messages.insert(channel, buf);
+    }
+
+    /// Adds a page of newer messages (newest first) below what's held. A short page, or
+    /// one reaching the channel's newest message, closes the gap to the present.
+    pub fn append_newer(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        let last = self.channels.get(&channel).and_then(|c| c.last_message_id);
+        let Some(buf) = self.messages.get_mut(&channel) else { return };
+        let held = buf.items.iter().rev().find(|m| m.state == SendState::Sent).map(|m| m.message.id);
+        let short = newest_first.len() < limit;
+        let mut fresh: Vec<Message> = newest_first.into_iter().filter(|m| held.is_none_or(|h| m.id > h)).collect();
+        fresh.reverse();
+        let reached = fresh.last().map(|m| m.id).or(held).zip(last).is_some_and(|(n, last)| n >= last);
+        // Before any unsent ones, which belong at the very end.
+        let at = buf.items.iter().rposition(|m| m.state == SendState::Sent).map_or(0, |i| i + 1);
+        for (offset, message) in fresh.into_iter().enumerate() {
+            buf.items.insert(at + offset, ChatMessage::new(message, SendState::Sent));
+        }
+        buf.has_newer = !(short || reached);
+    }
+
+    /// Whether `channel` is a window back in its history, with newer messages unloaded.
+    pub fn has_newer(&self, channel: Id) -> bool {
+        self.messages.get(&channel).is_some_and(|m| m.has_newer)
+    }
+
+    /// Newest message held for `channel` (not counting unsent ones).
+    pub fn newest(&self, channel: Id) -> Option<Id> {
+        self.messages.get(&channel)?.items.iter().rev().find(|m| m.state == SendState::Sent).map(|m| m.message.id)
+    }
+
     /// Oldest message held for `channel`; older pages are fetched before it.
     pub fn oldest(&self, channel: Id) -> Option<Id> {
         self.messages.get(&channel)?.items.front().map(|m| m.message.id)
@@ -930,6 +979,10 @@ impl Cache {
     /// Back at the bottom: drop scrollback beyond [`MESSAGE_CAP`].
     pub fn trim_to_tail(&mut self, channel: Id) {
         let Some(buf) = self.messages.get_mut(&channel) else { return };
+        // A window back in the channel isn't the bottom, and its newest are not the ones to keep.
+        if buf.has_newer {
+            return;
+        }
         buf.cap = MESSAGE_CAP;
         while buf.items.len() > MESSAGE_CAP {
             buf.items.pop_front();
@@ -1337,7 +1390,8 @@ impl Cache {
                     }
                 }
                 if let Some(buf) = self.messages.get_mut(&channel) {
-                    if buf.position(m.id).is_none() {
+                    // Not into a window back in history: it'd sit past a gap.
+                    if buf.position(m.id).is_none() && !buf.has_newer {
                         buf.push(ChatMessage::new(m, SendState::Sent));
                     }
                 }
@@ -1679,6 +1733,48 @@ mod tests {
         // Back to normal: a live message evicts the oldest again.
         c.apply(CoreEvent::MessageCreate(msg(1001, 311)));
         assert_eq!(c.messages(Id(311)).unwrap().len(), MESSAGE_CAP);
+    }
+
+    #[test]
+    fn a_window_around_a_message_replaces_what_was_held_and_leaves_the_present_out() {
+        let mut c = ready_cache();
+        c.open_messages(Id(311));
+        c.set_history(Id(311), page(951, 1000, 311), 50);
+        c.set_around(Id(311), page(401, 450, 311), 50);
+        let m = c.messages(Id(311)).unwrap();
+        assert_eq!((m.get(0).unwrap().message.id, m.get(m.len() - 1).unwrap().message.id), (Id(401), Id(450)));
+        assert!(m.has_older && m.has_newer);
+        // Live messages don't land past the gap.
+        c.apply(CoreEvent::MessageCreate(msg(1001, 311)));
+        assert_eq!(c.messages(Id(311)).unwrap().len(), 50);
+        assert_eq!(c.newest(Id(311)), Some(Id(450)));
+    }
+
+    #[test]
+    fn newer_pages_join_on_below_until_the_gap_closes() {
+        let mut c = ready_cache();
+        c.open_messages(Id(311));
+        c.set_around(Id(311), page(401, 450, 311), 50);
+        c.append_newer(Id(311), page(451, 500, 311), 50);
+        assert!(c.has_newer(Id(311)), "a full page: more may follow");
+        assert_eq!(c.newest(Id(311)), Some(Id(500)));
+        c.append_newer(Id(311), page(501, 520, 311), 50);
+        assert!(!c.has_newer(Id(311)), "a short page reaches the present");
+        let m = c.messages(Id(311)).unwrap();
+        assert_eq!(m.len(), 120);
+        assert!((0..m.len() - 1).all(|i| m.get(i).unwrap().message.id < m.get(i + 1).unwrap().message.id), "in order");
+        // And live messages are taken again.
+        c.apply(CoreEvent::MessageCreate(msg(521, 311)));
+        assert_eq!(c.messages(Id(311)).unwrap().len(), 121);
+    }
+
+    #[test]
+    fn a_window_is_not_trimmed_like_the_bottom() {
+        let mut c = ready_cache();
+        c.open_messages(Id(311));
+        c.set_around(Id(311), page(1, 250, 311), 250);
+        c.trim_to_tail(Id(311));
+        assert_eq!(c.messages(Id(311)).unwrap().len(), 250);
     }
 
     fn member(user: u64, nick: Option<&str>, roles: &[u64]) -> Member {

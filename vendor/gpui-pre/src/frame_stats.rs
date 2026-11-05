@@ -14,7 +14,9 @@ macro_rules! counters {
 counters!(FRAMES, DRAW_NS, REQUEST_NS, PREPAINT_NS, PAINT_NS, FINISH_NS, PRESENT_NS, LAYOUT_NS, LAYOUT_CALLS, NODES, MEASURES, HITBOXES, MEMO_HITS,
     // The render thread: frames it put on screen, what those cost it, the part of that spent
     // waiting for a surface image, and frames replaced before it got to them.
-    RENDER_FRAMES, RENDER_NS, ACQUIRE_NS, RENDER_SUPERSEDED);
+    RENDER_FRAMES, RENDER_NS, ACQUIRE_NS, RENDER_SUPERSEDED,
+    // Frames that moved a scroll layer instead of rebuilding, and moves that needed a rebuild.
+    LAYER_MOVES, LAYER_MOVE_REFUSED);
 
 /// Bytes of atlas textures alive right now, and how many. Never reset.
 pub static ATLAS_BYTES: AtomicU64 = AtomicU64::new(0);

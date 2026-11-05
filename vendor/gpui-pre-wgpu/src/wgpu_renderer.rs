@@ -668,6 +668,9 @@ impl RenderTarget {
             self.failed_frame_count = 0;
         }
 
+        // Rustcord: part of drawing, so that it costs the main thread nothing.
+        frame.scene.compose_scroll_layers();
+
         let render_start = std::time::Instant::now();
         // Rustcord: reconfiguring and trying again right here saves the main thread a trip
         // through the frame loop just because the surface went out of date.
@@ -2616,7 +2619,13 @@ pub struct WgpuHeadlessRenderer {
 ))]
 impl WgpuHeadlessRenderer {
     pub fn new() -> anyhow::Result<Self> {
-        let (context, target_format) = WgpuContext::new_headless()?;
+        // Rustcord: the Vulkan loader crashes in the driver's setup when two threads start it at
+        // once, which parallel tests would otherwise do now and then.
+        static STARTING: Mutex<()> = Mutex::new(());
+        let (context, target_format) = {
+            let _starting = STARTING.lock();
+            WgpuContext::new_headless()?
+        };
         let atlas = Arc::new(WgpuAtlas::from_context(&context));
         let core =
             WgpuRendererCore::new(&context, target_format, wgpu::CompositeAlphaMode::Opaque);
@@ -2698,8 +2707,11 @@ impl WgpuHeadlessRenderer {
             .clone();
         let mut atlas_frame = AtlasFrame::default();
         self.atlas.capture_frame(&mut atlas_frame);
+        let mut composed = Scene::default();
+        scene.copy_primitives_into(&mut composed);
+        composed.compose_scroll_layers();
         self.core.render_frame(
-            scene,
+            &composed,
             &mut atlas_frame,
             &view,
             size,
@@ -3196,6 +3208,538 @@ mod tests {
         Ok(())
     }
 
+    // Rustcord: composing a scene's scroll layers, one kind of primitive at a time.
+    #[cfg(target_os = "linux")]
+    mod composing {
+        use super::*;
+        use gpui::{AtlasTile, AtlasTextureKind, EntityId, PathVertex, ScrollLayerId, TileId, TransformationMatrix, point, px};
+
+        fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+            Bounds {
+                origin: point(ScaledPixels(x), ScaledPixels(y)),
+                size: Size { width: ScaledPixels(width), height: ScaledPixels(height) },
+            }
+        }
+
+        fn quad(bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>) -> Quad {
+            Quad { bounds, content_mask: ContentMask { bounds: mask }, ..Quad::default() }
+        }
+
+        fn view() -> EntityId {
+            EntityId::from(1u64)
+        }
+
+        fn composed(scene: &Scene) -> Scene {
+            let mut composed = Scene::default();
+            scene.copy_primitives_into(&mut composed);
+            composed.compose_scroll_layers();
+            composed
+        }
+
+        #[test]
+        fn every_kind_of_primitive_moves_with_its_mask() {
+            let id = ScrollLayerId::new();
+            let clip = rect(0., 100., 200., 100.);
+            let painted = rect(0., 0., 200., 300.);
+            let row = rect(10., 90., 50., 40.);
+            let mask = ContentMask { bounds: rect(10., 95., 50., 30.) };
+            let tile = AtlasTile {
+                texture_id: AtlasTextureId { index: 0, kind: AtlasTextureKind::Monochrome },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds::default(),
+            };
+            let mut path = Path::new(point(px(0.), px(0.))).scale(1.);
+            path.bounds = row;
+            path.content_mask = mask.clone();
+            path.vertices.push(PathVertex {
+                xy_position: point(ScaledPixels(20.), ScaledPixels(100.)),
+                st_position: point(0., 0.),
+                content_mask: ContentMask::default(),
+            });
+
+            let mut scene = Scene::default();
+            scene.begin_scroll_layer(id, view(), clip, painted);
+            scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(2.),
+                bounds: row,
+                corner_radii: Corners::default(),
+                content_mask: mask.clone(),
+                color: Hsla::default(),
+                element_bounds: row,
+                element_corner_radii: Corners::default(),
+                inset: 1,
+                pad: 0,
+            });
+            scene.insert_primitive(quad(row, mask.bounds));
+            scene.insert_primitive(Underline {
+                order: 0,
+                pad: 0,
+                bounds: row,
+                content_mask: mask.clone(),
+                color: Hsla::default(),
+                thickness: ScaledPixels(1.),
+                wavy: false.into(),
+            });
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds: row,
+                content_mask: mask.clone(),
+                color: Hsla::default(),
+                tile: tile.clone(),
+                transformation: TransformationMatrix::unit(),
+            });
+            scene.insert_primitive(SubpixelSprite {
+                order: 0,
+                pad: 0,
+                bounds: row,
+                content_mask: mask.clone(),
+                color: Hsla::default(),
+                tile: tile.clone(),
+                transformation: TransformationMatrix::unit(),
+            });
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.,
+                bounds: row,
+                content_mask: mask.clone(),
+                corner_radii: Corners::default(),
+                tile,
+            });
+            scene.insert_primitive(path);
+            scene.end_scroll_layer();
+            assert!(scene.quads.is_empty(), "a layer stays out of the lists until composed");
+
+            scene.set_scroll_layer_offset(id, ScaledPixels(40.));
+            let composed = composed(&scene);
+
+            let expected_bounds = rect(10., 130., 50., 40.);
+            let expected_mask = rect(10., 135., 50., 30.);
+            macro_rules! check {
+                ($list:ident) => {
+                    assert_eq!(composed.$list.len(), 1, stringify!($list));
+                    assert_eq!(composed.$list[0].bounds, expected_bounds, stringify!($list));
+                    assert_eq!(composed.$list[0].content_mask.bounds, expected_mask, stringify!($list));
+                };
+            }
+            check!(shadows);
+            check!(quads);
+            check!(underlines);
+            check!(monochrome_sprites);
+            check!(subpixel_sprites);
+            check!(polychrome_sprites);
+            check!(paths);
+            assert_eq!(composed.shadows[0].element_bounds, expected_bounds);
+            assert_eq!(composed.paths[0].vertices[0].xy_position.y, ScaledPixels(140.));
+        }
+
+        #[test]
+        fn what_ends_up_outside_the_view_is_dropped_and_masks_stop_at_its_edge() {
+            let id = ScrollLayerId::new();
+            let clip = rect(0., 100., 200., 100.);
+            let painted = rect(0., 0., 200., 300.);
+            let mut scene = Scene::default();
+            scene.begin_scroll_layer(id, view(), clip, painted);
+            // Above the view, moved into it, partly.
+            scene.insert_primitive(quad(rect(0., 50., 200., 30.), painted));
+            // Below the view, staying there.
+            scene.insert_primitive(quad(rect(0., 250., 200., 30.), painted));
+            scene.end_scroll_layer();
+            scene.set_scroll_layer_offset(id, ScaledPixels(40.));
+            let composed = composed(&scene);
+            assert_eq!(composed.quads.len(), 1);
+            assert_eq!(composed.quads[0].bounds, rect(0., 90., 200., 30.));
+            assert_eq!(composed.quads[0].content_mask.bounds, clip);
+        }
+
+        #[test]
+        fn what_paints_after_a_layer_stays_above_it_wherever_it_moves() {
+            let id = ScrollLayerId::new();
+            let clip = rect(0., 100., 200., 100.);
+            let painted = rect(0., 0., 200., 300.);
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(clip, clip));
+            scene.begin_scroll_layer(id, view(), clip, painted);
+            for y in 0..10 {
+                // Overlapping, so that the orders inside climb.
+                scene.insert_primitive(quad(rect(0., y as f32 * 20., 200., 40.), painted));
+            }
+            scene.end_scroll_layer();
+            // Not touching where rows happened to be doesn't matter: it's over the view.
+            let over = rect(190., 110., 10., 10.);
+            scene.insert_primitive(quad(over, over));
+            scene.finish();
+            scene.set_scroll_layer_offset(id, ScaledPixels(20.));
+            let composed = composed(&scene);
+            assert_eq!(composed.quads.first().unwrap().bounds, clip, "what's under it is drawn first");
+            assert_eq!(composed.quads.last().unwrap().bounds, over, "the last painted is drawn last");
+        }
+
+        #[test]
+        fn replaying_a_paint_keeps_the_layer() {
+            let id = ScrollLayerId::new();
+            let clip = rect(0., 100., 200., 100.);
+            let painted = rect(0., 0., 200., 300.);
+            let mut scene = Scene::default();
+            scene.begin_scroll_layer(id, view(), clip, painted);
+            scene.insert_primitive(quad(rect(0., 120., 200., 30.), painted));
+            scene.end_scroll_layer();
+            scene.set_scroll_layer_offset(id, ScaledPixels(10.));
+
+            let mut replayed = Scene::default();
+            replayed.replay(0..scene.len(), &scene);
+            assert_eq!(replayed.scroll_layer_offset(id), Some(0.), "a replay is back where it was painted");
+            assert!(replayed.quads.is_empty());
+            assert_eq!(composed(&replayed).quads.len(), 1);
+        }
+    }
+
+    // Rustcord: a moved scroll layer against really rebuilding, compared in pixels off the GPU.
+    #[cfg(target_os = "linux")]
+    mod scroll_layers {
+        use super::*;
+        use gpui::{
+            Context, InteractiveElement as _, IntoElement, ListAlignment,
+            ListState, MouseButton, ParentElement as _, Render, ScrollHandle, ScrollLayerId,
+            ScrollLayerSpec, StatefulInteractiveElement as _, Styled as _, TestAppContext,
+            VisualTestContext, Window, div, list, point, px, rgb,
+        };
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        fn row_color(ix: usize) -> u32 {
+            0x102030 + (ix as u32 * 0x0B1705) % 0xEFCFCF
+        }
+
+        /// Rows of different heights with what tends to go wrong: their own clips, rounded corners
+        /// and borders, something sticking out, and a shadow.
+        fn row(ix: usize, clicked: &Rc<Cell<Option<usize>>>) -> impl IntoElement {
+            let clicked = clicked.clone();
+            div()
+                .id(ix)
+                // A quarter pixel lands on half a device pixel in these tests' 2x windows.
+                .h(px(if ix % 3 == 0 { 30.25 } else { 47. }))
+                .w_full()
+                .flex_shrink_0()
+                .relative()
+                .bg(rgb(row_color(ix)))
+                .on_click(move |_, _, _| clicked.set(Some(ix)))
+                .child(div().absolute().left(px(4.)).top(px(-3.)).size(px(12.)).rounded(px(6.)).bg(rgb(0xFFFFFF)))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(30.))
+                        .top(px(4.))
+                        .h(px(16.))
+                        .w(px(60.))
+                        .overflow_hidden()
+                        .child(div().h(px(50.)).w(px(40.)).border_2().border_color(rgb(0x00FF00)).bg(rgb(0x202020))),
+                )
+                .child(div().absolute().right(px(4.)).top(px(6.)).size(px(14.)).rounded(px(3.)).bg(rgb(0x4040FF)).shadow_md())
+                .child(
+                    div().absolute().right(px(30.)).top(px(5.)).size(px(16.)).rounded(px(4.)).bg(rgb(0xC0C0C0)).shadow(vec![gpui::BoxShadow {
+                        color: rgb(0x000000).into(),
+                        offset: point(px(0.), px(2.)),
+                        blur_radius: px(3.),
+                        spread_radius: px(0.),
+                        inset: true,
+                    }]),
+                )
+        }
+
+        /// Things around a scroll view: above, below, and over it after it's painted.
+        fn around(content: impl IntoElement, header_clicked: &Rc<Cell<bool>>) -> impl IntoElement {
+            let header_clicked = header_clicked.clone();
+            div()
+                .size_full()
+                .relative()
+                .flex()
+                .flex_col()
+                .bg(rgb(0x000000))
+                .child(
+                    div()
+                        .id("header")
+                        .h(px(100.3))
+                        .w_full()
+                        .flex_shrink_0()
+                        .bg(rgb(0x800000))
+                        .on_click(move |_, _, _| header_clicked.set(true)),
+                )
+                .child(content)
+                .child(div().h(px(100.)).w_full().flex_shrink_0().bg(rgb(0x008000)))
+                .child(div().absolute().right_0().top(px(150.)).w(px(30.)).h(px(60.)).bg(rgb(0xFFFF00)).opacity(0.5))
+        }
+
+        struct ListView {
+            state: ListState,
+            clicked: Rc<Cell<Option<usize>>>,
+            header_clicked: Rc<Cell<bool>>,
+        }
+
+        impl Render for ListView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicked = self.clicked.clone();
+                around(
+                    div().flex_1().min_h_0().child(
+                        list(self.state.clone(), move |ix, _, _| row(ix, &clicked).into_any_element()).size_full(),
+                    ),
+                    &self.header_clicked,
+                )
+            }
+        }
+
+        struct HandleView {
+            handle: ScrollHandle,
+            clicked: Rc<Cell<Option<usize>>>,
+            header_clicked: Rc<Cell<bool>>,
+        }
+
+        impl Render for HandleView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicked = self.clicked.clone();
+                around(
+                    div().flex_1().min_h_0().child(
+                        div()
+                            .id("rows")
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.handle)
+                            .children((0..200).map(|ix| row(ix, &clicked).into_any_element())),
+                    ),
+                    &self.header_clicked,
+                )
+            }
+        }
+
+        fn spec() -> ScrollLayerSpec {
+            ScrollLayerSpec { id: ScrollLayerId::new(), overscan: px(300.) }
+        }
+
+        fn rebuild(cx: &mut VisualTestContext) {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        }
+
+        fn image_of(cx: &mut VisualTestContext, renderer: &mut WgpuHeadlessRenderer) -> image::RgbaImage {
+            cx.update(|window, _| {
+                let scale = window.scale_factor();
+                let viewport = window.viewport_size();
+                let size = device_size((f32::from(viewport.width) * scale) as i32, (f32::from(viewport.height) * scale) as i32);
+                renderer.render_scene_to_image(window.rendered_scene_for_test(), size)
+            })
+            .expect("rendering the scene")
+        }
+
+        fn assert_same_picture(moved: &image::RgbaImage, rebuilt: &image::RgbaImage, what: &str) {
+            assert_eq!(moved.dimensions(), rebuilt.dimensions());
+            let mut wrong = 0;
+            let mut first = None;
+            for (x, y, pixel) in moved.enumerate_pixels() {
+                let other = rebuilt.get_pixel(x, y);
+                // Rounding in the last bit of a coordinate can tip an edge's coverage by a step.
+                if pixel.0.iter().zip(other.0).any(|(a, b)| a.abs_diff(b) > 2) {
+                    wrong += 1;
+                    first.get_or_insert((x, y, pixel.0, other.0));
+                }
+            }
+            assert_eq!(wrong, 0, "{what}: {wrong} pixels differ, first {first:?}");
+        }
+
+        /// Scrolls by each of `steps`, checks that a moved layer gives the same picture as really
+        /// rebuilding, and that a rebuild is asked for exactly when the view leaves what's painted.
+        fn check_steps(
+            cx: &mut VisualTestContext,
+            renderer: &mut WgpuHeadlessRenderer,
+            id: ScrollLayerId,
+            steps: &[f32],
+            top: impl Fn() -> f32,
+            scroll: impl Fn(f32),
+        ) {
+            rebuild(cx);
+            for (ix, step) in steps.iter().enumerate() {
+                let before = top();
+                scroll(*step);
+                let moved = before - top();
+                let accepted = cx.update(|window, _| window.move_scroll_layer(id, px(moved)));
+                assert!(accepted, "step {ix} by {step}");
+                let picture = image_of(cx, renderer);
+                rebuild(cx);
+                let rebuilt = image_of(cx, renderer);
+                assert_same_picture(&picture, &rebuilt, &format!("step {ix} by {step}, moved {moved}"));
+            }
+            // Several steps without a rebuild between.
+            rebuild(cx);
+            for step in [60., 90.5, 50.] {
+                let before = top();
+                scroll(step);
+                let moved = before - top();
+                assert!(cx.update(|window, _| window.move_scroll_layer(id, px(moved))));
+            }
+            let picture = image_of(cx, renderer);
+            rebuild(cx);
+            assert_same_picture(&picture, &image_of(cx, renderer), "several steps");
+
+            // On until the view leaves what's painted, and no further.
+            let mut gone = 0.;
+            loop {
+                let before = top();
+                scroll(50.);
+                let moved = before - top();
+                gone += moved;
+                if !cx.update(|window, _| window.move_scroll_layer(id, px(moved))) {
+                    break;
+                }
+                assert!(gone >= -300., "the view left what was painted, {gone} down");
+            }
+            assert!(gone < -300., "asked for a rebuild too early, {gone} down");
+            rebuild(cx);
+        }
+
+        const STEPS: &[f32] = &[1., 0.5, 7.5, 40., 96.5, -30., -100., 250., 290., -290., 13.];
+
+        #[gpui::test]
+        fn moved_list_looks_like_a_rebuilt_one(cx: &mut TestAppContext) {
+            let mut renderer = WgpuHeadlessRenderer::new().expect("a GPU");
+            let spec = spec();
+            let state = ListState::new(200, ListAlignment::Top, px(50.));
+            state.set_scroll_layer(Some(spec));
+            let view_state = state.clone();
+            let (_, cx) = cx.add_window_view(move |_, _| ListView {
+                state: view_state,
+                clicked: Default::default(),
+                header_clicked: Default::default(),
+            });
+            rebuild(cx);
+            let top = || f32::from(-state.scroll_px_offset_for_scrollbar().y);
+            let scroll = |dy: f32| state.set_offset_from_scrollbar(point(px(0.), -(state_top(&state) + px(dy))));
+            check_steps(cx, &mut renderer, spec.id, STEPS, top, scroll);
+        }
+
+        fn state_top(state: &ListState) -> gpui::Pixels {
+            -state.scroll_px_offset_for_scrollbar().y
+        }
+
+        #[gpui::test]
+        fn moved_scroll_view_looks_like_a_rebuilt_one(cx: &mut TestAppContext) {
+            let mut renderer = WgpuHeadlessRenderer::new().expect("a GPU");
+            let spec = spec();
+            let handle = ScrollHandle::new();
+            handle.set_scroll_layer(Some(spec));
+            let view_handle = handle.clone();
+            let (_, cx) = cx.add_window_view(move |_, _| HandleView {
+                handle: view_handle,
+                clicked: Default::default(),
+                header_clicked: Default::default(),
+            });
+            rebuild(cx);
+            let top = || f32::from(-handle.offset().y);
+            let scroll = |dy: f32| {
+                let mut offset = handle.offset();
+                offset.y = (offset.y - px(dy)).min(px(0.));
+                handle.set_offset(offset);
+            };
+            check_steps(cx, &mut renderer, spec.id, STEPS, top, scroll);
+        }
+
+        #[gpui::test]
+        fn clicks_land_on_what_is_shown_and_never_on_rows_beyond_the_view(cx: &mut TestAppContext) {
+            let spec = spec();
+            let state = ListState::new(200, ListAlignment::Top, px(50.));
+            state.set_scroll_layer(Some(spec));
+            let clicked: Rc<Cell<Option<usize>>> = Default::default();
+            let header_clicked: Rc<Cell<bool>> = Default::default();
+            let (view_state, view_clicked, view_header) = (state.clone(), clicked.clone(), header_clicked.clone());
+            let (_, cx) = cx.add_window_view(move |_, _| ListView {
+                state: view_state,
+                clicked: view_clicked,
+                header_clicked: view_header,
+            });
+            rebuild(cx);
+
+            // Rows are painted behind the header for the layer to move into. They mustn't get its clicks.
+            state.set_offset_from_scrollbar(point(px(0.), px(-200.)));
+            rebuild(cx);
+            let click = |cx: &mut VisualTestContext, y: f32| {
+                let position = point(px(200.), px(y));
+                cx.simulate_mouse_move(position, None, gpui::Modifiers::default());
+                cx.simulate_mouse_down(position, MouseButton::Left, gpui::Modifiers::default());
+                cx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+            };
+            click(cx, 50.);
+            assert!(header_clicked.get(), "the header takes clicks over rows painted behind it");
+            assert_eq!(clicked.get(), None);
+
+            // The list has moved as a layer, with the pointer still: a click goes to the row shown
+            // there now, the same as clicking there after really rebuilding.
+            rebuild(cx);
+            let before = state_top(&state);
+            state.set_offset_from_scrollbar(point(px(0.), -(before + px(120.))));
+            let moved = before - state_top(&state);
+            assert!(cx.update(|window, _| window.move_scroll_layer(spec.id, moved)));
+            click(cx, 300.);
+            let on_moved = clicked.take();
+            assert!(on_moved.is_some());
+            rebuild(cx);
+            click(cx, 300.);
+            assert_eq!(on_moved, clicked.take());
+        }
+
+        #[gpui::test]
+        fn anything_changing_content_rebuilds_and_the_layer_starts_over(cx: &mut TestAppContext) {
+            let spec = spec();
+            let state = ListState::new(200, ListAlignment::Top, px(50.));
+            state.set_scroll_layer(Some(spec));
+            let view_state = state.clone();
+            let (_, cx) = cx.add_window_view(move |_, _| ListView {
+                state: view_state,
+                clicked: Default::default(),
+                header_clicked: Default::default(),
+            });
+            rebuild(cx);
+            let before = state_top(&state);
+            state.set_offset_from_scrollbar(point(px(0.), -(before + px(100.))));
+            let moved = before - state_top(&state);
+            assert!(cx.update(|window, _| window.move_scroll_layer(spec.id, moved)));
+
+            // The view isn't dirty, only moved: a draw for any other reason still has to render it.
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let offset_after =
+                cx.update(|window, _| window.rendered_scene_for_test().scroll_layer_offset(spec.id));
+            assert_eq!(offset_after, Some(0.));
+        }
+
+        #[gpui::test]
+        fn refuses_a_move_that_is_not_whole_pixels_or_with_no_such_layer(cx: &mut TestAppContext) {
+            let spec = spec();
+            let state = ListState::new(200, ListAlignment::Top, px(50.));
+            state.set_scroll_layer(Some(spec));
+            let view_state = state.clone();
+            let (_, cx) = cx.add_window_view(move |_, _| ListView {
+                state: view_state,
+                clicked: Default::default(),
+                header_clicked: Default::default(),
+            });
+            rebuild(cx);
+            let scale = cx.update(|window, _| window.scale_factor());
+            assert!(!cx.update(|window, _| window.move_scroll_layer(spec.id, px(0.3 / scale))));
+            rebuild(cx);
+            assert!(!cx.update(|window, _| window.move_scroll_layer(ScrollLayerId::new(), px(10.))));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn point_f(x: f32, y: f32) -> Point<ScaledPixels> {
+        Point { x: ScaledPixels(x), y: ScaledPixels(y) }
+    }
+
     /// What `WgpuRenderer::draw` costs the main thread, on a scene the size of a busy message
     /// list. `cargo test --lib handoff_cost -- --ignored --nocapture`
     #[cfg(target_os = "linux")]
@@ -3226,6 +3770,41 @@ mod tests {
             scene.quads.len(),
             scene.polychrome_sprites.len(),
             start.elapsed() / rounds
+        );
+
+        // The same with most of it on a scroll layer, as a list scrolling is.
+        let id = gpui::ScrollLayerId::new();
+        let everywhere = Bounds {
+            origin: point_f(0., -5000.),
+            size: Size { width: ScaledPixels(20000.), height: ScaledPixels(20000.) },
+        };
+        let mut layered = Scene::default();
+        layered.begin_scroll_layer(id, gpui::EntityId::from(1u64), everywhere, everywhere);
+        for quad in &scene.quads {
+            let mut quad = *quad;
+            quad.content_mask = ContentMask { bounds: everywhere };
+            layered.insert_primitive(quad);
+        }
+        for sprite in &scene.polychrome_sprites {
+            let mut sprite = sprite.clone();
+            sprite.content_mask = ContentMask { bounds: everywhere };
+            layered.insert_primitive(sprite);
+        }
+        layered.end_scroll_layer();
+        let (mut copying, mut composing) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        for _ in 0..rounds {
+            let start = std::time::Instant::now();
+            layered.copy_primitives_into(&mut frame.scene);
+            copying += start.elapsed();
+            let start = std::time::Instant::now();
+            frame.scene.compose_scroll_layers();
+            composing += start.elapsed();
+            frame.scene.clear();
+        }
+        println!(
+            "with a layer: {:?} on the main thread, {:?} on the render thread, per frame",
+            copying / rounds,
+            composing / rounds
         );
         Ok(())
     }

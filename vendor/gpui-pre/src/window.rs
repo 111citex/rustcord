@@ -16,7 +16,8 @@ use crate::{
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollLayerId, ScrollLayerSpec,
+    Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
@@ -962,6 +963,9 @@ pub(crate) struct TooltipRequest {
 }
 
 pub(crate) struct DeferredDraw {
+    /// Rustcord: comes from a scroll layer's content but paints outside the layer, so it wouldn't
+    /// follow when the layer moves.
+    in_scroll_layer: bool,
     current_view: EntityId,
     priority: usize,
     parent_node: DispatchNodeId,
@@ -1213,6 +1217,11 @@ pub struct Window {
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// Rustcord: what's seen of the scroll layer being prepainted or painted, inside which
+    /// content masks reach further than that.
+    scroll_layer_clips: Vec<Bounds<Pixels>>,
+    /// Whether scroll layers get made. Off where the platform can't draw them.
+    pub(crate) scroll_layers_enabled: bool,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1591,6 +1600,7 @@ impl Window {
         profiler::journal::record_window_visibility(handle.window_id(), visibility);
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let scroll_layers_enabled = platform_window.supports_scroll_layers();
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
@@ -2075,6 +2085,8 @@ impl Window {
             visibility_observers: SubscriberSet::new(),
             hovered,
             needs_present,
+            scroll_layer_clips: Vec::new(),
+            scroll_layers_enabled,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3279,6 +3291,19 @@ impl Window {
             self.refresh();
         }
         self.invalidate_entities();
+        // Rustcord: a layer that's moved has to be rendered for real now, or a cached view would
+        // bring back its old place along with hitboxes to match.
+        let moved_views: SmallVec<[EntityId; 4]> = self
+            .rendered_frame
+            .scene
+            .scroll_layers
+            .iter()
+            .filter(|layer| layer.offset_y.0 != 0.)
+            .filter_map(|layer| layer.view)
+            .collect();
+        for view in moved_views {
+            self.mark_view_dirty(view);
+        }
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -3863,6 +3888,7 @@ impl Window {
                 [range.start.deferred_draws_index..range.end.deferred_draws_index]
                 .iter()
                 .map(|deferred_draw| DeferredDraw {
+                    in_scroll_layer: deferred_draw.in_scroll_layer,
                     current_view: deferred_draw.current_view,
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
@@ -4008,6 +4034,159 @@ impl Window {
             result
         } else {
             f(self)
+        }
+    }
+
+    /// Rustcord: the masks for a scroll layer with this `mask`: what's seen, and what's painted.
+    /// `None` when it can't be a layer. The same answer in prepaint and paint.
+    fn scroll_layer_masks(
+        &self,
+        spec: ScrollLayerSpec,
+        mask: &ContentMask<Pixels>,
+    ) -> Option<(Bounds<Pixels>, ContentMask<Pixels>)> {
+        if !self.scroll_layers_enabled || !self.scroll_layer_clips.is_empty() {
+            return None;
+        }
+        let clip = mask.intersect(&self.content_mask()).bounds;
+        if clip.is_empty() {
+            return None;
+        }
+        let mut painted = clip;
+        painted.origin.y -= spec.overscan;
+        painted.size.height += spec.overscan * 2.;
+        Some((clip, ContentMask { bounds: painted }))
+    }
+
+    /// Rustcord: how far beyond its view a scrolling element should prepare content, if it's
+    /// a layer here.
+    pub(crate) fn scroll_layer_overscan(&self, spec: Option<ScrollLayerSpec>) -> Pixels {
+        match spec {
+            Some(spec) if self.scroll_layers_enabled && self.scroll_layer_clips.is_empty() => {
+                spec.overscan
+            }
+            _ => Pixels::ZERO,
+        }
+    }
+
+    /// Rustcord: like [`Self::with_content_mask`] for a scroll view in prepaint. With `spec`,
+    /// its content is prepaint for the layer: masks reach `overscan` further, while hitboxes
+    /// stick to what's seen.
+    pub(crate) fn prepaint_scroll_content<R>(
+        &mut self,
+        spec: Option<ScrollLayerSpec>,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let layer = spec.zip(mask.as_ref()).and_then(|(spec, mask)| self.scroll_layer_masks(spec, mask));
+        let Some((clip, painted)) = layer else {
+            return self.with_content_mask(mask, f);
+        };
+        self.content_mask_stack.push(painted);
+        self.scroll_layer_clips.push(clip);
+        let result = f(self);
+        self.scroll_layer_clips.pop();
+        self.content_mask_stack.pop();
+        result
+    }
+
+    /// Rustcord: like [`Self::with_content_mask`] for a scroll view in paint. With `spec`, what's
+    /// painted goes into a scroll layer.
+    pub(crate) fn paint_scroll_content<R>(
+        &mut self,
+        spec: Option<ScrollLayerSpec>,
+        mask: Option<ContentMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let layer = spec.zip(mask.as_ref()).and_then(|(spec, mask)| {
+            self.scroll_layer_masks(spec, mask).map(|masks| (spec, masks))
+        });
+        let Some((spec, (clip, painted))) = layer else {
+            return self.with_content_mask(mask, f);
+        };
+        let view = self.current_view();
+        // Snapped the way every primitive's own mask is, or an edge could land elsewhere.
+        self.next_frame.scene.begin_scroll_layer(
+            spec.id,
+            view,
+            self.cover_bounds(clip),
+            self.cover_bounds(painted.bounds),
+        );
+        self.content_mask_stack.push(painted);
+        self.scroll_layer_clips.push(clip);
+        let result = f(self);
+        self.scroll_layer_clips.pop();
+        self.content_mask_stack.pop();
+        self.next_frame.scene.end_scroll_layer();
+        result
+    }
+
+    /// Rustcord: the content of scroll layer `id` has moved `moved` down the screen (up, if
+    /// negative) and the frame being made should show that. This keeps what's on screen right,
+    /// and is why nothing about the list has to be rebuilt for this frame.
+    ///
+    /// `false` means moving won't do, and the view needs rendering: the layer's gone, the view
+    /// has left what was painted, the move isn't by whole pixels, or something on screen came
+    /// from the layer's content without being part of it.
+    pub fn move_scroll_layer(&mut self, id: ScrollLayerId, moved: Pixels) -> bool {
+        let scale = self.scale_factor();
+        let tooltip_shown = self.tooltip_bounds.is_some();
+        let deferred_content = self
+            .rendered_frame
+            .deferred_draws
+            .iter()
+            .any(|deferred| deferred.in_scroll_layer);
+        let Some(layer) = self
+            .rendered_frame
+            .scene
+            .scroll_layers
+            .iter_mut()
+            .find(|layer| layer.id == Some(id))
+        else {
+            crate::frame_stats::add(&crate::frame_stats::LAYER_MOVE_REFUSED, 1);
+            return false;
+        };
+        let device_pixels = moved.0 * scale;
+        let whole = device_pixels.round();
+        let offset_y = layer.offset_y + ScaledPixels(whole);
+        let can_move = layer.movable
+            && !tooltip_shown
+            && !deferred_content
+            && (device_pixels - whole).abs() < 0.05
+            && layer.covers_view_at(offset_y);
+        // Even a move that's refused counts, so that the layer's view gets rendered.
+        layer.offset_y = offset_y;
+        if can_move {
+            crate::frame_stats::add(&crate::frame_stats::LAYER_MOVES, 1);
+            self.needs_present.set(true);
+        } else {
+            crate::frame_stats::add(&crate::frame_stats::LAYER_MOVE_REFUSED, 1);
+        }
+        can_move
+    }
+
+    /// Rustcord: have this frame presented, with or without anything new in it. A list in mid-glide
+    /// that moved less than a pixel still wants pacing by the compositor's frames.
+    pub fn present_this_frame(&self) {
+        self.needs_present.set(true);
+    }
+
+    /// The scene last drawn, for tests to look at what a frame would show.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_scene_for_test(&self) -> &Scene {
+        &self.rendered_frame.scene
+    }
+
+    /// Rustcord: what's on screen comes from where a scroll layer was painted, so the hitboxes
+    /// and listeners from that paint don't match it. Whatever needs them gets a rebuild first.
+    fn settle_scroll_layers(&mut self, cx: &mut App) {
+        let moved = self
+            .rendered_frame
+            .scene
+            .scroll_layers
+            .iter()
+            .any(|layer| layer.offset_y.0 != 0.);
+        if moved {
+            self.draw(cx).clear(cx);
         }
     }
 
@@ -4344,7 +4523,16 @@ impl Window {
     ) {
         self.invalidator.debug_assert_prepaint();
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
+        let in_scroll_layer = !self.scroll_layer_clips.is_empty();
+        // Rustcord: a row beyond the view is only there for a layer to move into. What it floats
+        // over the window has no place on screen yet.
+        if let Some(clip) = self.scroll_layer_clips.last()
+            && (absolute_offset.y < clip.top() || absolute_offset.y > clip.bottom())
+        {
+            return;
+        }
         self.next_frame.deferred_draws.push(DeferredDraw {
+            in_scroll_layer,
             current_view: self.current_view(),
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
@@ -4669,7 +4857,9 @@ impl Window {
         let quantized_origin = Point::new(
             round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
                 / SUBPIXEL_VARIANTS_X as f32,
-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+            // Rustcord: the same rounding as `round_half_toward_zero` on screen, but also above
+            // the window's top: glyphs on a scroll layer must land the same wherever it's painted.
+            (glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32 - 0.5).ceil()
                 / SUBPIXEL_VARIANTS_Y as f32,
         );
         let subpixel_variant = Point::new(
@@ -5129,7 +5319,11 @@ impl Window {
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
         self.invalidator.debug_assert_prepaint();
 
-        let content_mask = self.content_mask();
+        let mut content_mask = self.content_mask();
+        // Rustcord: content painted beyond a scroll layer's view isn't there to click on.
+        if let Some(clip) = self.scroll_layer_clips.last() {
+            content_mask.bounds = content_mask.bounds.intersect(clip);
+        }
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
@@ -5425,6 +5619,13 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        // Rustcord: another wheel notch where the pointer already was only needs the list's own
+        // bounds, which a moved layer doesn't change. Everything else looks at what's under
+        // the pointer, or may do something that does.
+        if !matches!(&event, PlatformInput::ScrollWheel(wheel) if wheel.position == self.mouse_position)
+        {
+            self.settle_scroll_layers(cx);
+        }
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();

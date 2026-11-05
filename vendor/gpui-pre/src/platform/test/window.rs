@@ -535,6 +535,10 @@ impl PlatformWindow for TestWindow {
         }
     }
 
+    fn supports_scroll_layers(&self) -> bool {
+        true
+    }
+
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()
     }

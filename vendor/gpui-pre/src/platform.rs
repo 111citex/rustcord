@@ -958,6 +958,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
+    /// Rustcord: whether `draw` runs [`Scene::compose_scroll_layers`]. Without it a scene has
+    /// to come with no scroll layers, so the window doesn't make any.
+    fn supports_scroll_layers(&self) -> bool {
+        false
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 

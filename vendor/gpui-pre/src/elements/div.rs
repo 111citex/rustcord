@@ -2378,7 +2378,12 @@ impl Interactivity {
                 }
 
                 window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
+                    let scroll_layer = self
+                        .tracked_scroll_handle
+                        .as_ref()
+                        .and_then(|handle| handle.0.borrow().scroll_layer);
+                    window.prepaint_scroll_content(
+                        scroll_layer,
                         style.overflow_mask(bounds, window.rem_size()),
                         |window| {
                             let hitbox = if self.should_insert_hitbox(&style, window, cx) {
@@ -2538,7 +2543,12 @@ impl Interactivity {
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
-                            window.with_content_mask(
+                            let scroll_layer = self
+                                .tracked_scroll_handle
+                                .as_ref()
+                                .and_then(|handle| handle.0.borrow().scroll_layer);
+                            window.paint_scroll_content(
+                                scroll_layer,
                                 style.overflow_mask(bounds, window.rem_size()),
                                 |window| {
                                     window.with_tab_group(tab_group, |window| {
@@ -4221,6 +4231,8 @@ struct ScrollHandleState {
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
     active_item: Option<ScrollActiveItem>,
+    /// Rustcord: paint the content as a scroll layer.
+    scroll_layer: Option<crate::ScrollLayerSpec>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4252,6 +4264,12 @@ impl ScrollHandle {
     /// Construct a new scroll handle.
     pub fn new() -> Self {
         Self(Rc::default())
+    }
+
+    /// Rustcord: paint the content of what this handle tracks as a scroll layer, or stop doing
+    /// so. That content has to be all there for `overscan` beyond the view.
+    pub fn set_scroll_layer(&self, spec: Option<crate::ScrollLayerSpec>) {
+        self.0.borrow_mut().scroll_layer = spec;
     }
 
     /// Get the current scroll offset.

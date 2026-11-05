@@ -1748,6 +1748,10 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
+    fn supports_scroll_layers(&self) -> bool {
+        true
+    }
+
     fn draw(&self, scene: &Scene) {
         let mut inner = self.0.state.borrow_mut();
 

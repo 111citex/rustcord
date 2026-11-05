@@ -5,6 +5,10 @@ gpui-pre 0.3.7, gpui-pre-wgpu 0.3.7 and gpui-pre-linux 0.3.7 from crates.io (Apa
   lock, which is how a resize knows no frame is half done; frames painted before a resize are never presented.
 - `wgpu_atlas.rs`: a frame takes its uploads and textures with it (`AtlasFrame`), because the next paint can reuse a tile's
   space or a texture's id while it waits to be drawn.
+- `scene.rs`, `window.rs`, `elements/list.rs`, `elements/div.rs`: scroll layers. A `ListState` or `ScrollHandle` given a
+  `ScrollLayerSpec` paints its content with `overscan` more of it into a layer of the scene, which `Window::move_scroll_layer`
+  then moves with no render. The render thread composes that into a frame (`Scene::compose_scroll_layers`). A layer that's
+  moved gets rendered on the next real draw, and input other than more wheel on the same spot gets a real draw first.
 - `gpui-pre-linux/wayland`: only `draw` going off the main thread needs this crate changed. A frame that fails to reach
   the compositor gets no frame callback, so the render thread pings the loop (`render_feedback_fired`).
   `x11/window.rs`: redraw requests from the render thread are picked up in `refresh`.

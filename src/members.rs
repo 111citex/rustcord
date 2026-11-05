@@ -159,7 +159,7 @@ impl MembersPanel {
             stale_for: None,
             services,
             guild,
-            scroller: SmoothScroller::new(ScrollTarget::List(list.clone())).calm_hover(),
+            scroller: SmoothScroller::new(ScrollTarget::List(list.clone())).calm_hover().layered(),
             list,
             seen: Vec::new(),
             cards: Vec::new(),

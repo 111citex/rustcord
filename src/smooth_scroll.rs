@@ -9,7 +9,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{
-    DispatchPhase, IntoElement, ListState, ScrollDelta, ScrollHandle, ScrollWheelEvent, Styled, canvas, point, px,
+    App, DispatchPhase, EntityId, IntoElement, ListState, ScrollDelta, ScrollHandle, ScrollLayerId, ScrollLayerSpec,
+    ScrollWheelEvent, Styled, Window, canvas, point, px,
 };
 
 /// Pixels per wheel line.
@@ -161,6 +162,23 @@ impl ScrollTarget {
         room_to_move(top, max, dy)
     }
 
+    /// How far down the content the view is.
+    fn top(&self) -> f32 {
+        match self {
+            ScrollTarget::List(list) => {
+                f32::from((-list.scroll_px_offset_for_scrollbar().y).min(list.max_offset_for_scrollbar().y))
+            }
+            ScrollTarget::Handle(handle) => f32::from(-handle.offset().y),
+        }
+    }
+
+    fn set_scroll_layer(&self, spec: ScrollLayerSpec) {
+        match self {
+            ScrollTarget::List(list) => list.set_scroll_layer(Some(spec)),
+            ScrollTarget::Handle(handle) => handle.set_scroll_layer(Some(spec)),
+        }
+    }
+
     /// Moves the content `dy` pixels toward its end, clamped to its range.
     fn scroll_by(&self, dy: f32) {
         match self {
@@ -193,6 +211,8 @@ struct State {
     clock: FrameClock,
     /// Movement not yet shown, being less than a device pixel.
     carry: f32,
+    /// A step is waiting for the next frame, see [`SmoothScroller::tick`].
+    ticking: bool,
 }
 
 /// Splits movement into what lands on whole device pixels and what's left over.
@@ -213,7 +233,29 @@ pub struct SmoothScroller {
     in_modal: bool,
     /// A list whose rows do something when hovered: not while it's moving under the pointer.
     calm_hover: bool,
+    /// Moves a layer of what's already painted, instead of rebuilding the list to move it.
+    layer: Option<LayerScrolling>,
 }
+
+/// What it takes to move a list without rebuilding it.
+#[derive(Clone)]
+struct LayerScrolling {
+    id: ScrollLayerId,
+    /// Whether the rest of the view stays the same with the list's top at this place. Set each
+    /// render by a view that shows anything following the scroll outside the list.
+    outside_stays_right: Rc<RefCell<Option<OutsideCheck>>>,
+}
+
+/// See [`LayerScrolling::outside_stays_right`].
+type OutsideCheck = Box<dyn Fn(f32) -> bool>;
+
+/// How far outside the view a layer's content gets painted. Stays under what a view keeps fully
+/// built, for the same reason as [`KEPT_BEYOND_LAYER`].
+pub const LAYER_OVERSCAN: f32 = 600.;
+
+/// How far beyond [`LAYER_OVERSCAN`] rows a view swaps for spacers stay real anyway: the view's
+/// size and place used for choosing them are from the last frame, and may have changed by now.
+pub const KEPT_BEYOND_LAYER: f32 = 200.;
 
 /// How long after the last movement a list counts as still scrolling.
 const SETTLE: Duration = Duration::from_millis(180);
@@ -248,7 +290,83 @@ pub fn cancel_after_scrolling(id: &gpui_kit::SharedString) {
 
 impl SmoothScroller {
     pub fn new(target: ScrollTarget) -> Self {
-        SmoothScroller { target, state: Rc::default(), in_modal: false, calm_hover: false }
+        SmoothScroller { target, state: Rc::default(), in_modal: false, calm_hover: false, layer: None }
+    }
+
+    /// Moves the list by moving a layer of what's painted, whenever that gives the same picture
+    /// as rebuilding it would. Only for lists that hover and the like don't change as they
+    /// move, which is what [`Self::calm_hover`] sees to.
+    pub fn layered(mut self) -> Self {
+        debug_assert!(self.calm_hover);
+        self.layer = Some(LayerScrolling { id: ScrollLayerId::new(), outside_stays_right: Rc::default() });
+        self
+    }
+
+    /// Tells a layered list what outside it follows the scroll. See [`LayerScrolling`].
+    pub fn outside_stays_right(&self, check: impl Fn(f32) -> bool + 'static) {
+        if let Some(layer) = &self.layer {
+            *layer.outside_stays_right.borrow_mut() = Some(Box::new(check));
+        }
+    }
+
+    /// One step of a layered list's glide, at the start of a frame. Done there and not in a render,
+    /// because the whole point is that no render need happen.
+    fn tick(&self, layer: &LayerScrolling, view: EntityId, window: &mut Window, cx: &mut App) {
+        let mut state = self.state.borrow_mut();
+        if state.glide.is_active() {
+            SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
+            let now = Instant::now();
+            let measured = state.last_frame.map_or(FIRST_FRAME, |last| now - last).as_secs_f32();
+            state.last_frame = Some(now);
+            let frame = state.clock.tick(measured);
+            let moved = state.glide.step(Duration::from_secs_f32(frame)) + state.carry;
+            let (whole, rest) = whole_pixels(moved, window.scale_factor());
+            state.carry = if state.glide.is_active() { rest } else { 0. };
+            if whole != 0. {
+                let before = self.target.top();
+                self.target.scroll_by(whole);
+                let after = self.target.top();
+                let outside_right =
+                    layer.outside_stays_right.borrow().as_ref().is_none_or(|check| check(after));
+                if after != before && !(window.move_scroll_layer(layer.id, px(before - after)) && outside_right) {
+                    cx.notify(view);
+                }
+            }
+            // Keeps frames coming at the compositor's pace, moved or not.
+            window.present_this_frame();
+        } else {
+            state.last_frame = None;
+            state.carry = 0.;
+            match SCROLLING_UNTIL.get() {
+                Some(until) if Instant::now() < until => {}
+                Some(_) => {
+                    SCROLLING_UNTIL.set(None);
+                    let after = AFTER_SCROLLING.take();
+                    cx.defer(move |cx| {
+                        if let Some((_, action)) = after {
+                            action(cx);
+                        }
+                    });
+                    // Once more, for real: hover back on, and the hitboxes where the rows are.
+                    cx.notify(view);
+                    state.ticking = false;
+                    return;
+                }
+                None => {
+                    cx.notify(view);
+                    state.ticking = false;
+                    return;
+                }
+            }
+        }
+        drop(state);
+        self.schedule_tick(layer.clone(), view, window);
+    }
+
+    fn schedule_tick(&self, layer: LayerScrolling, view: EntityId, window: &Window) {
+        self.state.borrow_mut().ticking = true;
+        let this = self.clone();
+        window.on_next_frame(move |window, cx| this.tick(&layer, view, window, cx));
     }
 
     pub fn calm_hover(mut self) -> Self {
@@ -284,6 +402,14 @@ impl SmoothScroller {
             // Moves before painting: put ahead of the scroll view, the frame shows
             // this step instead of the last one.
             move |_, window, cx| {
+                if let Some(layer) = stepper.layer.clone() {
+                    stepper.target.set_scroll_layer(ScrollLayerSpec { id: layer.id, overscan: px(LAYER_OVERSCAN) });
+                    let moving = stepper.state.borrow().glide.is_active() || SCROLLING_UNTIL.get().is_some();
+                    if moving && !stepper.state.borrow().ticking {
+                        stepper.schedule_tick(layer, window.current_view(), window);
+                    }
+                    return;
+                }
                 if stepper.calm_hover {
                     if stepper.state.borrow().glide.is_active() {
                         SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
@@ -341,9 +467,13 @@ impl SmoothScroller {
                     if this.calm_hover {
                         SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
                     }
+                    let ticking = this.state.borrow().ticking;
                     this.state.borrow_mut().glide.add(-lines.y * LINE_PX);
-                    // This view alone: a window refresh redraws the other lists too.
-                    cx.notify(view);
+                    // This view alone: a window refresh redraws the other lists too. If a layer
+                    // is moving already then the next step takes this along.
+                    if this.layer.is_none() || !ticking {
+                        cx.notify(view);
+                    }
                 });
             },
         )

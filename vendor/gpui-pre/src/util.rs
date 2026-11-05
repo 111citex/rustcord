@@ -138,7 +138,10 @@ pub(crate) fn round_half_toward_zero_f64(value: f64) -> f64 {
 
 #[inline]
 pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
-    round_half_toward_zero(logical * scale_factor)
+    // Rustcord: the same as `round_half_toward_zero` on screen, but also above and left of the
+    // window, where content on a scroll layer can be painted before moving in. Moving by whole
+    // pixels has to give what painting at the new place would.
+    (logical * scale_factor - 0.5).ceil()
 }
 
 #[inline]

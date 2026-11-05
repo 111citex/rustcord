@@ -10,7 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
+    Overflow, Pixels, Point, ScrollDelta, ScrollLayerSpec, ScrollWheelEvent, Size, Style,
+    StyleRefinement, Styled,
     Window, point, px, size,
 };
 use collections::VecDeque;
@@ -73,6 +74,8 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    /// Rustcord: paint as a scroll layer.
+    scroll_layer: Option<ScrollLayerSpec>,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -227,6 +230,8 @@ struct LayoutItemsResponse {
     max_item_width: Pixels,
     scroll_top: ListOffset,
     item_layouts: VecDeque<ItemLayout>,
+    /// How much of `item_layouts` starts above the item at `scroll_top`.
+    height_above_scroll_top: Pixels,
 }
 
 struct ItemLayout {
@@ -325,6 +330,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            scroll_layer: None,
         })));
         this.splice(0..0, item_count);
         this
@@ -472,6 +478,11 @@ impl ListState {
         };
         state.items = new_items;
         state.measuring_behavior.reset();
+    }
+
+    /// Rustcord: paint this list as a scroll layer, or stop doing so.
+    pub fn set_scroll_layer(&self, spec: Option<ScrollLayerSpec>) {
+        self.0.borrow_mut().scroll_layer = spec;
     }
 
     /// The number of items in this list.
@@ -1057,6 +1068,8 @@ impl StateInner {
         &mut self,
         available_width: Option<Pixels>,
         available_height: Pixels,
+        // Rustcord: how far past each end of the view items are wanted for painting too.
+        paint_beyond: Pixels,
         padding: &Edges<Pixels>,
         render_item: &mut RenderItemFn,
         window: &mut Window,
@@ -1092,7 +1105,7 @@ impl StateInner {
         cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
         for (ix, item) in cursor.by_ref().enumerate() {
             let visible_height = rendered_height - scroll_top.offset_in_item;
-            if visible_height >= available_height + self.overdraw {
+            if visible_height >= available_height + self.overdraw.max(paint_beyond) {
                 break;
             }
 
@@ -1100,7 +1113,8 @@ impl StateInner {
             let mut size = item.size();
 
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
-            if visible_height < available_height || size.is_none() {
+            let wanted = visible_height < available_height + paint_beyond;
+            if wanted || size.is_none() {
                 let item_index = scroll_top.item_ix + ix;
                 let mut element = render_item(item_index, window, cx);
                 window.remember_next_layout(self.memo_key(item_index));
@@ -1132,7 +1146,7 @@ impl StateInner {
                     }
                 }
 
-                if visible_height < available_height {
+                if wanted {
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
                         element,
@@ -1208,10 +1222,26 @@ impl StateInner {
 
         // Measure items in the leading overdraw
         let mut leading_overdraw = scroll_top.offset_in_item;
-        while leading_overdraw < self.overdraw {
+        let mut height_above_scroll_top = px(0.);
+        while leading_overdraw < self.overdraw.max(paint_beyond) {
             cursor.prev();
             if let Some(item) = cursor.item() {
-                let size = if let ListItem::Measured { size, .. } = item {
+                let size = if leading_overdraw < paint_beyond {
+                    let item_index = cursor.start().0;
+                    let mut element = render_item(item_index, window, cx);
+                    window.remember_next_layout(self.memo_key(item_index));
+                    let size = element.layout_as_root(available_item_space, window, cx);
+                    height_above_scroll_top += size.height;
+                    item_layouts.push_front(ItemLayout {
+                        index: item_index,
+                        element,
+                        size,
+                    });
+                    if item.contains_focused(window, cx) {
+                        rendered_focused_item = true;
+                    }
+                    size
+                } else if let ListItem::Measured { size, .. } = item {
                     *size
                 } else {
                     let mut element = render_item(cursor.start().0, window, cx);
@@ -1276,6 +1306,7 @@ impl StateInner {
             max_item_width,
             scroll_top,
             item_layouts,
+            height_above_scroll_top,
         }
     }
 
@@ -1296,9 +1327,11 @@ impl StateInner {
                 _ => {}
             }
 
+            let scroll_layer = self.scroll_layer;
             let mut layout_response = self.layout_items(
                 Some(bounds.size.width),
                 bounds.size.height,
+                window.scroll_layer_overscan(scroll_layer),
                 &padding,
                 render_item,
                 window,
@@ -1312,10 +1345,15 @@ impl StateInner {
             if bounds.size.height > padding.top + padding.bottom {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
+                item_origin.y -= layout_response.height_above_scroll_top;
                 for item in &mut layout_response.item_layouts {
-                    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                        item.element.prepaint_at(item_origin, window, cx);
-                    });
+                    window.prepaint_scroll_content(
+                        scroll_layer,
+                        Some(ContentMask { bounds }),
+                        |window| {
+                            item.element.prepaint_at(item_origin, window, cx);
+                        },
+                    );
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
                         && autoscroll
@@ -1510,6 +1548,7 @@ impl Element for List {
                     let layout_response = state.layout_items(
                         None,
                         available_height,
+                        px(0.),
                         &padding,
                         &mut self.render_item,
                         window,
@@ -1644,7 +1683,8 @@ impl Element for List {
             }
         });
 
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        let scroll_layer = self.state.0.borrow().scroll_layer;
+        window.paint_scroll_content(scroll_layer, Some(ContentMask { bounds }), |window| {
             for item in &mut prepaint.layout.item_layouts {
                 item.element.paint(window, cx);
             }

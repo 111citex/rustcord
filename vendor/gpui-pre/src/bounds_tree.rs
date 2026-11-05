@@ -140,6 +140,24 @@ where
         ordering
     }
 
+    /// Rustcord: the highest ordering among bounds that intersect `query`, 0 if none.
+    pub fn max_ordering_in(&mut self, query: &Bounds<U>) -> u32 {
+        self.find_max_ordering(query)
+    }
+
+    /// Rustcord: like `insert`, but the bounds get at least `min_ordering`. A scroll layer is
+    /// one block to whatever's around it, with its inner orderings all below this.
+    pub fn insert_at_least(&mut self, new_bounds: Bounds<U>, min_ordering: u32) -> u32 {
+        let ordering = (self.find_max_ordering(&new_bounds) + 1).max(min_ordering);
+        let new_leaf_idx = self.insert_leaf(new_bounds, ordering);
+        self.max_leaf = match self.max_leaf {
+            None => Some(new_leaf_idx),
+            Some(old_idx) if self.nodes[old_idx].max_order < ordering => Some(new_leaf_idx),
+            some => some,
+        };
+        ordering
+    }
+
     /// Finds the maximum ordering among all bounds that intersect with the query.
     fn find_max_ordering(&mut self, query: &Bounds<U>) -> u32 {
         let Some(root_idx) = self.root else {

@@ -5,9 +5,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, EntityId, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::{
     fmt::Debug,
     iter::Peekable,
@@ -42,6 +43,12 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    /// Rustcord: lists whose primitives can be moved without painting them again. They stay
+    /// out of the lists below until [`Scene::compose_scroll_layers`] puts them in.
+    pub(crate) scroll_layers: Vec<ScrollLayer>,
+    /// The layer being painted into, and its orderings so far.
+    active_scroll_layer: Option<ActiveScrollLayer>,
+    scroll_layer_bounds: BoundsTree<ScaledPixels>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -52,9 +59,114 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
 }
 
+/// Rustcord: names a scroll layer across frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScrollLayerId(u64);
+
+impl ScrollLayerId {
+    /// A new id, different from all others.
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, AtomicOrdering::Relaxed))
+    }
+}
+
+impl Default for ScrollLayerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Rustcord: asks a scrolling element to paint as a layer, with `overscan` of content painted
+/// beyond each end of its view for the layer to move into.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollLayerSpec {
+    /// The layer's name, to move it by.
+    pub id: ScrollLayerId,
+    /// How far beyond the view content gets painted.
+    pub overscan: Pixels,
+}
+
+/// Rustcord: a scrolling list's content, painted with more of it than fits in the view. Moving
+/// it by whole device pixels gives what painting it again at the new place would, as long as
+/// the view stays inside what was painted.
+#[derive(Clone, Default)]
+pub(crate) struct ScrollLayer {
+    pub(crate) id: Option<ScrollLayerId>,
+    /// Whose render made this, to redo it when moving isn't enough.
+    pub(crate) view: Option<EntityId>,
+    /// What's seen of the layer. Never moves.
+    pub(crate) clip: Bounds<ScaledPixels>,
+    /// What was painted, where it was when painted.
+    pub(crate) painted: Bounds<ScaledPixels>,
+    /// How far it's moved since then.
+    pub(crate) offset_y: ScaledPixels,
+    /// Whether the orderings in here hold when it moves.
+    pub(crate) movable: bool,
+    shadows: Vec<Shadow>,
+    quads: Vec<Quad>,
+    paths: Vec<Path<ScaledPixels>>,
+    underlines: Vec<Underline>,
+    monochrome_sprites: Vec<MonochromeSprite>,
+    subpixel_sprites: Vec<SubpixelSprite>,
+    polychrome_sprites: Vec<PolychromeSprite>,
+    surfaces: Vec<PaintSurface>,
+}
+
+impl ScrollLayer {
+    /// Whether the view would still be inside what was painted, `offset_y` from there.
+    pub(crate) fn covers_view_at(&self, offset_y: ScaledPixels) -> bool {
+        self.clip.top() - offset_y >= self.painted.top()
+            && self.clip.bottom() - offset_y <= self.painted.bottom()
+    }
+
+    fn copy_from(&mut self, other: &ScrollLayer) {
+        self.id = other.id;
+        self.view = other.view;
+        self.clip = other.clip;
+        self.painted = other.painted;
+        self.offset_y = other.offset_y;
+        self.movable = other.movable;
+        self.shadows.clone_from(&other.shadows);
+        self.quads.clone_from(&other.quads);
+        self.paths.clone_from(&other.paths);
+        self.underlines.clone_from(&other.underlines);
+        self.monochrome_sprites.clone_from(&other.monochrome_sprites);
+        self.subpixel_sprites.clone_from(&other.subpixel_sprites);
+        self.polychrome_sprites.clone_from(&other.polychrome_sprites);
+        self.surfaces.clone_from(&other.surfaces);
+    }
+}
+
+struct ActiveScrollLayer {
+    index: usize,
+    /// Above everything under the layer. Orderings inside it count from here.
+    base_order: DrawOrder,
+    highest_order: DrawOrder,
+    /// Painted inside a `push_layer`: everything shares that one's order, the same as if
+    /// this weren't a scroll layer, and it can't move.
+    inside_layer: bool,
+}
+
+/// Moves one primitive's place by `offset_y` and clips it to `clip`. `false` if nothing's left.
+fn move_into_view(
+    bounds: &mut Bounds<ScaledPixels>,
+    content_mask: &mut ContentMask<ScaledPixels>,
+    offset_y: ScaledPixels,
+    clip: &Bounds<ScaledPixels>,
+) -> bool {
+    bounds.origin.y = bounds.origin.y + offset_y;
+    content_mask.bounds.origin.y = content_mask.bounds.origin.y + offset_y;
+    content_mask.bounds = content_mask.bounds.intersect(clip);
+    !bounds.intersect(&content_mask.bounds).is_empty()
+}
+
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
+        self.scroll_layers.clear();
+        self.active_scroll_layer = None;
+        self.scroll_layer_bounds.clear();
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -72,8 +184,133 @@ impl Scene {
         self.paint_operations.len()
     }
 
+    /// Rustcord: everything inserted until [`Self::end_scroll_layer`] goes into a layer.
+    /// Layers don't nest: the caller only opens one when there's none open.
+    pub fn begin_scroll_layer(
+        &mut self,
+        id: ScrollLayerId,
+        view: EntityId,
+        clip: Bounds<ScaledPixels>,
+        painted: Bounds<ScaledPixels>,
+    ) {
+        debug_assert!(self.active_scroll_layer.is_none());
+        let inside_layer = !self.layer_stack.is_empty();
+        self.scroll_layer_bounds.clear();
+        self.active_scroll_layer = Some(ActiveScrollLayer {
+            index: self.scroll_layers.len(),
+            base_order: self.primitive_bounds.max_ordering_in(&clip),
+            highest_order: 0,
+            inside_layer,
+        });
+        self.scroll_layers.push(ScrollLayer {
+            id: Some(id),
+            view: Some(view),
+            clip,
+            painted,
+            offset_y: ScaledPixels(0.),
+            movable: !inside_layer,
+            ..ScrollLayer::default()
+        });
+        self.paint_operations
+            .push(PaintOperation::StartScrollLayer { id, view, clip, painted });
+    }
+
+    pub fn end_scroll_layer(&mut self) {
+        if let Some(active) = self.active_scroll_layer.take()
+            && !active.inside_layer
+        {
+            // Whatever's painted later over this view, wherever the layer has moved by then,
+            // has to end up above all of it.
+            let top = active.base_order.max(active.highest_order) + 1;
+            self.primitive_bounds
+                .insert_at_least(self.scroll_layers[active.index].clip, top);
+        }
+        self.paint_operations.push(PaintOperation::EndScrollLayer);
+    }
+
+    /// The order for something new with these bounds, in the layer being painted if there is one.
+    fn next_order(&mut self, bounds: Bounds<ScaledPixels>) -> DrawOrder {
+        match &mut self.active_scroll_layer {
+            Some(active) if !active.inside_layer => {
+                let order = active.base_order + self.scroll_layer_bounds.insert(bounds);
+                active.highest_order = active.highest_order.max(order);
+                order
+            }
+            _ => self.primitive_bounds.insert(bounds),
+        }
+    }
+
+    /// Sets how far a scroll layer has moved since it was painted, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_scroll_layer_offset(&mut self, id: ScrollLayerId, offset_y: ScaledPixels) {
+        for layer in &mut self.scroll_layers {
+            if layer.id == Some(id) {
+                layer.offset_y = offset_y;
+            }
+        }
+    }
+
+    /// How far a scroll layer has moved since it was painted, in device pixels, for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn scroll_layer_offset(&self, id: ScrollLayerId) -> Option<f32> {
+        self.scroll_layers
+            .iter()
+            .find(|layer| layer.id == Some(id))
+            .map(|layer| layer.offset_y.0)
+    }
+
+    /// Puts the scroll layers' primitives where they belong by now, clipped to their views.
+    /// The outcome is what the renderers draw. They take scenes that aren't finished with
+    /// this yet off the main thread, because it's part of drawing and costs that thread nothing.
+    pub fn compose_scroll_layers(&mut self) {
+        if self.scroll_layers.is_empty() {
+            return;
+        }
+        for layer in std::mem::take(&mut self.scroll_layers) {
+            let (offset_y, clip) = (layer.offset_y, layer.clip);
+            macro_rules! bring_in {
+                ($list:ident) => {
+                    self.$list.extend(layer.$list.into_iter().filter_map(|mut primitive| {
+                        move_into_view(
+                            &mut primitive.bounds,
+                            &mut primitive.content_mask,
+                            offset_y,
+                            &clip,
+                        )
+                        .then_some(primitive)
+                    }));
+                };
+            }
+            // An inset shadow's shape is worked out from this.
+            let mut shadows = layer.shadows;
+            for shadow in &mut shadows {
+                shadow.element_bounds.origin.y = shadow.element_bounds.origin.y + offset_y;
+            }
+            self.shadows.extend(shadows.into_iter().filter_map(|mut shadow| {
+                move_into_view(&mut shadow.bounds, &mut shadow.content_mask, offset_y, &clip)
+                    .then_some(shadow)
+            }));
+            bring_in!(quads);
+            bring_in!(underlines);
+            bring_in!(monochrome_sprites);
+            bring_in!(subpixel_sprites);
+            bring_in!(polychrome_sprites);
+            bring_in!(surfaces);
+            self.paths.extend(layer.paths.into_iter().filter_map(|mut path| {
+                if !move_into_view(&mut path.bounds, &mut path.content_mask, offset_y, &clip) {
+                    return None;
+                }
+                for vertex in &mut path.vertices {
+                    vertex.xy_position.y = vertex.xy_position.y + offset_y;
+                }
+                Some(path)
+            }));
+        }
+        self.finish();
+    }
+
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
+        let order = self.next_order(bounds);
         self.layer_stack.push(order);
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
@@ -94,44 +331,70 @@ impl Scene {
             return;
         }
 
-        let order = self
-            .layer_stack
-            .last()
-            .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        let order = match self.layer_stack.last().copied() {
+            Some(order) => order,
+            None => self.next_order(clipped_bounds),
+        };
+        // Rustcord: the lists of the scroll layer being painted, or the scene's own.
+        let layer = self
+            .active_scroll_layer
+            .as_ref()
+            .map(|active| active.index);
+        // A transformed sprite's place is in its matrix as well. Those are rare, and usually
+        // animating anyway, so the list just gets rendered.
+        if let Some(index) = layer {
+            let unit = TransformationMatrix::unit();
+            let transformed = match &primitive {
+                Primitive::MonochromeSprite(sprite) => sprite.transformation != unit,
+                Primitive::SubpixelSprite(sprite) => sprite.transformation != unit,
+                _ => false,
+            };
+            if transformed {
+                self.scroll_layers[index].movable = false;
+            }
+        }
+        macro_rules! list {
+            ($list:ident) => {
+                match layer {
+                    Some(index) => &mut self.scroll_layers[index].$list,
+                    None => &mut self.$list,
+                }
+            };
+        }
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
-                self.shadows.push(*shadow);
+                list!(shadows).push(*shadow);
             }
             Primitive::Quad(quad) => {
                 quad.order = order;
-                self.quads.push(*quad);
+                list!(quads).push(*quad);
             }
             Primitive::Path(path) => {
                 path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
+                let paths = list!(paths);
+                path.id = PathId(paths.len());
+                paths.push(path.clone());
             }
             Primitive::Underline(underline) => {
                 underline.order = order;
-                self.underlines.push(*underline);
+                list!(underlines).push(*underline);
             }
             Primitive::MonochromeSprite(sprite) => {
                 sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
+                list!(monochrome_sprites).push(*sprite);
             }
             Primitive::SubpixelSprite(sprite) => {
                 sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
+                list!(subpixel_sprites).push(*sprite);
             }
             Primitive::PolychromeSprite(sprite) => {
                 sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
+                list!(polychrome_sprites).push(*sprite);
             }
             Primitive::Surface(surface) => {
                 surface.order = order;
-                self.surfaces.push(surface.clone());
+                list!(surfaces).push(surface.clone());
             }
         }
         self.paint_operations
@@ -150,6 +413,12 @@ impl Scene {
         target.subpixel_sprites.clone_from(&self.subpixel_sprites);
         target.polychrome_sprites.clone_from(&self.polychrome_sprites);
         target.surfaces.clone_from(&self.surfaces);
+        target
+            .scroll_layers
+            .resize_with(self.scroll_layers.len(), ScrollLayer::default);
+        for (target, layer) in target.scroll_layers.iter_mut().zip(&self.scroll_layers) {
+            target.copy_from(layer);
+        }
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -158,6 +427,10 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartScrollLayer { id, view, clip, painted } => {
+                    self.begin_scroll_layer(*id, *view, *clip, *painted)
+                }
+                PaintOperation::EndScrollLayer => self.end_scroll_layer(),
             }
         }
     }
@@ -229,6 +502,13 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    StartScrollLayer {
+        id: ScrollLayerId,
+        view: EntityId,
+        clip: Bounds<ScaledPixels>,
+        painted: Bounds<ScaledPixels>,
+    },
+    EndScrollLayer,
 }
 
 #[derive(Clone)]

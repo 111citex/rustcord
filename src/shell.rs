@@ -99,7 +99,7 @@ impl SidePane {
             services,
             rail_scroller: SmoothScroller::new(ScrollTarget::Handle(rail_scroll.clone())),
             rail_scroll,
-            channels_scroller: SmoothScroller::new(ScrollTarget::Handle(channels_scroll.clone())).calm_hover(),
+            channels_scroller: SmoothScroller::new(ScrollTarget::Handle(channels_scroll.clone())).calm_hover().layered(),
             drawn_list: std::cell::Cell::new(None),
             revealed_channel: Default::default(),
             reveal_wait: Default::default(),
@@ -999,6 +999,17 @@ impl SidePane {
             .find(|g| Some(g.id) == location.guild)
             .and_then(|g| g.icon.as_ref().map(|hash| cdn::guild_icon_url(g.id, hash, 64)));
         let pills = mention_pills(&self.channels_scroll, &self.channels_scroller, smooth, &pinged, cx);
+        // Besides the list, the pills and the header over a banner follow its scroll. Moving the
+        // list as a layer leaves those alone, so it only will while they'd look the same.
+        {
+            let scroll = self.channels_scroll.clone();
+            let pills_now = pills_shown(&scroll, -f32::from(scroll.offset().y), &pinged);
+            let fade = move |top: f32| (top / (BANNER_HEIGHT - 49.)).clamp(0., 1.);
+            let fade_now = fade(-f32::from(scroll.offset().y));
+            self.channels_scroller.outside_stays_right(move |top| {
+                (!has_banner || fade(top) == fade_now) && pills_shown(&scroll, top, &pinged) == pills_now
+            });
+        }
         // A jump to another channel brings its row into view. Its place is only
         // known once the new list has been laid out, so that waits a frame.
         if self.revealed_channel.get() != location.channel {
@@ -2007,8 +2018,9 @@ fn reveal_distance(top: f32, bottom: f32, height: f32) -> Option<f32> {
     }
 }
 
-/// How far outside the view rows stay fully built, so none shows up empty mid-glide.
-const ROWS_KEPT_BEYOND_VIEW: f32 = 600.;
+/// How far outside the view rows stay fully built: the list moves as a layer, painted this far
+/// and a bit, between rebuilds. So none shows up empty mid-glide.
+const ROWS_KEPT_BEYOND_VIEW: f32 = crate::smooth_scroll::LAYER_OVERSCAN + crate::smooth_scroll::KEPT_BEYOND_LAYER;
 
 /// Whether a row spanning `top..bottom` (as drawn, scrolled) is out of reach of the view.
 fn out_of_reach(top: f32, bottom: f32, view_top: f32, view_bottom: f32) -> bool {
@@ -2031,9 +2043,10 @@ fn room_for_unseen_row(scroll: &ScrollHandle, ix: usize, places_known: bool) -> 
     out_of_reach(top, top + height, f32::from(view.top()), f32::from(view.bottom())).then_some(height)
 }
 
-fn mention_pills(scroll: &ScrollHandle, scroller: &SmoothScroller, smooth: bool, pinged: &[(usize, u32)], cx: &Context<SidePane>) -> Vec<AnyElement> {
+/// How many mentions each pill would show with the list's top at `top`, and which row each goes to.
+fn pills_shown(scroll: &ScrollHandle, top: f32, pinged: &[(usize, u32)]) -> ((u32, Option<usize>), (u32, Option<usize>)) {
     let view = scroll.bounds();
-    let offset = scroll.offset().y;
+    let offset = gpui_kit::px(-top);
     let (mut above, mut below) = ((0, None), (0, None));
     for (ix, count) in pinged {
         let Some(item) = scroll.bounds_for_item(*ix) else { continue };
@@ -2043,6 +2056,11 @@ fn mention_pills(scroll: &ScrollHandle, scroller: &SmoothScroller, smooth: bool,
             below = (below.0 + count, below.1.or(Some(*ix)));
         }
     }
+    (above, below)
+}
+
+fn mention_pills(scroll: &ScrollHandle, scroller: &SmoothScroller, smooth: bool, pinged: &[(usize, u32)], cx: &Context<SidePane>) -> Vec<AnyElement> {
+    let (above, below) = pills_shown(scroll, -f32::from(scroll.offset().y), pinged);
     let danger = cx.theme().danger;
     let pill = |id: &'static str, (count, ix): (u32, Option<usize>), top: bool| {
         let ix = ix?;
@@ -2138,7 +2156,8 @@ mod reach_tests {
     fn only_rows_well_outside_the_view_are_out_of_reach() {
         assert!(!super::out_of_reach(100., 140., 0., 800.), "on screen");
         assert!(!super::out_of_reach(1300., 1340., 0., 800.), "just below: kept for the glide");
-        assert!(super::out_of_reach(1500., 1540., 0., 800.));
-        assert!(super::out_of_reach(-700., -660., 0., 800.));
+        assert!(!super::out_of_reach(1590., 1630., 0., 800.), "still within what a layer may move into, and a bit");
+        assert!(super::out_of_reach(1700., 1740., 0., 800.));
+        assert!(super::out_of_reach(-900., -860., 0., 800.));
     }
 }

@@ -1,0 +1,24 @@
+# Vendored from alhazen-gpui-pre 0.1.0 (Apache-2.0, see LICENSE and NOTICE),
+# repinned from gpui-pre 0.3.8 to the 0.3.7 that gpui-kit pins.
+[package]
+name = "alhazen-gpui"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = ["native", "http", "ffmpeg-cli", "nvdec", "audio-output", "native-aac", "native-mp3"]
+native-aac = ["alhazen-core/native-aac"]
+native-mp3 = ["alhazen-core/native-mp3"]
+native = ["alhazen-core/native"]
+http = ["alhazen-core/http"]
+hls = ["alhazen-core/hls"]
+audio-output = ["alhazen-core/audio-output"]
+ffmpeg-cli = ["alhazen-core/ffmpeg-cli"]
+nvdec = ["alhazen-core/nvdec"]
+
+[dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+alhazen-core = { version = "0.7", default-features = false }
+image = { version = "0.25.1", default-features = false, features = ["png", "jpeg"] }

@@ -1,0 +1,28 @@
+{
+  "v": 9,
+  "user": {"id": "100", "username": "ada", "global_name": "Ada", "avatar": "abc"},
+  "session_id": "sess-1",
+  "resume_gateway_url": "wss://gateway-us-east1-b.discord.gg",
+  "users": [{"id": "200", "username": "lin", "global_name": null, "avatar": null}],
+  "guilds": [
+    {
+      "id": "300",
+      "properties": {"name": "testguild", "icon": "ic0"},
+      "channels": [
+        {"id": "310", "type": 4, "name": "Text", "position": 0},
+        {"id": "311", "type": 0, "name": "general", "position": 0, "parent_id": "310", "last_message_id": "900"},
+        {"id": "312", "type": 2, "name": "Lounge", "position": 1, "parent_id": "310"},
+        {"id": "313", "type": 15, "name": "ideas", "position": 2}
+      ],
+      "roles": [],
+      "some_future_field": {"x": 1}
+    },
+    {"id": "301", "unavailable": true}
+  ],
+  "private_channels": [
+    {"id": "400", "type": 1, "recipient_ids": ["200"], "last_message_id": "901"},
+    {"id": "401", "type": 3, "name": null, "recipient_ids": ["200", "201"], "last_message_id": null}
+  ],
+  "read_state": {"entries": []},
+  "relationships": []
+}

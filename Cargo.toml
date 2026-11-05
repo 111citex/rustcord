@@ -1,0 +1,73 @@
+[workspace]
+members = ["crates/cord-core", "crates/cord-voice", "crates/alhazen-gpui"]
+exclude = ["vendor"]
+
+[package]
+name = "rustcord"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A lightweight Discord client"
+
+[dependencies]
+rlottie = "0.5.4"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg", "gif"] }
+anyhow = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+cord-core = { path = "crates/cord-core" }
+alhazen-gpui = { path = "crates/alhazen-gpui" }
+cord-voice = { path = "crates/cord-voice" }
+emojis = "0.9.0"
+gpui-fps = { git = "https://github.com/longbridge/gpui-kit", version = "0.7.0" }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit" }
+gpui-pre-reqwest-client = "0.3.6"
+qrcode = { version = "0.14", default-features = false }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tao = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-segmentation = "1.13.3"
+wry = "0.57"
+mimalloc = { version = "0.1.52", default-features = false }
+futures = "0.3.34"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+
+# Crypto, image decoding and GPUI are far too slow unoptimized.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+# Keeps function names, so a profiler can attach to a session that's gone slow.
+strip = "debuginfo"
+lto = "thin"
+codegen-units = 1
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# `cargo build --profile profiling`: release speed with symbols, for profilers.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+lto = false
+codegen-units = 16
+
+# Frame cost counters and scrolling work; see vendor/README.md.
+[patch.crates-io]
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+cosmic-text = { path = "vendor/cosmic-text" }
+
+# One small addition to the input widget; see vendor/gpui-kit/README.md.
+[patch."https://github.com/longbridge/gpui-kit"]
+gpui-base = { path = "vendor/gpui-kit/crates/base" }

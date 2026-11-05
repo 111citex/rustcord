@@ -1,0 +1,6 @@
+/target
+.superpowers/
+.env
+.claude/
+.cargo/
+docs/

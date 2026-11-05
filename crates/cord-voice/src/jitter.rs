@@ -1,0 +1,212 @@
+//! Evens out one person's packets: they arrive early, late, out of order or not at
+//! all, and are played one every 20 ms regardless.
+
+use std::collections::BTreeMap;
+
+/// Frames (20 ms each) held before someone starts playing.
+const TARGET: usize = 3;
+/// Holding more than this, they've fallen behind: skip ahead.
+const TOO_MANY: usize = 12;
+/// Frames in a row to cover over before taking it that they've stopped talking.
+const MAX_CONCEALED: u32 = 5;
+
+/// What to play next for someone.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Next {
+    /// Nothing: not talking, or still filling up.
+    Nothing,
+    Play(Vec<u8>),
+    /// The packet's missing, but the next one carries a rough copy of it.
+    Recover(Vec<u8>),
+    /// The packet's missing: make something up to cover the gap.
+    Conceal,
+}
+
+#[derive(Default)]
+pub struct Jitter {
+    /// Keyed by distance from `next`, so that sequence numbers can wrap around.
+    held: BTreeMap<u32, Vec<u8>>,
+    /// The sequence number of the frame to play next; `None` when not playing.
+    next: Option<u16>,
+    /// Where `held`'s keys count from.
+    base: u32,
+    concealed: u32,
+    /// Frames dropped to catch up, not yet told about.
+    skipped: u32,
+}
+
+impl Jitter {
+    fn key(&self, seq: u16) -> Option<u32> {
+        let Some(next) = self.next else { return Some(self.base.wrapping_add(seq as u32)) };
+        let ahead = seq.wrapping_sub(next);
+        // More than half way round is behind us: too late.
+        (ahead < 0x8000).then(|| self.base.wrapping_add(ahead as u32))
+    }
+
+    pub fn push(&mut self, seq: u16, payload: Vec<u8>) {
+        if let Some(key) = self.key(seq) {
+            self.held.insert(key, payload);
+        }
+    }
+
+    /// Frames dropped to catch up since last asked.
+    pub fn take_skipped(&mut self) -> u32 {
+        std::mem::take(&mut self.skipped)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty() && self.next.is_none()
+    }
+
+    /// Starts from the oldest held, once there's enough to ride out a late packet.
+    fn begin(&mut self) -> bool {
+        if self.held.len() < TARGET {
+            return false;
+        }
+        // Not playing: keys are plain sequence numbers. Find where a wrap would be.
+        let keys: Vec<u32> = self.held.keys().copied().collect();
+        let (first, last) = (keys[0], keys[keys.len() - 1]);
+        let wrapped = last - first > 0x8000;
+        let start = if wrapped { *keys.iter().find(|k| **k >= 0x8000).unwrap_or(&first) } else { first };
+        let rekeyed: BTreeMap<u32, Vec<u8>> = std::mem::take(&mut self.held)
+            .into_iter()
+            .map(|(key, payload)| ((key as u16).wrapping_sub(start as u16) as u32, payload))
+            .collect();
+        self.held = rekeyed;
+        self.next = Some(start as u16);
+        self.base = 0;
+        self.concealed = 0;
+        true
+    }
+
+    fn advance(&mut self) {
+        self.next = self.next.map(|n| n.wrapping_add(1));
+        self.base = self.base.wrapping_add(1);
+    }
+
+    /// The next 20 ms.
+    pub fn next(&mut self) -> Next {
+        if self.next.is_none() && !self.begin() {
+            return Next::Nothing;
+        }
+        // Too far behind: drop the oldest, to catch up rather than stay late.
+        while self.held.len() > TOO_MANY {
+            let Some((&oldest, _)) = self.held.iter().next() else { break };
+            self.held.remove(&oldest);
+            self.skipped += 1;
+            if oldest >= self.base {
+                let skipped = oldest + 1 - self.base;
+                self.base += skipped;
+                self.next = self.next.map(|n| n.wrapping_add(skipped as u16));
+            }
+        }
+        let wanted = self.base;
+        self.held.retain(|key, _| *key >= wanted);
+        if let Some(payload) = self.held.remove(&wanted) {
+            self.advance();
+            self.concealed = 0;
+            return Next::Play(payload);
+        }
+        if self.held.is_empty() && self.concealed >= MAX_CONCEALED {
+            self.next = None;
+            self.base = 0;
+            self.concealed = 0;
+            return Next::Nothing;
+        }
+        self.concealed += 1;
+        let following = self.held.get(&wanted.wrapping_add(1)).cloned();
+        self.advance();
+        match following {
+            Some(payload) => Next::Recover(payload),
+            None => Next::Conceal,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(n: u8) -> Vec<u8> {
+        vec![n]
+    }
+
+    fn fill(j: &mut Jitter, seqs: &[u16]) {
+        for s in seqs {
+            j.push(*s, p(*s as u8));
+        }
+    }
+
+    #[test]
+    fn it_waits_to_fill_up_then_plays_in_order() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[10, 11]);
+        assert_eq!(j.next(), Next::Nothing);
+        fill(&mut j, &[12]);
+        assert_eq!(j.next(), Next::Play(p(10)));
+        assert_eq!(j.next(), Next::Play(p(11)));
+        assert_eq!(j.next(), Next::Play(p(12)));
+    }
+
+    #[test]
+    fn out_of_order_packets_land_in_order() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[12, 10, 11]);
+        assert_eq!(j.next(), Next::Play(p(10)));
+        assert_eq!(j.next(), Next::Play(p(11)));
+    }
+
+    #[test]
+    fn a_missing_packet_is_recovered_from_the_next() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[10, 12, 13]);
+        assert_eq!(j.next(), Next::Play(p(10)));
+        assert_eq!(j.next(), Next::Recover(p(12)));
+        assert_eq!(j.next(), Next::Play(p(12)), "and then played itself");
+    }
+
+    #[test]
+    fn a_gap_is_covered_and_then_they_have_stopped() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[10, 11, 12]);
+        for _ in 0..3 {
+            assert!(matches!(j.next(), Next::Play(_)));
+        }
+        for _ in 0..MAX_CONCEALED {
+            assert_eq!(j.next(), Next::Conceal);
+        }
+        assert_eq!(j.next(), Next::Nothing);
+        assert!(j.is_empty());
+    }
+
+    #[test]
+    fn a_late_packet_is_dropped() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[10, 11, 12]);
+        assert_eq!(j.next(), Next::Play(p(10)));
+        assert_eq!(j.next(), Next::Play(p(11)));
+        j.push(10, p(99));
+        assert_eq!(j.next(), Next::Play(p(12)));
+    }
+
+    #[test]
+    fn sequence_numbers_wrap_around() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[65534, 65535, 0, 1]);
+        assert_eq!(j.next(), Next::Play(p(254)));
+        assert_eq!(j.next(), Next::Play(p(255)));
+        assert_eq!(j.next(), Next::Play(p(0)));
+        assert_eq!(j.next(), Next::Play(p(1)));
+    }
+
+    #[test]
+    fn falling_behind_skips_ahead() {
+        let mut j = Jitter::default();
+        let seqs: Vec<u16> = (0..20).collect();
+        fill(&mut j, &seqs);
+        match j.next() {
+            Next::Play(first) => assert!(first[0] >= 8, "started at {}", first[0]),
+            other => panic!("{other:?}"),
+        }
+    }
+}

@@ -162,7 +162,9 @@ impl Http {
                 }
             } else {
                 let mut payload = body.cloned().unwrap_or_else(|| Value::Object(Default::default()));
-                payload["attachments"] = files
+                // A forum post's files belong to its first message.
+                let target = if payload["message"].is_object() { &mut payload["message"] } else { &mut payload };
+                target["attachments"] = files
                     .iter()
                     .enumerate()
                     .map(|(i, f)| serde_json::json!({"id": i, "filename": f.name}))

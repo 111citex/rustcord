@@ -12,6 +12,8 @@ use crate::model::{Channel, Guild, Member, Message, ReactionEmoji, User, VoiceSt
 use crate::permissions;
 use crate::settings_proto::{self, GuildFolder};
 
+mod threads;
+
 pub const MESSAGE_CAP: usize = 200;
 /// While the user scrolls back through older pages, a channel may hold up to
 /// this many; it trims back to [`MESSAGE_CAP`] once they return to the bottom.
@@ -654,7 +656,9 @@ impl Cache {
         let Some(guild) = channel.guild_id else { return Some(permissions::ALL) };
         let me = self.me.as_ref()?.id;
         let member = self.member(guild, me)?;
-        Some(permissions::compute(self.guilds.get(&guild)?, channel, me, &member.roles))
+        // A thread has no overwrites of its own: it follows the channel it's in.
+        let source = channel.thread.as_ref().and_then(|_| self.channels.get(&channel.parent_id?)).unwrap_or(channel);
+        Some(permissions::compute(self.guilds.get(&guild)?, source, me, &member.roles))
     }
 
     /// Whether `channel` should be listed. True while unknown, so nothing
@@ -785,7 +789,12 @@ impl Cache {
     /// Whether the user may write in `channel`. True while unknown: the
     /// server has the final say.
     pub fn can_send(&self, channel: Id) -> bool {
-        self.my_permissions(channel).is_none_or(|p| p & permissions::SEND_MESSAGES != 0)
+        let needed = if self.channels.get(&channel).is_some_and(|c| c.thread.is_some()) {
+            permissions::SEND_MESSAGES_IN_THREADS
+        } else {
+            permissions::SEND_MESSAGES
+        };
+        self.my_permissions(channel).is_none_or(|p| p & needed != 0)
     }
 
     /// The raw ISO 8601 end of our timeout in `guild`, while it's still ahead.
@@ -838,6 +847,7 @@ impl Cache {
     /// it). Live messages newer than the page, and unsent ones, are kept.
     pub fn set_history(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
         let has_older = newest_first.len() >= limit;
+        self.note_message_threads(&newest_first);
         let newest = newest_first.first().map(|m| m.id);
         let old = self.messages.remove(&channel).unwrap_or_default();
         let mut buf = ChannelMessages::default();
@@ -858,6 +868,7 @@ impl Cache {
     /// above what's held, up to [`SCROLLBACK_CAP`]. A page shorter than
     /// `limit` means the channel's first message has been reached.
     pub fn prepend_older(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        self.note_message_threads(&newest_first);
         let Some(buf) = self.messages.get_mut(&channel) else { return };
         let oldest = buf.items.front().map(|m| m.message.id);
         let reached_start = newest_first.len() < limit;
@@ -911,6 +922,7 @@ impl Cache {
     }
 
     fn insert_channel(&mut self, mut channel: Channel) {
+        self.keep_thread_state(&mut channel);
         for u in channel.recipients.drain(..) {
             self.users.insert(u.id, u);
         }
@@ -1257,6 +1269,11 @@ impl Cache {
                 self.remove_channel(id);
                 self.bump_sidebar();
             }
+            event @ (CoreEvent::ThreadUpsert { .. }
+            | CoreEvent::ThreadDelete { .. }
+            | CoreEvent::ThreadListSync { .. }
+            | CoreEvent::ThreadJoined { .. }
+            | CoreEvent::ThreadMembers { .. }) => self.apply_thread_event(event),
             CoreEvent::MessageCreate(mut m) => {
                 self.users.insert(m.author.id, m.author.clone());
                 if let (Some(guild), Some(mut member)) = (m.guild_id, m.member.take()) {
@@ -1264,8 +1281,12 @@ impl Cache {
                     self.insert_member(guild, member);
                 }
                 let was_unread = self.is_unread(m.channel_id);
+                self.note_message_threads(std::slice::from_ref(&m));
                 if let Some(c) = self.channels.get_mut(&m.channel_id) {
                     c.last_message_id = Some(m.id);
+                    if let Some(info) = c.thread.as_mut().filter(|_| m.kind != 21 && m.id != m.channel_id) {
+                        info.message_count += 1;
+                    }
                     // The DM list is ordered by last activity.
                     if c.guild_id.is_none() {
                         self.sidebar_rev = next_revision();
@@ -1519,7 +1540,7 @@ mod tests {
         Channel {
             id: Id(id), kind, guild_id: guild.map(Id), name: Some(format!("c{id}")), position: 0,
             parent_id: None, last_message_id: last.map(Id), recipient_ids: vec![], recipients: vec![], owner_id: None, icon: None,
-            permission_overwrites: vec![], topic: None,
+            permission_overwrites: vec![], topic: None, thread: None, forum: None,
         }
     }
 
@@ -1527,7 +1548,7 @@ mod tests {
         Message {
             pinned: false,
             id: Id(id), channel_id: Id(channel), guild_id: None, author: user(2, "lin"),
-            content: format!("m{id}"), timestamp: String::new(), edited_timestamp: None, poll: None, interaction: None, interaction_metadata: None, message_snapshots: Vec::new(),
+            content: format!("m{id}"), timestamp: String::new(), edited_timestamp: None, poll: None, interaction: None, interaction_metadata: None, message_snapshots: Vec::new(), thread: None,
             nonce: None, attachments: vec![], member: None,
             kind: 0, flags: 0, embeds: vec![], components: vec![], message_reference: None, call: None,
             referenced_message: None, sticker_items: vec![], mentions: vec![], reactions: vec![], mention_everyone: false, mention_roles: vec![],

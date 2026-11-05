@@ -31,6 +31,9 @@ pub const MENTION_EVERYONE: u64 = 1 << 17;
 pub const USE_EXTERNAL_EMOJIS: u64 = 1 << 18;
 pub const USE_EXTERNAL_STICKERS: u64 = 1 << 37;
 pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
+pub const MANAGE_THREADS: u64 = 1 << 34;
+pub const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
+pub const CREATE_PRIVATE_THREADS: u64 = 1 << 36;
 
 /// Server-wide permissions: everything for the owner, else @everyone (the
 /// role whose id is the guild's) plus the member's roles. Roles the guild no
@@ -98,7 +101,7 @@ mod tests {
         Channel {
             id: Id(300), kind: ChannelKind::Text, guild_id: Some(GUILD), name: None, position: 0,
             parent_id: None, last_message_id: None, recipient_ids: vec![], recipients: vec![], owner_id: None, icon: None,
-            permission_overwrites: overwrites, topic: None,
+            permission_overwrites: overwrites, topic: None, thread: None, forum: None,
         }
     }
 

@@ -326,6 +326,8 @@ pub enum ChannelKind {
     Forum,
     /// A thread (announcement, public or private) or a forum post.
     Thread,
+    /// A media channel: a forum whose posts are mostly pictures.
+    Media,
     Other(u8),
 }
 
@@ -333,6 +335,11 @@ impl ChannelKind {
     /// Channels whose messages this client can show and send to.
     pub fn is_text_like(self) -> bool {
         matches!(self, Self::Text | Self::Dm | Self::GroupDm | Self::Announcement | Self::Thread)
+    }
+
+    /// Channels that hold posts (each a thread) instead of messages.
+    pub fn is_forum_like(self) -> bool {
+        matches!(self, Self::Forum | Self::Media)
     }
 }
 
@@ -347,6 +354,7 @@ impl From<u8> for ChannelKind {
             5 => Self::Announcement,
             13 => Self::Stage,
             15 => Self::Forum,
+            16 => Self::Media,
             10..=12 => Self::Thread,
             other => Self::Other(other),
         }
@@ -375,8 +383,118 @@ pub struct Channel {
     /// A group DM's picture (`channel-icons/{id}/{hash}`).
     pub icon: Option<String>,
     pub permission_overwrites: Vec<PermissionOverwrite>,
-    /// The topic line of a server text channel.
+    /// The topic line of a server text channel; a forum's guidelines.
     pub topic: Option<String>,
+    /// Set on threads and forum posts.
+    pub thread: Option<ThreadInfo>,
+    /// Set on forum and media channels.
+    pub forum: Option<ForumInfo>,
+}
+
+/// A thread's flag for a post pinned to the top of its forum.
+pub const THREAD_PINNED: u64 = 1 << 1;
+/// A forum's flag: new posts must carry a tag.
+pub const FORUM_REQUIRE_TAG: u64 = 1 << 4;
+
+/// What a thread or forum post carries beyond a plain channel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ThreadInfo {
+    /// A private thread: only invited people see it.
+    pub private: bool,
+    pub archived: bool,
+    pub locked: bool,
+    /// Minutes of quiet before it archives itself.
+    pub auto_archive: u32,
+    /// ISO 8601: when it was last archived or unarchived.
+    pub archived_at: Option<String>,
+    /// ISO 8601; absent on threads made before 2022-01-09.
+    pub created_at: Option<String>,
+    /// Messages in it, not counting the first or deleted ones (Discord stops at 50 on old clients).
+    pub message_count: u32,
+    pub member_count: u32,
+    /// We're a member: it shows in the channel list and pings us.
+    pub joined: bool,
+    pub flags: u64,
+    /// A forum post's tags.
+    pub applied_tags: Vec<Id>,
+}
+
+impl ThreadInfo {
+    pub fn pinned(&self) -> bool {
+        self.flags & THREAD_PINNED != 0
+    }
+}
+
+/// A forum's label for its posts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForumTag {
+    pub id: Id,
+    pub name: String,
+    /// Only moderators may put it on a post.
+    pub moderated: bool,
+    pub emoji_id: Option<Id>,
+    /// A unicode emoji, or the custom one's name.
+    pub emoji_name: Option<String>,
+}
+
+/// What a forum or media channel adds to a channel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ForumInfo {
+    pub tags: Vec<ForumTag>,
+    /// 0 latest activity, 1 creation date.
+    pub sort_order: u8,
+    /// 1 list, 2 gallery; 0 when the server hasn't picked.
+    pub layout: u8,
+    pub flags: u64,
+    /// The reaction offered on each post.
+    pub reaction: Option<(Option<Id>, Option<String>)>,
+    /// What the body of a new post starts with.
+    pub template: Option<String>,
+}
+
+impl ForumInfo {
+    pub fn requires_tag(&self) -> bool {
+        self.flags & FORUM_REQUIRE_TAG != 0
+    }
+
+    pub fn tag(&self, id: Id) -> Option<&ForumTag> {
+        self.tags.iter().find(|t| t.id == id)
+    }
+}
+
+#[derive(Deserialize)]
+struct RawTag {
+    id: Id,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    moderated: bool,
+    #[serde(default)]
+    emoji_id: Option<Id>,
+    #[serde(default)]
+    emoji_name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawThreadMeta {
+    #[serde(default)]
+    archived: bool,
+    #[serde(default)]
+    locked: bool,
+    #[serde(default)]
+    auto_archive_duration: u32,
+    #[serde(default)]
+    archive_timestamp: Option<String>,
+    #[serde(default)]
+    create_timestamp: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawReaction {
+    #[serde(default)]
+    emoji_id: Option<Id>,
+    #[serde(default)]
+    emoji_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -385,7 +503,7 @@ struct RawChannel {
     owner_id: Option<Id>,
     id: Id,
     #[serde(rename = "type")]
-    kind: ChannelKind,
+    kind: u8,
     #[serde(default)]
     guild_id: Option<Id>,
     #[serde(default)]
@@ -406,6 +524,29 @@ struct RawChannel {
     permission_overwrites: Vec<PermissionOverwrite>,
     #[serde(default)]
     topic: Option<String>,
+    #[serde(default)]
+    thread_metadata: Option<RawThreadMeta>,
+    /// Present on a thread we've joined.
+    #[serde(default)]
+    member: Option<serde_json::Value>,
+    #[serde(default)]
+    message_count: u32,
+    #[serde(default)]
+    member_count: u32,
+    #[serde(default)]
+    flags: u64,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    applied_tags: Vec<Id>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    available_tags: Vec<RawTag>,
+    #[serde(default)]
+    default_sort_order: Option<u8>,
+    #[serde(default)]
+    default_forum_layout: Option<u8>,
+    #[serde(default)]
+    default_reaction_emoji: Option<RawReaction>,
+    #[serde(default)]
+    template: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Channel {
@@ -416,9 +557,38 @@ impl<'de> Deserialize<'de> for Channel {
         } else {
             r.recipient_ids
         };
+        let kind = ChannelKind::from(r.kind);
+        let thread = (kind == ChannelKind::Thread).then(|| {
+            let meta = r.thread_metadata.unwrap_or_default();
+            ThreadInfo {
+                private: r.kind == 12,
+                archived: meta.archived,
+                locked: meta.locked,
+                auto_archive: meta.auto_archive_duration,
+                archived_at: meta.archive_timestamp,
+                created_at: meta.create_timestamp,
+                message_count: r.message_count,
+                member_count: r.member_count,
+                joined: r.member.as_ref().is_some_and(|m| !m.is_null()),
+                flags: r.flags,
+                applied_tags: r.applied_tags,
+            }
+        });
+        let forum = kind.is_forum_like().then(|| ForumInfo {
+            tags: r
+                .available_tags
+                .into_iter()
+                .map(|t| ForumTag { id: t.id, name: t.name, moderated: t.moderated, emoji_id: t.emoji_id.filter(|id| id.0 != 0), emoji_name: t.emoji_name.filter(|n| !n.is_empty()) })
+                .collect(),
+            sort_order: r.default_sort_order.unwrap_or(0),
+            layout: r.default_forum_layout.unwrap_or(0),
+            flags: r.flags,
+            reaction: r.default_reaction_emoji.map(|e| (e.emoji_id, e.emoji_name)),
+            template: r.template.filter(|t| !t.trim().is_empty()),
+        });
         Ok(Channel {
             id: r.id,
-            kind: r.kind,
+            kind,
             guild_id: r.guild_id,
             name: r.name,
             position: r.position,
@@ -430,6 +600,8 @@ impl<'de> Deserialize<'de> for Channel {
             icon: r.icon,
             permission_overwrites: r.permission_overwrites,
             topic: r.topic.filter(|t| !t.trim().is_empty()),
+            thread,
+            forum,
         })
     }
 }
@@ -656,6 +828,9 @@ pub struct Message {
     /// A forward's copy of the original message.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub message_snapshots: Vec<MessageSnapshot>,
+    /// The thread started from this message, when Discord sent it along.
+    #[serde(default, deserialize_with = "lenient_thread")]
+    pub thread: Option<Box<Channel>>,
 }
 
 /// One forwarded message.
@@ -787,6 +962,10 @@ pub(crate) fn lenient_poll<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Box
 }
 
 fn lenient_boxed<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Box<Message>>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.and_then(|v| serde_json::from_value(v).ok()).map(Box::new))
+}
+
+fn lenient_thread<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Box<Channel>>, D::Error> {
     Ok(Option::<Value>::deserialize(d)?.and_then(|v| serde_json::from_value(v).ok()).map(Box::new))
 }
 

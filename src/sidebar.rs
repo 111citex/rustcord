@@ -499,7 +499,7 @@ mod tests {
         Channel {
             owner_id: None,
             id: Id(id), kind, guild_id: Some(Id(300)), name: Some(format!("c{id}")), position: 0, parent_id: None,
-            last_message_id: None, recipient_ids: vec![], recipients: vec![], icon: None, permission_overwrites: vec![], topic: None,
+            last_message_id: None, recipient_ids: vec![], recipients: vec![], icon: None, permission_overwrites: vec![], topic: None, thread: None, forum: None,
         }
     }
 

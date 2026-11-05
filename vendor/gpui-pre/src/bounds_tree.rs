@@ -34,6 +34,11 @@ where
     search_stack: Vec<NonNull<Node<U>>>,
 }
 
+// Rustcord: `search_stack` is the only thing that isn't plainly `Send`. Its pointers go to this
+// tree's own `nodes` and are only used during the search that pushed them, which clears the
+// stack first, so nothing is tied to a thread. A `Scene` has to be able to reach the render thread.
+unsafe impl<U> Send for BoundsTree<U> where U: Clone + Debug + Default + PartialEq + Send {}
+
 /// A node in the bounds tree.
 #[derive(Debug, Clone)]
 struct Node<U>

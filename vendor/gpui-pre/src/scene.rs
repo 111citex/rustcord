@@ -138,6 +138,20 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    /// Rustcord: copies what a renderer draws into `target`, keeping `target`'s buffers. The
+    /// window keeps its own scene to replay cached views from next frame, so the render
+    /// thread gets a copy. `target` only ever goes to `batches`, so nothing else is copied.
+    pub fn copy_primitives_into(&self, target: &mut Scene) {
+        target.shadows.clone_from(&self.shadows);
+        target.quads.clone_from(&self.quads);
+        target.paths.clone_from(&self.paths);
+        target.underlines.clone_from(&self.underlines);
+        target.monochrome_sprites.clone_from(&self.monochrome_sprites);
+        target.subpixel_sprites.clone_from(&self.subpixel_sprites);
+        target.polychrome_sprites.clone_from(&self.polychrome_sprites);
+        target.surfaces.clone_from(&self.surfaces);
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {

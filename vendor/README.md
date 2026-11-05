@@ -1,4 +1,16 @@
-gpui-pre 0.3.7 and gpui-pre-wgpu 0.3.7 from crates.io (Apache-2.0), with:
+gpui-pre 0.3.7, gpui-pre-wgpu 0.3.7 and gpui-pre-linux 0.3.7 from crates.io (Apache-2.0), with:
+- `gpui-pre-wgpu/wgpu_renderer.rs`, `frame_mailbox.rs`: every window has a render thread that does all the GPU work of a
+  frame, from uploads to present. `WgpuRenderer::draw` copies the scene (`Scene::copy_primitives_into`) and hands it over
+  without waiting. The newest frame wins if the thread is behind. The surface and the things drawing to it sit behind one
+  lock, which is how a resize knows no frame is half done; frames painted before a resize are never presented.
+- `wgpu_atlas.rs`: a frame takes its uploads and textures with it (`AtlasFrame`), because the next paint can reuse a tile's
+  space or a texture's id while it waits to be drawn.
+- `gpui-pre-linux/wayland`: only `draw` going off the main thread needs this crate changed. A frame that fails to reach
+  the compositor gets no frame callback, so the render thread pings the loop (`render_feedback_fired`).
+  `x11/window.rs`: redraw requests from the render thread are picked up in `refresh`.
+- `bounds_tree.rs`: `Send`, so that a `Scene` can go to the render thread.
+- `cosmic_text_system.rs`: its tests want fonts from Zed's tree and are off, so that this crate's other tests can be built
+  (`cargo test -p gpui-pre-wgpu --features test-support`).
 - `frame_stats`: counters on what a frame costs (draw phases, layout nodes, atlas size).
 - `TaffyLayoutEngine::remember_next_layout`: a list row's layout is reused on its next frame when its
   styles, its tree and what its measured nodes say are all unchanged. `layout_items` in `elements/list.rs` asks for it.

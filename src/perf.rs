@@ -200,7 +200,7 @@ pub fn frame_line() -> String {
     let frames = get("FRAMES").max(1.);
     let ms = |name: &str| get(name) / frames / 1e6;
     format!(
-        "frames={} draw={:.2} request={:.2} prepaint={:.2} layout={:.2} paint={:.2} present={:.2} nodes={:.0} layouts={:.1} memo_hits={:.1} hitboxes={:.0} atlas={}MB/{} used={}MB",
+        "frames={} draw={:.2} request={:.2} prepaint={:.2} layout={:.2} paint={:.2} present={:.2} render={:.2} acquire={:.2} rendered={} superseded={} nodes={:.0} layouts={:.1} memo_hits={:.1} hitboxes={:.0} atlas={}MB/{} used={}MB",
         get("FRAMES"),
         ms("DRAW_NS"),
         ms("REQUEST_NS"),
@@ -208,6 +208,10 @@ pub fn frame_line() -> String {
         ms("LAYOUT_NS"),
         ms("PAINT_NS"),
         ms("PRESENT_NS"),
+        get("RENDER_NS") / get("RENDER_FRAMES").max(1.) / 1e6,
+        get("ACQUIRE_NS") / get("RENDER_FRAMES").max(1.) / 1e6,
+        get("RENDER_FRAMES"),
+        get("RENDER_SUPERSEDED"),
         get("NODES") / frames,
         get("LAYOUT_CALLS") / frames,
         get("MEMO_HITS") / frames,

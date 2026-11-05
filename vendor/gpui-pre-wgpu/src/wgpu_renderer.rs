@@ -1,4 +1,5 @@
-use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
+use crate::frame_mailbox::FrameMailbox;
+use crate::{AtlasFrame, CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
@@ -7,6 +8,7 @@ use gpui::{
     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
+use parking_lot::Mutex;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use smallvec::SmallVec;
@@ -15,6 +17,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -212,7 +215,6 @@ impl WgpuResources {
 
 struct WgpuRendererCore {
     resources: WgpuResources,
-    atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
     gamma_offset: u64,
     instance_data_capacity: u64,
@@ -243,6 +245,93 @@ enum RendererState {
     Released,
 }
 
+/// The surface and everything that draws to it. Rustcord: the render thread holds this lock
+/// for as long as it works on a frame, so when the main thread takes it to change the
+/// surface, no frame is half done. The render thread never waits for the main thread with
+/// this held, which is what keeps that from deadlocking.
+struct RenderTarget {
+    state: RendererState,
+    surface_config: wgpu::SurfaceConfiguration,
+    transparent_alpha_mode: wgpu::CompositeAlphaMode,
+    opaque_alpha_mode: wgpu::CompositeAlphaMode,
+    is_bgr: bool,
+    failed_frame_count: u32,
+    device_errors: Arc<DeviceErrorState>,
+    observed_error_generation: u64,
+    last_surface_error: Option<String>,
+}
+
+/// Rustcord: a finished frame on its way to the render thread.
+#[derive(Default)]
+struct FramePacket {
+    scene: Scene,
+    atlas: AtlasFrame,
+    /// See [`RenderShared::surface_generation`].
+    surface_generation: u64,
+}
+
+/// Rustcord: what the main thread and the render thread share.
+struct RenderShared {
+    target: Mutex<RenderTarget>,
+    mailbox: FrameMailbox<FramePacket>,
+    /// Goes up when the surface changes in a way that makes frames painted before it wrong
+    /// to show, like a resize. Those frames are then never presented, so nothing of the old
+    /// size can reach the compositor once the main thread has acked the new size.
+    surface_generation: AtomicU64,
+    /// The last frame didn't reach the screen.
+    frame_failed: AtomicBool,
+    /// GPU errors kept coming: the atlas should be emptied, which is for the main thread to
+    /// do because that's where tiles get handed out.
+    atlas_reset_wanted: AtomicBool,
+    thread_died: AtomicBool,
+    /// Called when the main thread should look at the flags above.
+    feedback_waker: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+impl RenderShared {
+    fn wake_main_thread(&self) {
+        if let Some(waker) = self.feedback_waker.lock().as_ref() {
+            waker();
+        }
+    }
+}
+
+/// Rustcord: lets the main thread know if the render thread goes down with a panic.
+/// Without this a window would just freeze.
+#[cfg(not(target_family = "wasm"))]
+struct RenderThreadWatch(Arc<RenderShared>);
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for RenderThreadWatch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.thread_died.store(true, Ordering::Release);
+            self.0.wake_main_thread();
+        }
+    }
+}
+
+/// Rustcord: the render thread. It owns every GPU step of a frame, from uploads to present,
+/// so that a slow driver or a wait for a free surface image never holds up the main thread.
+#[cfg(not(target_family = "wasm"))]
+fn render_thread(shared: Arc<RenderShared>) {
+    let _watch = RenderThreadWatch(shared.clone());
+    while let Some(mut frame) = shared.mailbox.wait() {
+        let presented = shared.target.lock().render_packet(&mut frame, &shared);
+        frame.scene.clear();
+        frame.atlas.reset();
+        shared.mailbox.recycle(frame);
+        // Without a commit the compositor won't send the frame callback that the main thread
+        // is waiting for, so it has to hear about this some other way.
+        if !presented {
+            shared.frame_failed.store(true, Ordering::Release);
+            shared.wake_main_thread();
+        }
+    }
+}
+
+/// The main thread's handle on a window's rendering. Rustcord: frames are drawn by
+/// [`render_thread`]. All the methods here belong to the main thread.
 pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
@@ -250,35 +339,20 @@ pub struct WgpuRenderer {
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     compositor_gpu: Option<CompositorGpuHint>,
-    state: RendererState,
-    surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
-    transparent_alpha_mode: wgpu::CompositeAlphaMode,
-    opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
-    is_bgr: bool,
-    failed_frame_count: u32,
-    device_errors: Arc<DeviceErrorState>,
-    observed_error_generation: u64,
-    last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// Whether frames can be drawn, so `draw` can answer without taking the target's lock.
+    /// Only the main thread changes that state.
+    surface_ready: bool,
+    /// Asked on every frame, so this stays off the target's lock too.
+    device_errors: Arc<DeviceErrorState>,
+    shared: Arc<RenderShared>,
+    #[cfg(not(target_family = "wasm"))]
+    render_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WgpuRenderer {
-    fn core(&self) -> Option<&WgpuRendererCore> {
-        match &self.state {
-            RendererState::Ready { core, .. } | RendererState::Unconfigured { core } => Some(core),
-            RendererState::Released => None,
-        }
-    }
-
-    fn core_mut(&mut self) -> Option<&mut WgpuRendererCore> {
-        match &mut self.state {
-            RendererState::Ready { core, .. } | RendererState::Unconfigured { core } => Some(core),
-            RendererState::Released => None,
-        }
-    }
-
     /// Creates a new WgpuRenderer from raw window handles.
     ///
     /// The `gpu_context` is a shared reference that coordinates GPU context across
@@ -371,6 +445,7 @@ impl WgpuRenderer {
         Self::new_internal(None, context, surface, config, None, atlas)
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
     fn new_internal(
         gpu_context: Option<GpuContext>,
         context: &WgpuContext,
@@ -378,6 +453,49 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
+    ) -> anyhow::Result<Self> {
+        let target = RenderTarget::new(context, surface, config)?;
+        let max_texture_size = context.device.limits().max_texture_dimension_2d;
+        let shared = Arc::new(RenderShared {
+            target: Mutex::new(target),
+            mailbox: FrameMailbox::new(),
+            surface_generation: AtomicU64::new(0),
+            frame_failed: AtomicBool::new(false),
+            atlas_reset_wanted: AtomicBool::new(false),
+            thread_died: AtomicBool::new(false),
+            feedback_waker: Mutex::new(None),
+        });
+        #[cfg(not(target_family = "wasm"))]
+        let render_thread = {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name("gpui-render".to_string())
+                // GPU drivers can be hungry for stack, and this is only address space until used.
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || render_thread(shared))
+                .context("Failed to start the render thread")?
+        };
+
+        Ok(Self {
+            context: gpu_context,
+            compositor_gpu,
+            atlas,
+            max_texture_size,
+            needs_redraw: false,
+            surface_ready: true,
+            device_errors: Arc::clone(context.errors()),
+            shared,
+            #[cfg(not(target_family = "wasm"))]
+            render_thread: Some(render_thread),
+        })
+    }
+}
+
+impl RenderTarget {
+    fn new(
+        context: &WgpuContext,
+        surface: wgpu::Surface<'static>,
+        config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
         let preferred_formats = [
@@ -461,24 +579,151 @@ impl WgpuRenderer {
         // that this adapter can successfully configure this surface.
         surface.configure(&context.device, &surface_config);
 
-        let core = WgpuRendererCore::new(context, atlas.clone(), surface_format, alpha_mode);
+        let core = WgpuRendererCore::new(context, surface_format, alpha_mode);
 
         Ok(Self {
-            context: gpu_context,
-            compositor_gpu,
             state: RendererState::Ready { surface, core },
             surface_config,
-            atlas,
             transparent_alpha_mode,
             opaque_alpha_mode,
-            max_texture_size,
             is_bgr: false,
             failed_frame_count: 0,
             device_errors: Arc::clone(context.errors()),
             observed_error_generation: 0,
             last_surface_error: None,
-            needs_redraw: false,
         })
+    }
+
+    fn core(&self) -> Option<&WgpuRendererCore> {
+        match &self.state {
+            RendererState::Ready { core, .. } | RendererState::Unconfigured { core } => Some(core),
+            RendererState::Released => None,
+        }
+    }
+
+    fn core_mut(&mut self) -> Option<&mut WgpuRendererCore> {
+        match &mut self.state {
+            RendererState::Ready { core, .. } | RendererState::Unconfigured { core } => Some(core),
+            RendererState::Released => None,
+        }
+    }
+
+    /// Writes a frame's uploads even when the frame itself won't be drawn. Its tiles count as
+    /// uploaded from now on, and later frames will draw them.
+    fn flush_uploads(&mut self, frame: &mut FramePacket) {
+        if let Some(core) = self.core() {
+            frame.atlas.flush_uploads(&core.resources.queue);
+        }
+    }
+
+    /// Draws a frame and presents it. Returns whether it reached the compositor.
+    fn render_packet(&mut self, frame: &mut FramePacket, shared: &RenderShared) -> bool {
+        self.flush_uploads(frame);
+        if frame.surface_generation != shared.surface_generation.load(Ordering::Acquire) {
+            return false;
+        }
+
+        #[cfg(target_family = "wasm")]
+        if self.device_errors.device_lost() {
+            if matches!(self.state, RendererState::Ready { .. }) {
+                log::error!(
+                    "Browser graphics context was lost; rendering has stopped. Reload the page to recover."
+                );
+                self.state = match std::mem::replace(&mut self.state, RendererState::Released) {
+                    RendererState::Ready { core, .. } => RendererState::Unconfigured { core },
+                    state => state,
+                };
+            }
+            return false;
+        }
+
+        // Bail out early if the surface has been unconfigured (e.g. during
+        // Android background/rotation transitions).  Attempting to acquire
+        // a texture from an unconfigured surface can block indefinitely on
+        // some drivers (Adreno).
+        let RendererState::Ready { surface, core } = &mut self.state else {
+            return false;
+        };
+
+        if let Some(error) = self.last_surface_error.take().or_else(|| {
+            self.device_errors
+                .observe_error(&mut self.observed_error_generation)
+        }) {
+            self.failed_frame_count += 1;
+            log::error!(
+                "GPU error during frame (failure {} of 10): {error}",
+                self.failed_frame_count
+            );
+
+            // TBD. Does retrying more actually help?
+            if self.failed_frame_count > 10 {
+                panic!("Too many consecutive GPU errors. Last error: {error}");
+            } else if self.failed_frame_count > 5 {
+                core.resources.invalidate_intermediate_textures();
+                shared.atlas_reset_wanted.store(true, Ordering::Release);
+                self.failed_frame_count = 0;
+                return false;
+            }
+        } else {
+            self.failed_frame_count = 0;
+        }
+
+        let render_start = std::time::Instant::now();
+        // Rustcord: reconfiguring and trying again right here saves the main thread a trip
+        // through the frame loop just because the surface went out of date.
+        let mut can_retry = true;
+        let surface_texture = loop {
+            match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(surface_texture) => break surface_texture,
+                wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
+                    // Textures must be destroyed before the surface can be reconfigured.
+                    drop(surface_texture);
+                    surface.configure(&core.resources.device, &self.surface_config);
+                }
+                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                    surface.configure(&core.resources.device, &self.surface_config);
+                }
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    self.last_surface_error = Some("Surface texture validation error".to_string());
+                    return false;
+                }
+            }
+            if !std::mem::take(&mut can_retry) {
+                return false;
+            }
+        };
+        gpui::frame_stats::since(&gpui::frame_stats::ACQUIRE_NS, render_start);
+
+        // The acquired texture is the authority on frame dimensions; the surface
+        // configuration is only a request.
+        let size = Size {
+            width: DevicePixels(surface_texture.texture.width() as i32),
+            height: DevicePixels(surface_texture.texture.height() as i32),
+        };
+        let frame_view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let premultiplied_alpha =
+            self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        if let Err(error) = core.render_frame(
+            &frame.scene,
+            &mut frame.atlas,
+            &frame_view,
+            size,
+            premultiplied_alpha,
+            wgpu::Color::TRANSPARENT,
+        ) {
+            log::error!("{error:#}");
+            return false;
+        }
+
+        surface_texture.present();
+        gpui::frame_stats::since(&gpui::frame_stats::RENDER_NS, render_start);
+        gpui::frame_stats::add(&gpui::frame_stats::RENDER_FRAMES, 1);
+        true
     }
 }
 
@@ -999,11 +1244,17 @@ impl WgpuRendererCore {
 impl WgpuRenderer {
     /// Records the new drawable size and reconfigures the surface when one is present.
     /// The size is kept even without GPU resources so that recovery restores it.
+    ///
+    /// Rustcord: this waits for a frame being drawn, and any frame that's painted but not yet
+    /// drawn is never presented. So after this returns, the next thing to reach the
+    /// compositor is the first frame painted at the new size.
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
 
-        if width == self.surface_config.width && height == self.surface_config.height {
+        let mut guard = self.shared.target.lock();
+        let target = &mut *guard;
+        if width == target.surface_config.width && height == target.surface_config.height {
             return;
         }
 
@@ -1016,10 +1267,13 @@ impl WgpuRenderer {
                 width, height, self.max_texture_size, clamped_width, clamped_height
             );
         }
-        self.surface_config.width = clamped_width.max(1);
-        self.surface_config.height = clamped_height.max(1);
+        target.surface_config.width = clamped_width.max(1);
+        target.surface_config.height = clamped_height.max(1);
+        self.shared
+            .surface_generation
+            .fetch_add(1, Ordering::AcqRel);
 
-        let Some(core) = self.core_mut() else {
+        let Some(core) = target.core_mut() else {
             return;
         };
         let resources = &mut core.resources;
@@ -1045,31 +1299,34 @@ impl WgpuRenderer {
         // panics when the device/surface is in an invalid state during resize.
         resources.invalidate_intermediate_textures();
 
-        if let RendererState::Ready { surface, core } = &self.state {
-            surface.configure(&core.resources.device, &self.surface_config);
+        if let RendererState::Ready { surface, core } = &target.state {
+            surface.configure(&core.resources.device, &target.surface_config);
         }
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
-        self.is_bgr = is_bgr;
-        if let Some(core) = self.core_mut() {
+        let mut target = self.shared.target.lock();
+        target.is_bgr = is_bgr;
+        if let Some(core) = target.core_mut() {
             core.is_bgr = is_bgr;
         }
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
+        let mut guard = self.shared.target.lock();
+        let target = &mut *guard;
         let new_alpha_mode = if transparent {
-            self.transparent_alpha_mode
+            target.transparent_alpha_mode
         } else {
-            self.opaque_alpha_mode
+            target.opaque_alpha_mode
         };
-        if new_alpha_mode == self.surface_config.alpha_mode {
+        if new_alpha_mode == target.surface_config.alpha_mode {
             return;
         }
-        self.surface_config.alpha_mode = new_alpha_mode;
-        let format = self.surface_config.format;
+        target.surface_config.alpha_mode = new_alpha_mode;
+        let format = target.surface_config.format;
 
-        let Some(core) = self.core_mut() else {
+        let Some(core) = target.core_mut() else {
             return;
         };
         let resources = &mut core.resources;
@@ -1083,16 +1340,17 @@ impl WgpuRenderer {
             core.uses_webgl_instance_data,
         );
 
-        if let RendererState::Ready { surface, core } = &self.state {
-            surface.configure(&core.resources.device, &self.surface_config);
+        if let RendererState::Ready { surface, core } = &target.state {
+            surface.configure(&core.resources.device, &target.surface_config);
         }
     }
 
     #[allow(dead_code)]
     pub fn viewport_size(&self) -> Size<DevicePixels> {
+        let target = self.shared.target.lock();
         Size {
-            width: DevicePixels(self.surface_config.width as i32),
-            height: DevicePixels(self.surface_config.height as i32),
+            width: DevicePixels(target.surface_config.width as i32),
+            height: DevicePixels(target.surface_config.height as i32),
         }
     }
 
@@ -1101,13 +1359,18 @@ impl WgpuRenderer {
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
-        self.core().is_some_and(|core| core.dual_source_blending)
+        self.shared
+            .target
+            .lock()
+            .core()
+            .is_some_and(|core| core.dual_source_blending)
     }
 
     /// Returns `None` once GPU resources have been released by `destroy` or a pending
     /// device recovery.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
-        let adapter_info = &self.core()?.adapter_info;
+        let target = self.shared.target.lock();
+        let adapter_info = &target.core()?.adapter_info;
         Some(GpuSpecs {
             is_software_emulated: adapter_info.device_type == wgpu::DeviceType::Cpu,
             device_name: adapter_info.name.clone(),
@@ -1120,102 +1383,81 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    /// Hands a finished frame to the render thread and returns without waiting for it.
+    /// `true` means the frame is on its way, not that it's on screen. If it doesn't make it,
+    /// the waker from [`set_feedback_waker`](Self::set_feedback_waker) is called and
+    /// [`take_failed_frame`](Self::take_failed_frame) says so.
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        self.apply_render_feedback();
+        if !self.surface_ready {
+            return false;
+        }
+
+        let mut frame = self.shared.mailbox.take_spare().unwrap_or_default();
+        scene.copy_primitives_into(&mut frame.scene);
+        self.atlas.capture_frame(&mut frame.atlas);
+        frame.surface_generation = self.shared.surface_generation.load(Ordering::Acquire);
+
+        // Whatever failed before this frame, this one will put right.
+        self.shared.frame_failed.store(false, Ordering::Release);
+
         #[cfg(target_family = "wasm")]
-        if self.device_lost() {
-            if matches!(self.state, RendererState::Ready { .. }) {
-                log::error!(
-                    "Browser graphics context was lost; rendering has stopped. Reload the page to recover."
-                );
-                self.unconfigure_surface();
-            }
-            return false;
+        {
+            let shared = self.shared.clone();
+            let presented = shared.target.lock().render_packet(&mut frame, &shared);
+            self.apply_render_feedback();
+            frame.scene.clear();
+            frame.atlas.reset();
+            shared.mailbox.recycle(frame);
+            presented
         }
 
-        // Bail out early if the surface has been unconfigured (e.g. during
-        // Android background/rotation transitions).  Attempting to acquire
-        // a texture from an unconfigured surface can block indefinitely on
-        // some drivers (Adreno).
-        let RendererState::Ready { surface, core } = &mut self.state else {
-            return false;
-        };
-
-        if let Some(error) = self.last_surface_error.take().or_else(|| {
-            self.device_errors
-                .observe_error(&mut self.observed_error_generation)
-        }) {
-            self.failed_frame_count += 1;
-            log::error!(
-                "GPU error during frame (failure {} of 10): {error}",
-                self.failed_frame_count
-            );
-
-            // TBD. Does retrying more actually help?
-            if self.failed_frame_count > 10 {
-                panic!("Too many consecutive GPU errors. Last error: {error}");
-            } else if self.failed_frame_count > 5 {
-                core.resources.invalidate_intermediate_textures();
-                self.atlas.clear();
-                self.needs_redraw = true;
-                self.failed_frame_count = 0;
-                return false;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let replaced = self.shared.mailbox.post(frame, |older, newer| {
+                newer.atlas.take_uploads_from(&mut older.atlas);
+                older.scene.clear();
+                older.atlas.reset();
+            });
+            if replaced {
+                gpui::frame_stats::add(&gpui::frame_stats::RENDER_SUPERSEDED, 1);
             }
-        } else {
-            self.failed_frame_count = 0;
+            true
         }
+    }
 
-        let frame = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                surface.configure(&core.resources.device, &self.surface_config);
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                surface.configure(&core.resources.device, &self.surface_config);
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                self.last_surface_error = Some("Surface texture validation error".to_string());
-                return false;
-            }
-        };
+    /// Sets what the render thread calls when the main thread should come and look:
+    /// a frame didn't reach the screen, or a redraw is needed. It's called from the render
+    /// thread, and only in those cases, never for a frame that went fine.
+    pub fn set_feedback_waker(&mut self, waker: Box<dyn Fn() + Send + Sync>) {
+        *self.shared.feedback_waker.lock() = Some(waker);
+    }
 
-        // The acquired texture is the authority on frame dimensions; the surface
-        // configuration is only a request.
-        let size = Size {
-            width: DevicePixels(frame.texture.width() as i32),
-            height: DevicePixels(frame.texture.height() as i32),
-        };
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let premultiplied_alpha =
-            self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
-        if let Err(error) = core.render_frame(
-            scene,
-            &frame_view,
-            size,
-            premultiplied_alpha,
-            wgpu::Color::TRANSPARENT,
-        ) {
-            log::error!("{error:#}");
-            return false;
+    /// Whether a frame failed since the last [`draw`](Self::draw). Calling this clears it.
+    pub fn take_failed_frame(&mut self) -> bool {
+        self.apply_render_feedback();
+        self.shared.frame_failed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Whether a frame is waiting for the render thread, with one being drawn not counted.
+    pub fn has_queued_frame(&self) -> bool {
+        self.shared.mailbox.has_pending()
+    }
+
+    fn apply_render_feedback(&mut self) {
+        if self.shared.thread_died.load(Ordering::Acquire) {
+            panic!("The render thread died, see its panic above");
         }
-
-        frame.present();
-        true
+        if self.shared.atlas_reset_wanted.swap(false, Ordering::AcqRel) {
+            self.atlas.clear();
+            self.needs_redraw = true;
+        }
     }
 }
 
 impl WgpuRendererCore {
     fn new(
         context: &WgpuContext,
-        atlas: Arc<WgpuAtlas>,
         target_format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
     ) -> Self {
@@ -1354,7 +1596,6 @@ impl WgpuRendererCore {
                 path_msaa_texture: None,
                 path_msaa_view: None,
             },
-            atlas,
             path_globals_offset,
             gamma_offset,
             instance_data_capacity,
@@ -1417,6 +1658,7 @@ impl WgpuRendererCore {
     fn render_frame(
         &mut self,
         scene: &Scene,
+        atlas_frame: &mut AtlasFrame,
         target_view: &wgpu::TextureView,
         size: Size<DevicePixels>,
         premultiplied_alpha: bool,
@@ -1433,7 +1675,7 @@ impl WgpuRendererCore {
             self.max_texture_size
         );
 
-        self.atlas.before_frame();
+        atlas_frame.flush_uploads(&self.resources.queue);
         self.ensure_intermediate_textures(size);
 
         let gamma_params = GammaParams {
@@ -1468,7 +1710,7 @@ impl WgpuRendererCore {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        self.record_frame(scene, target_view, clear_color)
+        self.record_frame(scene, atlas_frame, target_view, clear_color)
             .inspect_err(|_| {
                 // Queue writes are staged before encoding; flush them even if the frame fails.
                 self.resources.queue.submit(std::iter::empty());
@@ -1478,6 +1720,7 @@ impl WgpuRendererCore {
     fn record_frame(
         &mut self,
         scene: &Scene,
+        atlas_frame: &AtlasFrame,
         frame_view: &wgpu::TextureView,
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
@@ -1496,7 +1739,7 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
-        self.prepare_texture_bind_groups(scene);
+        self.prepare_texture_bind_groups(scene, atlas_frame);
 
         let mut encoder =
             self.resources()
@@ -1686,7 +1929,7 @@ impl WgpuRendererCore {
             })
     }
 
-    fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
+    fn prepare_texture_bind_groups(&mut self, scene: &Scene, atlas_frame: &AtlasFrame) {
         let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
         for batch in scene.batches() {
             let texture_id = match batch {
@@ -1705,7 +1948,7 @@ impl WgpuRendererCore {
             .retain(|texture_id, _| texture_ids.contains(texture_id));
 
         for texture_id in texture_ids {
-            let Some(texture_info) = self.atlas.get_texture_info(texture_id) else {
+            let Some(texture_info) = atlas_frame.texture_info(texture_id) else {
                 self.resources_mut()
                     .atlas_texture_bind_groups
                     .remove(&texture_id);
@@ -2113,7 +2356,10 @@ impl WgpuRenderer {
     /// (e.g. Android `TerminateWindow`) but you intend to re-create the
     /// surface later without losing cached atlas textures.
     pub fn unconfigure_surface(&mut self) {
-        self.state = match std::mem::replace(&mut self.state, RendererState::Released) {
+        self.surface_ready = false;
+        let mut target = self.shared.target.lock();
+        self.drop_queued_frame(&mut target);
+        target.state = match std::mem::replace(&mut target.state, RendererState::Released) {
             RendererState::Ready { core, surface } => {
                 drop(surface);
                 RendererState::Unconfigured { core }
@@ -2121,8 +2367,15 @@ impl WgpuRenderer {
             state @ (RendererState::Unconfigured { .. } | RendererState::Released) => state,
         };
         // Drop intermediate textures since they reference the old surface size.
-        if let Some(core) = self.core_mut() {
+        if let Some(core) = target.core_mut() {
             core.resources.invalidate_intermediate_textures();
+        }
+    }
+
+    /// Takes a frame back before it's drawn, keeping its uploads because the atlas lives on.
+    fn drop_queued_frame(&self, target: &mut RenderTarget) {
+        if let Some(mut frame) = self.shared.mailbox.take_pending() {
+            target.flush_uploads(&mut frame);
         }
     }
 
@@ -2150,20 +2403,27 @@ impl WgpuRenderer {
         let width = (config.size.width.0 as u32).max(1);
         let height = (config.size.height.0 as u32).max(1);
 
+        let mut guard = self.shared.target.lock();
+        let target = &mut *guard;
+        self.drop_queued_frame(target);
+        self.shared
+            .surface_generation
+            .fetch_add(1, Ordering::AcqRel);
+
         let alpha_mode = if config.transparent {
-            self.transparent_alpha_mode
+            target.transparent_alpha_mode
         } else {
-            self.opaque_alpha_mode
+            target.opaque_alpha_mode
         };
 
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.surface_config.alpha_mode = alpha_mode;
+        target.surface_config.width = width;
+        target.surface_config.height = height;
+        target.surface_config.alpha_mode = alpha_mode;
         if let Some(mode) = config.preferred_present_mode {
-            self.surface_config.present_mode = mode;
+            target.surface_config.present_mode = mode;
         }
 
-        let mut core = match std::mem::replace(&mut self.state, RendererState::Released) {
+        let mut core = match std::mem::replace(&mut target.state, RendererState::Released) {
             RendererState::Ready {
                 core,
                 surface: old_surface,
@@ -2173,12 +2433,14 @@ impl WgpuRenderer {
             }
             RendererState::Unconfigured { core } => core,
             RendererState::Released => {
+                self.surface_ready = false;
                 anyhow::bail!("Cannot replace the surface: GPU resources have been released")
             }
         };
-        surface.configure(&core.resources.device, &self.surface_config);
+        surface.configure(&core.resources.device, &target.surface_config);
         core.resources.invalidate_intermediate_textures();
-        self.state = RendererState::Ready { surface, core };
+        target.state = RendererState::Ready { surface, core };
+        self.surface_ready = true;
 
         Ok(())
     }
@@ -2186,7 +2448,20 @@ impl WgpuRenderer {
     pub fn destroy(&mut self) {
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
-        self.state = RendererState::Released;
+        self.surface_ready = false;
+        self.stop_render_thread();
+        self.shared.target.lock().state = RendererState::Released;
+    }
+
+    /// Returns once the render thread is gone. Nothing it could be waiting for needs the
+    /// main thread, so this can't hang on it.
+    fn stop_render_thread(&mut self) {
+        self.shared.mailbox.close();
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(thread) = self.render_thread.take() {
+            // If it panicked, that panic has already been reported.
+            thread.join().ok();
+        }
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.
@@ -2197,6 +2472,7 @@ impl WgpuRenderer {
     /// Returns true if a redraw is needed because GPU state was cleared.
     /// Calling this method clears the flag.
     pub fn needs_redraw(&mut self) -> bool {
+        self.apply_render_feedback();
         std::mem::take(&mut self.needs_redraw)
     }
 
@@ -2214,6 +2490,11 @@ impl WgpuRenderer {
     {
         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
 
+        // Rustcord: the frame waiting for the render thread was meant for the lost device,
+        // and so are its uploads. The render thread stays, it finds no work until the first
+        // frame for the new device.
+        self.shared.mailbox.take_pending();
+
         // Check if another window already recovered the context
         let needs_new_context = gpu_context
             .borrow()
@@ -2228,7 +2509,8 @@ impl WgpuRenderer {
             log::warn!("GPU device lost, recreating context...");
 
             // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
-            self.state = RendererState::Released;
+            self.surface_ready = false;
+            self.shared.target.lock().state = RendererState::Released;
             *gpu_context.borrow_mut() = None;
 
             // Wait briefly for the GPU driver to stabilize, then try to
@@ -2249,34 +2531,48 @@ impl WgpuRenderer {
             create_surface(instance, window_handle.as_raw())?
         };
 
-        let config = WgpuSurfaceConfig {
-            size: gpui::Size {
-                width: gpui::DevicePixels(self.surface_config.width as i32),
-                height: gpui::DevicePixels(self.surface_config.height as i32),
-            },
-            transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
-            preferred_present_mode: Some(self.surface_config.present_mode),
-        };
         let gpu_context = Rc::clone(gpu_context);
         let ctx_ref = gpu_context.borrow();
         let context = ctx_ref.as_ref().expect("context should exist");
 
-        self.state = RendererState::Released;
+        let mut target = self.shared.target.lock();
+        let config = WgpuSurfaceConfig {
+            size: gpui::Size {
+                width: gpui::DevicePixels(target.surface_config.width as i32),
+                height: gpui::DevicePixels(target.surface_config.height as i32),
+            },
+            transparent: target.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
+            preferred_present_mode: Some(target.surface_config.present_mode),
+        };
+        let is_bgr = target.is_bgr;
+
+        self.surface_ready = false;
+        target.state = RendererState::Released;
         self.atlas.handle_device_lost(context);
 
-        let is_bgr = self.is_bgr;
-        *self = Self::new_internal(
-            Some(gpu_context.clone()),
-            context,
-            surface,
-            config,
-            self.compositor_gpu,
-            self.atlas.clone(),
-        )?;
-        self.set_subpixel_layout(is_bgr);
+        let mut recovered = RenderTarget::new(context, surface, config)?;
+        recovered.is_bgr = is_bgr;
+        if let Some(core) = recovered.core_mut() {
+            core.is_bgr = is_bgr;
+        }
+        *target = recovered;
+        self.max_texture_size = context.device.limits().max_texture_dimension_2d;
+        self.device_errors = Arc::clone(context.errors());
+        self.surface_ready = true;
+        self.shared
+            .surface_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.shared.frame_failed.store(false, Ordering::Release);
+        self.shared.atlas_reset_wanted.store(false, Ordering::Release);
 
         log::info!("GPU recovery complete");
         Ok(())
+    }
+}
+
+impl Drop for WgpuRenderer {
+    fn drop(&mut self) {
+        self.stop_render_thread();
     }
 }
 
@@ -2309,6 +2605,7 @@ impl HeadlessRenderTarget {
 pub struct WgpuHeadlessRenderer {
     context: WgpuContext,
     core: WgpuRendererCore,
+    atlas: Arc<WgpuAtlas>,
     render_target: Option<HeadlessRenderTarget>,
     observed_error_generation: u64,
 }
@@ -2321,16 +2618,13 @@ impl WgpuHeadlessRenderer {
     pub fn new() -> anyhow::Result<Self> {
         let (context, target_format) = WgpuContext::new_headless()?;
         let atlas = Arc::new(WgpuAtlas::from_context(&context));
-        let core = WgpuRendererCore::new(
-            &context,
-            atlas,
-            target_format,
-            wgpu::CompositeAlphaMode::Opaque,
-        );
+        let core =
+            WgpuRendererCore::new(&context, target_format, wgpu::CompositeAlphaMode::Opaque);
 
         Ok(Self {
             context,
             core,
+            atlas,
             render_target: None,
             observed_error_generation: 0,
         })
@@ -2402,8 +2696,16 @@ impl WgpuHeadlessRenderer {
             .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
             .view
             .clone();
-        self.core
-            .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
+        let mut atlas_frame = AtlasFrame::default();
+        self.atlas.capture_frame(&mut atlas_frame);
+        self.core.render_frame(
+            scene,
+            &mut atlas_frame,
+            &view,
+            size,
+            false,
+            wgpu::Color::BLACK,
+        )?;
         Ok(())
     }
 
@@ -2538,7 +2840,7 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
     }
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
-        self.core.atlas.clone()
+        self.atlas.clone()
     }
 }
 
@@ -2686,6 +2988,245 @@ mod tests {
         assert_pixel(&image, 24, 16, RED);
         assert_pixel(&image, 40, 16, BLUE);
         assert_pixel(&image, 56, 16, BLUE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    const SPRITE_SIDE: i32 = 300;
+
+    /// Puts a picture of one colour in the atlas, `pixel` being in the atlas's BGRA order.
+    #[cfg(target_os = "linux")]
+    fn insert_picture(
+        atlas: &WgpuAtlas,
+        image_id: usize,
+        pixel: [u8; 4],
+    ) -> (gpui::AtlasKey, gpui::AtlasTile) {
+        use gpui::PlatformAtlas as _;
+        let key = gpui::AtlasKey::Image(gpui::RenderImageParams {
+            image_id: gpui::ImageId(image_id),
+            frame_index: 0,
+        });
+        let bytes = pixel.repeat((SPRITE_SIDE * SPRITE_SIDE) as usize);
+        let tile = atlas
+            .get_or_insert_with(key.clone(), &mut || {
+                Ok(Some((
+                    device_size(SPRITE_SIDE, SPRITE_SIDE),
+                    std::borrow::Cow::Owned(bytes.clone()),
+                )))
+            })
+            .expect("allocation should succeed")
+            .expect("callback returns Some");
+        (key, tile)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scene_with_sprite(tile: gpui::AtlasTile) -> Scene {
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: (SPRITE_SIDE as f32).into(),
+                height: (SPRITE_SIDE as f32).into(),
+            },
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false.into(),
+            opacity: 1.0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
+            tile,
+        });
+        scene.finish();
+        scene
+    }
+
+    /// Draws the way the render thread does: with the atlas as the frame captured it, not as
+    /// it is by now.
+    #[cfg(target_os = "linux")]
+    fn render_frame_to_image(
+        renderer: &mut WgpuHeadlessRenderer,
+        scene: &Scene,
+        atlas_frame: &mut AtlasFrame,
+    ) -> anyhow::Result<image::RgbaImage> {
+        let size = device_size(SPRITE_SIDE, SPRITE_SIDE);
+        renderer.ensure_render_target(size)?;
+        let view = renderer.render_target.as_ref().unwrap().view.clone();
+        renderer
+            .core
+            .render_frame(scene, atlas_frame, &view, size, false, wgpu::Color::BLACK)?;
+        renderer.read_image()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copied_scene_draws_the_same_and_buffers_get_reused() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(0.0, 0.0, 32.0, 32.0, gpui::red()));
+        scene.insert_primitive(solid_quad(8.0, 8.0, 16.0, 16.0, gpui::blue()));
+        scene.finish();
+
+        let mut copy = Scene::default();
+        scene.copy_primitives_into(&mut copy);
+        let size = device_size(32, 32);
+        let original = renderer.render_scene_to_image(&scene, size)?;
+        let copied = renderer.render_scene_to_image(&copy, size)?;
+        assert_eq!(original.as_raw(), copied.as_raw());
+
+        let quads = copy.quads.as_ptr();
+        scene.copy_primitives_into(&mut copy);
+        assert_eq!(copy.quads.as_ptr(), quads);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn frame_shows_its_own_picture_after_the_next_paint_replaced_it() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let atlas = renderer.atlas.clone();
+
+        let (red_key, red_tile) = insert_picture(&atlas, 1, [0, 0, 255, 255]);
+        let red_scene = scene_with_sprite(red_tile);
+        let mut red_frame = AtlasFrame::default();
+        atlas.capture_frame(&mut red_frame);
+
+        // While that frame waits for the render thread, the main thread paints on: the picture
+        // goes and another takes the same texture id.
+        gpui::PlatformAtlas::remove(&*atlas, &red_key);
+        let (_, blue_tile) = insert_picture(&atlas, 2, [255, 0, 0, 255]);
+        assert_eq!(blue_tile.texture_id, red_tile.texture_id);
+        let blue_scene = scene_with_sprite(blue_tile);
+        let mut blue_frame = AtlasFrame::default();
+        atlas.capture_frame(&mut blue_frame);
+
+        let image = render_frame_to_image(&mut renderer, &red_scene, &mut red_frame)?;
+        assert_pixel(&image, 150, 150, RED);
+        let image = render_frame_to_image(&mut renderer, &blue_scene, &mut blue_frame)?;
+        assert_pixel(&image, 150, 150, BLUE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn frame_drawn_instead_of_another_gets_its_uploads() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let atlas = renderer.atlas.clone();
+
+        let (_, tile) = insert_picture(&atlas, 1, [0, 0, 255, 255]);
+        let mut replaced = AtlasFrame::default();
+        atlas.capture_frame(&mut replaced);
+
+        // The next paint uploads nothing, but its scene still uses that tile.
+        let scene = scene_with_sprite(tile);
+        let mut drawn = AtlasFrame::default();
+        atlas.capture_frame(&mut drawn);
+        drawn.take_uploads_from(&mut replaced);
+
+        let image = render_frame_to_image(&mut renderer, &scene, &mut drawn)?;
+        assert_pixel(&image, 150, 150, RED);
+        Ok(())
+    }
+
+    /// The main thread paints as fast as it can, swapping a picture in the atlas every frame,
+    /// while another thread draws what comes through the mailbox the way the render thread
+    /// does. Every frame that gets drawn must show its own picture, whatever was replaced or
+    /// reused in the meantime, and nothing may hang or upset wgpu's validation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn frames_drawn_on_another_thread_show_their_own_pictures() -> anyhow::Result<()> {
+        struct TestFrame {
+            scene: Scene,
+            atlas: AtlasFrame,
+            expected: [u8; 4],
+            number: u32,
+        }
+        const FRAMES: u32 = 300;
+
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let atlas = renderer.atlas.clone();
+        let mailbox = Arc::new(FrameMailbox::<TestFrame>::new());
+        let drawing = {
+            let mailbox = mailbox.clone();
+            std::thread::spawn(move || -> anyhow::Result<(WgpuHeadlessRenderer, u32)> {
+                let mut drawn = 0;
+                while let Some(mut frame) = mailbox.wait() {
+                    let image =
+                        render_frame_to_image(&mut renderer, &frame.scene, &mut frame.atlas)?;
+                    assert_pixel(&image, 150, 150, frame.expected);
+                    renderer.check_gpu_errors()?;
+                    drawn += 1;
+                    if frame.number == FRAMES - 1 {
+                        break;
+                    }
+                }
+                Ok((renderer, drawn))
+            })
+        };
+
+        let mut previous = None;
+        for number in 0..FRAMES {
+            if let Some(key) = previous.take() {
+                gpui::PlatformAtlas::remove(&*atlas, &key);
+            }
+            let (pixel, expected) = if number % 2 == 0 {
+                ([0, 0, 255, 255], RED)
+            } else {
+                ([255, 0, 0, 255], BLUE)
+            };
+            let (key, tile) = insert_picture(&atlas, number as usize, pixel);
+            previous = Some(key);
+
+            let mut frame = TestFrame {
+                scene: scene_with_sprite(tile),
+                atlas: AtlasFrame::default(),
+                expected,
+                number,
+            };
+            atlas.capture_frame(&mut frame.atlas);
+            mailbox.post(frame, |older, newer| {
+                newer.atlas.take_uploads_from(&mut older.atlas);
+            });
+        }
+
+        let (_, drawn) = drawing.join().expect("the drawing thread panicked")?;
+        assert!(drawn >= 1 && drawn <= FRAMES);
+        Ok(())
+    }
+
+    /// What `WgpuRenderer::draw` costs the main thread, on a scene the size of a busy message
+    /// list. `cargo test --lib handoff_cost -- --ignored --nocapture`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn handoff_cost() -> anyhow::Result<()> {
+        let renderer = WgpuHeadlessRenderer::new()?;
+        let (_, tile) = insert_picture(&renderer.atlas, 1, [0, 0, 255, 255]);
+        let mut scene = Scene::default();
+        for i in 0..4000 {
+            let mut quad = solid_quad(i as f32, 0.0, 1.0, 1.0, gpui::red());
+            quad.order = i;
+            scene.quads.push(quad);
+        }
+        let sprite = scene_with_sprite(tile).polychrome_sprites[0].clone();
+        scene.polychrome_sprites = vec![sprite; 8000];
+
+        let mut frame = FramePacket::default();
+        let rounds = 500;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            scene.copy_primitives_into(&mut frame.scene);
+            renderer.atlas.capture_frame(&mut frame.atlas);
+            frame.atlas.reset();
+        }
+        println!(
+            "hand-off of {} quads and {} sprites: {:?} per frame",
+            scene.quads.len(),
+            scene.polychrome_sprites.len(),
+            start.elapsed() / rounds
+        );
         Ok(())
     }
 

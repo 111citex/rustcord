@@ -67,6 +67,7 @@ codegen-units = 16
 [patch.crates-io]
 gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
 cosmic-text = { path = "vendor/cosmic-text" }
 
 # One small addition to the input widget; see vendor/gpui-kit/README.md.

@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result};
+use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasBackend, AtlasKey, AtlasState, AtlasTextureId, AtlasTextureKind, AtlasTextureList,
@@ -32,8 +33,73 @@ pub struct WgpuAtlas(Mutex<AtlasState<WgpuAtlasTextures>>);
 
 struct PendingUpload {
     id: AtlasTextureId,
+    /// The texture itself and not just its id: the id can be given to a new texture
+    /// before the render thread gets to this upload.
+    texture: wgpu::Texture,
+    bytes_per_pixel: u32,
     bounds: Bounds<DevicePixels>,
     data: Vec<u8>,
+}
+
+/// Rustcord: the atlas as one frame needs it. The render thread draws a frame while the
+/// main thread is already painting the next one, which can remove tiles and hand their
+/// space or texture ids to something else. So a frame takes with it the uploads made up to
+/// its paint and the textures alive then, and sees exactly those.
+#[derive(Default)]
+pub struct AtlasFrame {
+    uploads: Vec<PendingUpload>,
+    textures: Option<Arc<FxHashMap<AtlasTextureId, WgpuTextureInfo>>>,
+}
+
+impl AtlasFrame {
+    /// Writes this frame's uploads to the queue. Doing it again does nothing.
+    pub fn flush_uploads(&mut self, queue: &wgpu::Queue) {
+        for upload in self.uploads.drain(..) {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &upload.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: upload.bounds.origin.x.0 as u32,
+                        y: upload.bounds.origin.y.0 as u32,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &upload.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(upload.bounds.size.width.0 as u32 * upload.bytes_per_pixel),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: upload.bounds.size.width.0 as u32,
+                    height: upload.bounds.size.height.0 as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    /// The texture behind `id` when this frame was painted, or `None` if every tile in it
+    /// was gone by then. See [`WgpuAtlas::capture_frame`].
+    pub fn texture_info(&self, id: AtlasTextureId) -> Option<&WgpuTextureInfo> {
+        self.textures.as_ref()?.get(&id)
+    }
+
+    /// This frame replaces `older`, which will never be drawn. The tiles in this frame's
+    /// scene can still depend on the uploads `older` carried, and those go first because a
+    /// later upload may reuse the same space.
+    pub fn take_uploads_from(&mut self, older: &mut AtlasFrame) {
+        older.uploads.append(&mut self.uploads);
+        std::mem::swap(&mut self.uploads, &mut older.uploads);
+    }
+
+    /// Lets go of the textures, keeping the buffers for the next frame.
+    pub fn reset(&mut self) {
+        self.uploads.clear();
+        self.textures = None;
+    }
 }
 
 struct WgpuAtlasTextures {
@@ -44,8 +110,11 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    /// What [`AtlasFrame`]s share, until the set of textures changes.
+    frame_textures: Option<Arc<FxHashMap<AtlasTextureId, WgpuTextureInfo>>>,
 }
 
+#[derive(Clone)]
 pub struct WgpuTextureInfo {
     pub view: wgpu::TextureView,
     /// Distinguishes new textures that reuse an [`AtlasTextureId`].
@@ -67,6 +136,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            frame_textures: None,
         })))
     }
 
@@ -78,15 +148,20 @@ impl WgpuAtlas {
         )
     }
 
-    pub fn before_frame(&self) {
+    /// Hands `frame` the uploads made since the last call and the textures alive now. Call
+    /// it for the frame that was just painted. A sprite whose texture isn't in there has
+    /// lost it: a scene can still reference such a texture when a cached view replays a
+    /// paint from before the image was dropped, so the renderer must skip those sprites
+    /// rather than assume the texture exists.
+    pub fn capture_frame(&self, frame: &mut AtlasFrame) {
         let mut lock = self.0.lock();
-        lock.backend.flush_uploads();
+        let backend = &mut lock.backend;
+        frame.uploads.append(&mut backend.pending_uploads);
+        frame.textures = Some(backend.frame_textures());
     }
 
-    /// Returns the view backing `id`, or `None` once every tile in it has been
-    /// removed. A scene can still reference such a texture when a cached view
-    /// replays a paint from before the image was dropped, so callers must skip
-    /// those sprites rather than assume the texture exists.
+    /// Returns the view backing `id`, or `None` once every tile in it has been removed.
+    #[cfg(test)]
     pub fn get_texture_info(&self, id: AtlasTextureId) -> Option<WgpuTextureInfo> {
         let lock = self.0.lock();
         let texture = lock.backend.storage.get(id)?;
@@ -103,6 +178,7 @@ impl WgpuAtlas {
         self.0.lock().clear(|textures| {
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.frame_textures = None;
         });
     }
 
@@ -116,6 +192,7 @@ impl WgpuAtlas {
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
+            textures.frame_textures = None;
         });
     }
 }
@@ -164,6 +241,7 @@ impl AtlasBackend for WgpuAtlasTextures {
                 gpui::frame_stats::ATLAS_TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 self.pending_uploads
                     .retain(|upload| upload.id != texture.id);
+                self.frame_textures = None;
                 self.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
@@ -221,6 +299,7 @@ impl WgpuAtlasTextures {
             AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
         };
 
+        self.frame_textures = None;
         let bytes = size.width.0 as u64 * size.height.0 as u64 * if matches!(kind, AtlasTextureKind::Monochrome) { 1 } else { 4 };
         gpui::frame_stats::add(&gpui::frame_stats::ATLAS_BYTES, bytes);
         gpui::frame_stats::add(&gpui::frame_stats::ATLAS_TEXTURES, 1);
@@ -278,47 +357,42 @@ impl WgpuAtlasTextures {
     }
 
     fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
-        let data = self
-            .storage
-            .get(id)
-            .map(|texture| swizzle_upload_data(bytes, texture.format))
-            .unwrap_or_else(|| bytes.to_vec());
-
-        self.pending_uploads
-            .push(PendingUpload { id, bounds, data });
+        let Some(texture) = self.storage.get(id) else {
+            return;
+        };
+        let upload = PendingUpload {
+            id,
+            texture: texture.texture.clone(),
+            bytes_per_pixel: texture.bytes_per_pixel() as u32,
+            bounds,
+            data: swizzle_upload_data(bytes, texture.format),
+        };
+        self.pending_uploads.push(upload);
     }
 
-    fn flush_uploads(&mut self) {
-        for upload in self.pending_uploads.drain(..) {
-            let Some(texture) = self.storage.get(upload.id) else {
-                continue;
-            };
-            let bytes_per_pixel = texture.bytes_per_pixel();
-
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: upload.bounds.origin.x.0 as u32,
-                        y: upload.bounds.origin.y.0 as u32,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &upload.data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(upload.bounds.size.width.0 as u32 * bytes_per_pixel as u32),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: upload.bounds.size.width.0 as u32,
-                    height: upload.bounds.size.height.0 as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
+    fn frame_textures(&mut self) -> Arc<FxHashMap<AtlasTextureId, WgpuTextureInfo>> {
+        if let Some(textures) = &self.frame_textures {
+            return textures.clone();
         }
+        let mut textures = FxHashMap::default();
+        for list in [
+            &self.storage.monochrome_textures,
+            &self.storage.subpixel_textures,
+            &self.storage.polychrome_textures,
+        ] {
+            for texture in list.textures.iter().flatten() {
+                textures.insert(
+                    texture.id,
+                    WgpuTextureInfo {
+                        view: texture.view.clone(),
+                        generation: texture.generation,
+                    },
+                );
+            }
+        }
+        let textures = Arc::new(textures);
+        self.frame_textures = Some(textures.clone());
+        textures
     }
 }
 
@@ -458,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn before_frame_skips_uploads_for_removed_texture() -> anyhow::Result<()> {
+    fn capture_skips_uploads_for_removed_texture() -> anyhow::Result<()> {
         let (device, queue) = test_device_and_queue()?;
 
         let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
@@ -477,7 +551,107 @@ mod tests {
             .get_or_insert_with(key.clone(), &mut build)?
             .expect("tile should be created");
         atlas.remove(&key);
-        atlas.before_frame();
+        let mut frame = AtlasFrame::default();
+        atlas.capture_frame(&mut frame);
+        assert!(frame.uploads.is_empty());
+        Ok(())
+    }
+
+    fn insert_image(atlas: &WgpuAtlas, image_id: usize, side: i32) -> (AtlasKey, AtlasTile) {
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(image_id),
+            frame_index: 0,
+        });
+        let size = Size {
+            width: DevicePixels(side),
+            height: DevicePixels(side),
+        };
+        let bytes = vec![0; side as usize * side as usize * 4];
+        let tile = atlas
+            .get_or_insert_with(key.clone(), &mut || Ok(Some((size, Cow::Owned(bytes.clone())))))
+            .expect("allocation should succeed")
+            .expect("callback returns Some");
+        (key, tile)
+    }
+
+    #[test]
+    fn frame_keeps_its_texture_after_the_next_paint_removes_it() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue.clone(), wgpu::TextureFormat::Bgra8Unorm);
+
+        let (key, first_tile) = insert_image(&atlas, 1, 700);
+        let mut painted = AtlasFrame::default();
+        atlas.capture_frame(&mut painted);
+        let first_generation = painted
+            .texture_info(first_tile.texture_id)
+            .context("the painted frame should see its texture")?
+            .generation;
+
+        // The main thread paints on while the frame above waits for the render thread: the
+        // image goes, and another one takes the same texture id.
+        atlas.remove(&key);
+        let (_, second_tile) = insert_image(&atlas, 2, 700);
+        assert_eq!(second_tile.texture_id, first_tile.texture_id);
+
+        assert_eq!(
+            painted
+                .texture_info(first_tile.texture_id)
+                .context("the texture should outlive its removal")?
+                .generation,
+            first_generation
+        );
+        assert_eq!(painted.uploads.len(), 1);
+        painted.flush_uploads(&queue);
+        assert!(painted.uploads.is_empty());
+
+        let mut next = AtlasFrame::default();
+        atlas.capture_frame(&mut next);
+        assert_eq!(next.uploads.len(), 1);
+        assert_ne!(
+            next.texture_info(second_tile.texture_id)
+                .context("the next frame should see the new texture")?
+                .generation,
+            first_generation
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_a_frame_keeps_its_uploads_first() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+
+        let (_, older_tile) = insert_image(&atlas, 1, 8);
+        let mut older = AtlasFrame::default();
+        atlas.capture_frame(&mut older);
+
+        let (_, newer_tile) = insert_image(&atlas, 2, 16);
+        let mut newer = AtlasFrame::default();
+        atlas.capture_frame(&mut newer);
+
+        newer.take_uploads_from(&mut older);
+        assert!(older.uploads.is_empty());
+        let bounds: Vec<_> = newer.uploads.iter().map(|upload| upload.bounds).collect();
+        assert_eq!(bounds, [older_tile.bounds, newer_tile.bounds]);
+        Ok(())
+    }
+
+    #[test]
+    fn frame_textures_follow_the_set_of_textures() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+
+        let (key, tile) = insert_image(&atlas, 1, 700);
+        let mut frame = AtlasFrame::default();
+        atlas.capture_frame(&mut frame);
+        let first = frame.textures.clone().context("captured")?;
+
+        atlas.capture_frame(&mut frame);
+        assert!(Arc::ptr_eq(&first, frame.textures.as_ref().context("captured")?));
+
+        atlas.remove(&key);
+        atlas.capture_frame(&mut frame);
+        assert!(frame.texture_info(tile.texture_id).is_none());
         Ok(())
     }
 

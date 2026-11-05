@@ -1198,7 +1198,9 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     postscript_name.contains("Emoji")
 }
 
-#[cfg(test)]
+// Rustcord: these want fonts from Zed's own tree, which isn't here. Without this cfg no test in
+// this crate could be built.
+#[cfg(all(test, rustcord_zed_fonts))]
 mod tests {
     use super::*;
     #[cfg(feature = "test-support")]

@@ -1,4 +1,5 @@
 mod cosmic_text_system;
+mod frame_mailbox;
 mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;

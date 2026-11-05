@@ -18,11 +18,14 @@ pub struct Draft {
     /// A message being edited, and its text so far.
     #[serde(default)]
     pub edit: Option<(Id, String)>,
+    /// Files waiting to be sent with it.
+    #[serde(default)]
+    pub files: Vec<crate::uploads::Pending>,
 }
 
 impl Draft {
     fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.edit.is_none()
+        self.text.is_empty() && self.edit.is_none() && self.files.is_empty()
     }
 }
 
@@ -93,6 +96,12 @@ fn change(drafts: &mut Drafts, channel: Id, f: impl FnOnce(&mut Draft)) -> bool 
 
 pub fn set_text(channel: Id, text: String, cx: &App) {
     if with(|d| change(d, channel, |draft| draft.text = text)) {
+        save_soon(cx);
+    }
+}
+
+pub fn set_files(channel: Id, files: Vec<crate::uploads::Pending>, cx: &App) {
+    if with(|d| change(d, channel, |draft| draft.files = files)) {
         save_soon(cx);
     }
 }

@@ -13,6 +13,11 @@ use crate::Stats;
 use crate::jitter::{Jitter, Next};
 use crate::sounds::{Bank, Clip, Sound};
 
+/// Discord's silence packets are this long, and don't count as speaking.
+const SILENCE_PACKET: usize = 3;
+/// How long after the last sound someone still counts as speaking.
+const SPEAKING_FOR: std::time::Duration = std::time::Duration::from_millis(350);
+
 const RATE: u32 = 48_000;
 /// Samples in 20 ms of stereo.
 const FRAME: usize = 960 * 2;
@@ -26,6 +31,8 @@ pub struct Speakers {
     queues: HashMap<u32, Jitter>,
     /// Whose each stream is, and how loud each person's wanted: 1 is as sent.
     users: HashMap<u32, u64>,
+    /// When real sound (not a silence packet) last came from each stream.
+    heard: HashMap<u32, Instant>,
     gains: HashMap<u64, f32>,
     pub bank: Bank,
     /// Sounds under way, and how far through each is.
@@ -34,12 +41,22 @@ pub struct Speakers {
 
 impl Speakers {
     pub fn push(&mut self, ssrc: u32, seq: u16, payload: Vec<u8>) {
+        if payload.len() > SILENCE_PACKET {
+            self.heard.insert(ssrc, Instant::now());
+        }
         self.queues.entry(ssrc).or_default().push(seq, payload);
     }
 
     pub fn remove(&mut self, ssrc: u32) {
         self.queues.remove(&ssrc);
         self.users.remove(&ssrc);
+        self.heard.remove(&ssrc);
+    }
+
+    /// Who's making sound right now.
+    pub fn speaking(&self) -> Vec<u64> {
+        let now = Instant::now();
+        self.heard.iter().filter(|(_, at)| now - **at < SPEAKING_FOR).filter_map(|(ssrc, _)| self.users.get(ssrc).copied()).collect()
     }
 
     pub fn play_sound(&mut self, sound: Sound) {
@@ -141,6 +158,47 @@ fn mix(speakers: &Mutex<Speakers>, voices: &mut HashMap<u32, Voice>, stats: &Sta
 }
 
 /// Starts playing on a thread of its own, until `stop`.
+/// Plays one sound on its own, in or out of a call.
+pub fn play_once(clip: Clip) {
+    let spawned = std::thread::Builder::new().name("sound".into()).spawn(move || {
+        if let Err(error) = sound_alone(&clip) {
+            tracing::warn!(%error, "couldn't play a sound");
+        }
+    });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "couldn't start a sound");
+    }
+}
+
+fn sound_alone(clip: &Clip) -> Result<(), String> {
+    let device = cpal::default_host().default_output_device().ok_or("no output device")?;
+    let default = device.default_output_config().map_err(|e| e.to_string())?;
+    let channels = usize::from(default.channels()).max(1);
+    let mut config: cpal::StreamConfig = default.into();
+    config.sample_rate = RATE;
+    let (samples, mut at) = (clip.clone(), 0usize);
+    let stream = device
+        .build_output_stream(
+            config,
+            move |data: &mut [f32], _| {
+                for frame in data.chunks_mut(channels) {
+                    let (left, right) = (samples.get(at).copied().unwrap_or(0.), samples.get(at + 1).copied().unwrap_or(0.));
+                    at += 2;
+                    for (i, sample) in frame.iter_mut().enumerate() {
+                        *sample = if i % 2 == 0 { left } else { right };
+                    }
+                }
+            },
+            |error| tracing::warn!(%error, "sound: output trouble"),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    stream.play().map_err(|e| e.to_string())?;
+    // Stereo at 48 kHz, and a little over so that the end isn't cut off.
+    std::thread::sleep(std::time::Duration::from_millis(clip.len() as u64 / 96 + 200));
+    Ok(())
+}
+
 pub fn start(speakers: Arc<Mutex<Speakers>>, stats: Arc<Stats>, deaf: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
     let spawned = std::thread::Builder::new().name("voice-playback".into()).spawn(move || {
         if let Err(error) = play(&speakers, &stats, &deaf, &stop) {

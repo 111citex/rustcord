@@ -77,6 +77,9 @@ pub struct Participant {
     pub avatar_url: String,
     pub muted: bool,
     pub deafened: bool,
+    /// Done to them by a moderator, not by themselves.
+    pub server_muted: bool,
+    pub server_deafened: bool,
     pub streaming: bool,
     /// Their display name style's font, and their server tag's badge.
     pub font: Option<&'static str>,
@@ -100,6 +103,8 @@ pub fn participants(cache: &Cache, guild: Id, channel: Id) -> Vec<Participant> {
                 },
                 muted: state.is_muted(),
                 deafened: state.is_deafened(),
+                server_muted: state.mute,
+                server_deafened: state.deaf,
                 streaming: state.self_stream,
                 font: user.and_then(|u| crate::name_fonts::family(u.extras.display_name_styles.as_ref()?.font_id)),
                 tag_badge: user.and_then(|u| u.server_tag()?.1),
@@ -107,7 +112,8 @@ pub fn participants(cache: &Cache, guild: Id, channel: Id) -> Vec<Participant> {
             }
         })
         .collect();
-    list.sort_by_cached_key(|p| (p.name.to_lowercase(), p.user_id));
+    // Whoever's sharing their screen goes first.
+    list.sort_by_cached_key(|p| (!p.streaming, p.name.to_lowercase(), p.user_id));
     list
 }
 
@@ -461,6 +467,7 @@ mod tests {
 
     fn ch(id: u64, kind: ChannelKind) -> Channel {
         Channel {
+            owner_id: None,
             id: Id(id), kind, guild_id: Some(Id(300)), name: Some(format!("c{id}")), position: 0, parent_id: None,
             last_message_id: None, recipient_ids: vec![], recipients: vec![], icon: None, permission_overwrites: vec![], topic: None,
         }
@@ -562,7 +569,7 @@ mod tests {
         let list = participants(&c, Id(300), Id(20));
         let shape: Vec<(&str, bool, bool, bool)> =
             list.iter().map(|p| (p.name.as_str(), p.muted, p.deafened, p.streaming)).collect();
-        assert_eq!(shape, [("kai", false, true, true), ("Zed", false, false, false), ("Lin", true, false, false)]);
+        assert_eq!(shape, [("kai", false, true, true), ("Lin", true, false, false), ("Zed", false, false, false)]);
         assert!(participants(&c, Id(300), Id(21)).is_empty());
     }
 

@@ -159,7 +159,7 @@ impl MembersPanel {
             stale_for: None,
             services,
             guild,
-            scroller: SmoothScroller::new(ScrollTarget::List(list.clone())),
+            scroller: SmoothScroller::new(ScrollTarget::List(list.clone())).calm_hover(),
             list,
             seen: Vec::new(),
             cards: Vec::new(),
@@ -473,6 +473,22 @@ fn pill(text: String, fill: Option<Hsla>, cx: &gpui_kit::App) -> AnyElement {
 
 const BOOST_PINK: u32 = 0xff73fa;
 
+/// The pointer's come to, or left, someone's row.
+fn hover_member(panel: &gpui_kit::WeakEntity<MembersPanel>, user: Id, guild: Id, video: Option<&str>, over: bool, cx: &mut gpui_kit::App) {
+    if over && let Some(url) = video {
+        crate::nameplates::warm(url, cx);
+    }
+    let id = over.then_some(user);
+    let _ = panel.update(cx, |panel, cx| {
+        let core = panel.services.core.clone();
+        crate::profile_preload::hover(user, Some(guild), over, &core, cx);
+        if panel.hovered != id {
+            panel.hovered = id;
+            cx.notify();
+        }
+    });
+}
+
 fn member_row(
     ix: usize,
     m: &ListMember,
@@ -480,6 +496,7 @@ fn member_row(
     colors: &[u32],
     hovered: bool,
     in_voice: bool,
+    owner: bool,
     panel: &gpui_kit::WeakEntity<MembersPanel>,
     cx: &gpui_kit::App,
 ) -> AnyElement {
@@ -508,20 +525,26 @@ fn member_row(
         .rounded(u(8.))
         .on_hover({
             let (panel, video) = (panel.clone(), nameplate_video.clone());
+            let row = gpui_kit::SharedString::from(format!("member-{user}"));
             move |over, _, cx| {
-                if *over && let Some(url) = &video {
-                    crate::nameplates::warm(url, cx);
-                }
-                let id = over.then_some(user);
                 let over = *over;
-                let _ = panel.update(cx, |panel, cx| {
-                    let core = panel.services.core.clone();
-                    crate::profile_preload::hover(user, Some(guild), over, &core, cx);
-                    if panel.hovered != id {
-                        panel.hovered = id;
-                        cx.notify();
+                // Rows passing under a moving pointer: no playing, no fetching. If it
+                // comes to rest on one, that one gets it all then.
+                if crate::smooth_scroll::list_scrolling() {
+                    let _ = panel.update(cx, |panel, cx| {
+                        if panel.hovered.take().is_some() {
+                            cx.notify();
+                        }
+                    });
+                    if over {
+                        let (panel, video) = (panel.clone(), video.clone());
+                        crate::smooth_scroll::after_scrolling(row.clone(), move |cx| hover_member(&panel, user, guild, video.as_deref(), true, cx));
+                    } else {
+                        crate::smooth_scroll::cancel_after_scrolling(&row);
                     }
-                });
+                    return;
+                }
+                hover_member(&panel, user, guild, video.as_deref(), over, cx);
             }
         })
         // A nameplate: the art behind the row, fading in from the left, animated
@@ -558,7 +581,7 @@ fn member_row(
         .items_center()
         .gap_3()
         .cursor_pointer()
-        .hover(|style| style.bg(theme.secondary_hover))
+        .when(!crate::smooth_scroll::list_scrolling(), |this| this.hover(|style| style.bg(theme.secondary_hover)))
         .when(offline, |this| this.opacity(0.45))
         .on_mouse_down(gpui_kit::MouseButton::Right, {
             let (panel, name) = (panel.clone(), list_name(m).to_string());
@@ -598,6 +621,7 @@ fn member_row(
                             }
                             None => this.when_some(m.tag.clone(), |this, tag| this.child(pill(tag, None, cx))),
                         })
+                        .when(owner, |this| this.child(crate::badges::owner_crown()))
                         // Discord's member list shows the boost gem, not role icons.
                         .when(m.booster, |this| {
                             this.child(
@@ -814,7 +838,7 @@ impl Render for MembersPanel {
                 Some(ListItem::Member(m)) if cache.member_list_stale_for().is_some_and(|channel| !cache.member_can_see(channel, m.user.id)) => div().into_any_element(),
                 Some(ListItem::Member(m)) => {
                     let in_voice = cache.voice_state(guild, m.user.id).is_some_and(|v| v.channel_id.is_some());
-                    member_row(row_ix, m, guild, &cache.member_colors(guild, m.user.id), hovered == Some(m.user.id), in_voice, &panel, cx)
+                    member_row(row_ix, m, guild, &cache.member_colors(guild, m.user.id), hovered == Some(m.user.id), in_voice, cache.guild(guild).and_then(|g| g.owner_id) == Some(m.user.id), &panel, cx)
                 }
                 Some(ListItem::Unknown) => div().into_any_element(),
                 None => {

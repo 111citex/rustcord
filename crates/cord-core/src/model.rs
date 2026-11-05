@@ -260,6 +260,12 @@ impl User {
         Some((tag, badge))
     }
 
+    /// Their avatar decoration, sharp at `size` pixels, for where it's shown large.
+    pub fn decoration_url_at(&self, size: u32) -> Option<String> {
+        let asset = &self.extras.avatar_decoration_data.as_ref()?.asset;
+        (!asset.is_empty()).then(|| format!("https://cdn.discordapp.com/avatar-decoration-presets/{asset}.png?size={size}&passthrough=false"))
+    }
+
     pub fn decoration_url(&self) -> Option<String> {
         let asset = &self.extras.avatar_decoration_data.as_ref()?.asset;
         (!asset.is_empty()).then(|| format!("https://cdn.discordapp.com/avatar-decoration-presets/{asset}.png?size=96&passthrough=false"))
@@ -350,6 +356,8 @@ pub struct Channel {
     pub last_message_id: Option<Id>,
     pub recipient_ids: Vec<Id>,
     pub recipients: Vec<User>,
+    /// Who owns a group DM.
+    pub owner_id: Option<Id>,
     /// A group DM's picture (`channel-icons/{id}/{hash}`).
     pub icon: Option<String>,
     pub permission_overwrites: Vec<PermissionOverwrite>,
@@ -359,6 +367,8 @@ pub struct Channel {
 
 #[derive(Deserialize)]
 struct RawChannel {
+    #[serde(default)]
+    owner_id: Option<Id>,
     id: Id,
     #[serde(rename = "type")]
     kind: ChannelKind,
@@ -402,6 +412,7 @@ impl<'de> Deserialize<'de> for Channel {
             last_message_id: r.last_message_id,
             recipient_ids,
             recipients: r.recipients,
+            owner_id: r.owner_id,
             icon: r.icon,
             permission_overwrites: r.permission_overwrites,
             topic: r.topic.filter(|t| !t.trim().is_empty()),
@@ -564,6 +575,14 @@ impl<'de> Deserialize<'de> for Guild {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct MessageCall {
+    #[serde(default)]
+    pub participants: Vec<Id>,
+    #[serde(default)]
+    pub ended_timestamp: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct Message {
     pub id: Id,
@@ -596,6 +615,9 @@ pub struct Message {
     pub components: Vec<Component>,
     #[serde(default)]
     pub message_reference: Option<MessageReference>,
+    /// On a call's message: who was in it, and when it ended.
+    #[serde(default)]
+    pub call: Option<MessageCall>,
     /// The message a reply answers, when Discord included it (null when that
     /// message was deleted, absent when it wasn't fetched).
     #[serde(default, deserialize_with = "lenient_boxed")]
@@ -794,6 +816,9 @@ pub struct Ready {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct Relationship {
     pub id: Id,
+    /// 1 is a friend; the rest are requests and blocks, which aren't.
+    #[serde(default, rename = "type")]
+    pub kind: u8,
     #[serde(default)]
     pub nickname: Option<String>,
     /// When you became friends, ISO 8601.
@@ -816,6 +841,8 @@ pub struct GuildSettings {
     pub guild_id: Option<Id>,
     #[serde(default)]
     pub muted: bool,
+    #[serde(default)]
+    pub mute_config: Option<MuteConfig>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub channel_overrides: Vec<ChannelOverride>,
 }
@@ -825,6 +852,23 @@ pub struct ChannelOverride {
     pub channel_id: Id,
     #[serde(default)]
     pub muted: bool,
+    #[serde(default)]
+    pub mute_config: Option<MuteConfig>,
+}
+
+/// How long a mute lasts. Discord leaves `muted` set after it's over: only the end says so.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct MuteConfig {
+    #[serde(default)]
+    pub end_time: Option<String>,
+}
+
+impl MuteConfig {
+    /// The moment it ends, in milliseconds; `None` if it never does.
+    pub fn ends_at(config: Option<&MuteConfig>) -> Option<i64> {
+        let end = config?.end_time.as_deref()?;
+        Some(chrono::DateTime::parse_from_rfc3339(end).ok()?.timestamp_millis())
+    }
 }
 
 /// How far the account has read in each channel (READY's `read_state`).

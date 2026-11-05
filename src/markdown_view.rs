@@ -179,6 +179,7 @@ fn label(run: &Run, env: &Env, now: &chrono::DateTime<chrono::Local>) -> Option<
             None => "@deleted-role".into(),
         },
         Content::Channel(id) => env.channel_label(*id),
+        Content::MessageLink { channel, .. } => format!("# {} \u{203a} \u{1f4ac}", env.cache.channel(*channel).map_or_else(|| "unknown".to_string(), |c| crate::nav::channel_label(env.cache, c))),
         Content::Command(name) => name.clone(),
         Content::Everyone(word) => word.to_string(),
         Content::Timestamp { unix, style } => markdown::format_timestamp(*unix, *style, now),
@@ -206,9 +207,12 @@ fn look(run: &Run, env: &Env, cx: &App) -> Look {
     match &run.content {
         // User and channel mentions are always Discord's blurple pill
         // (measured: #5865f2 at 24% behind light-blurple text).
-        Content::User(_) | Content::Channel(_) | Content::Command(_) => {
+        Content::User(_) | Content::Channel(_) | Content::Command(_) | Content::MessageLink { .. } => {
             look.color = Some(rgb(MENTION_TEXT));
             look.background = Some(rgb(0x5865f2).opacity(0.24));
+            if let Content::MessageLink { url, .. } = &run.content {
+                look.click = Some(Click::Open(url.clone()));
+            }
             if let Content::User(id) = &run.content {
                 look.click = Some(Click::User(*id));
             }

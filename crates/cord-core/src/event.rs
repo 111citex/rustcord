@@ -68,7 +68,7 @@ pub enum CoreEvent {
     /// Someone's nickname, server avatar or roles changed (or they joined).
     MemberUpsert { guild_id: Id, member: Member },
     /// Members sent back for a gateway member search (op 8).
-    MembersChunk { guild_id: Id, members: Vec<Member> },
+    MembersChunk { guild_id: Id, members: Vec<Member>, presences: Vec<(Id, crate::member_list::UserPresence)> },
     /// A change to the member list the app subscribed to.
     MemberListUpdate(Box<MemberListUpdate>),
     /// Someone joined, left, moved or muted in a voice channel of a server.
@@ -176,6 +176,24 @@ struct MembersChunk {
     guild_id: Id,
     #[serde(default)]
     members: Vec<Member>,
+    #[serde(default)]
+    presences: Vec<ChunkPresence>,
+}
+
+#[derive(Deserialize)]
+struct ChunkPresence {
+    user: PartialUserId,
+    #[serde(default)]
+    status: crate::member_list::Status,
+    #[serde(default)]
+    activities: Vec<serde_json::Value>,
+    #[serde(default)]
+    client_status: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct PartialUserId {
+    id: Id,
 }
 
 #[derive(Deserialize)]
@@ -472,7 +490,11 @@ pub fn decode_dispatch(t: &str, d: Value) -> Option<CoreEvent> {
         "GUILD_MEMBER_ADD" | "GUILD_MEMBER_UPDATE" => {
             from_value::<MemberEvent>(d).map(|m| CoreEvent::MemberUpsert { guild_id: m.guild_id, member: m.member })
         }
-        "GUILD_MEMBERS_CHUNK" => from_value::<MembersChunk>(d).map(|c| CoreEvent::MembersChunk { guild_id: c.guild_id, members: c.members }),
+        "GUILD_MEMBERS_CHUNK" => from_value::<MembersChunk>(d).map(|c| CoreEvent::MembersChunk {
+            guild_id: c.guild_id,
+            members: c.members,
+            presences: c.presences.into_iter().map(|p| (p.user.id, crate::member_list::UserPresence::new(p.status, &p.activities, &p.client_status))).collect(),
+        }),
         "GUILD_MEMBER_LIST_UPDATE" => from_value(d).map(|u| CoreEvent::MemberListUpdate(Box::new(u))),
         "CHANNEL_RECIPIENT_ADD" => from_value::<RecipientEvent>(d).map(|e| CoreEvent::RecipientAdd { channel_id: e.channel_id, user: e.user }),
         "CHANNEL_RECIPIENT_REMOVE" => from_value::<RecipientEvent>(d).map(|e| CoreEvent::RecipientRemove { channel_id: e.channel_id, user_id: e.user.id }),

@@ -7,7 +7,9 @@
 static ALLOCATOR: perf::CountingAlloc = perf::CountingAlloc;
 
 mod animated;
+mod add_people;
 mod confirm;
+mod discord_icons;
 mod emoji_card;
 mod font_pages;
 mod image_disk;
@@ -50,6 +52,7 @@ mod router;
 mod settings;
 mod shell;
 mod sidebar;
+mod slider;
 mod smooth_scroll;
 mod stickers;
 mod store;

@@ -48,6 +48,10 @@ fn close(cx: &mut App) {
 }
 
 /// The question, if there is one.
+pub fn is_open(cx: &App) -> bool {
+    cx.has_global::<Asking>()
+}
+
 pub fn overlay(window: &Window, cx: &App) -> Option<AnyElement> {
     let asking = cx.try_global::<Asking>()?;
     let theme = cx.theme();

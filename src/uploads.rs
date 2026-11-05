@@ -90,7 +90,7 @@ pub fn status_line(sent: u64, total: u64, secs: f32) -> String {
     format!("{percent}%  \u{2022}  {}/s  \u{2022}  {time}  \u{2022}  {size}", megabytes(speed as u64))
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Pending {
     pub name: String,
     pub mime: String,

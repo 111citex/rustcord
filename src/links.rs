@@ -41,17 +41,25 @@ pub fn open(url: &str, cx: &mut App) {
 struct PendingProfile {
     user: Id,
     position: gpui_kit::Point<gpui_kit::Pixels>,
+    /// From a menu: always opens. A click on someone's row toggles.
+    always: bool,
 }
 
 impl Global for PendingProfile {}
 
 pub fn open_profile(user: Id, position: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut App) {
-    cx.set_global(PendingProfile { user, position });
+    cx.set_global(PendingProfile { user, position, always: false });
     cx.refresh_windows();
 }
 
-pub fn take_profile(cx: &mut App) -> Option<(Id, gpui_kit::Point<gpui_kit::Pixels>)> {
-    let pending = cx.try_global::<PendingProfile>().map(|p| (p.user, p.position))?;
+/// Their card, whether or not it was just open: someone asked for it from a menu.
+pub fn show_profile(user: Id, position: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut App) {
+    cx.set_global(PendingProfile { user, position, always: true });
+    cx.refresh_windows();
+}
+
+pub fn take_profile(cx: &mut App) -> Option<(Id, gpui_kit::Point<gpui_kit::Pixels>, bool)> {
+    let pending = cx.try_global::<PendingProfile>().map(|p| (p.user, p.position, p.always))?;
     cx.remove_global::<PendingProfile>();
     Some(pending)
 }
@@ -64,7 +72,7 @@ pub fn take_jump(channel: Id, cx: &mut App) -> Option<Id> {
 }
 
 /// `…/channels/<guild>/<channel>/<message>` → (channel, message).
-fn linked_message(url: &str) -> Option<(Id, Id)> {
+pub fn linked_message(url: &str) -> Option<(Id, Id)> {
     let path = url.split(['?', '#']).next()?;
     let mut parts = path.rsplit('/');
     let message = parts.next()?.parse().ok()?;

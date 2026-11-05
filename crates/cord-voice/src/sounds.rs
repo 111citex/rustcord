@@ -16,6 +16,8 @@ pub enum Sound {
     SomeoneLeft,
     Deafened,
     Undeafened,
+    StreamStarted,
+    StreamEnded,
 }
 
 /// Stereo samples at 48 kHz.
@@ -46,6 +48,8 @@ pub fn fallback(sound: Sound) -> Clip {
         Sound::SomeoneLeft => tones(&[(880., 0.09), (660., 0.14)]),
         Sound::Deafened => tones(&[(520., 0.07), (390., 0.11)]),
         Sound::Undeafened => tones(&[(390., 0.07), (520., 0.11)]),
+        Sound::StreamStarted => tones(&[(520., 0.08), (780., 0.14)]),
+        Sound::StreamEnded => tones(&[(780., 0.08), (520., 0.14)]),
     }
 }
 

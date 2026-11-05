@@ -112,40 +112,16 @@ fn set_volume(url: &str, level: f32, cx: &mut App) {
 
 /// The volume button, with Discord's upright slider while the pointer's on either.
 fn volume_button(id: SharedString, a: &Attachment, muted: bool, cx: &App) -> impl IntoElement {
-    const STEPS: usize = 20;
+    const HEIGHT: f32 = 100.;
     let theme = cx.theme();
     let open = OVER_BUTTON.with_borrow(|b| b.as_ref() == Some(&id)) || OVER_SLIDER.with_borrow(|s| s.as_ref() == Some(&id));
     let muted = muted || MUTED.get();
     let level = if muted { 0. } else { VOLUME.get() };
     let url = a.url.clone();
     let blurple = gpui_kit::Hsla::from(gpui_kit::rgb(0x5865f2));
-    let cells = (0..STEPS).map(|i| {
-        // Top cell is full volume.
-        let at = (STEPS - i) as f32 / STEPS as f32;
-        let (down, moved) = (url.clone(), url.clone());
-        div()
-            .w_full()
-            .h(u(5.))
-            .flex()
-            .justify_center()
-            .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
-                cx.stop_propagation();
-                set_volume(&down, at, cx);
-            })
-            .on_mouse_move(move |event: &gpui_kit::MouseMoveEvent, _, cx| {
-                if event.pressed_button == Some(gpui_kit::MouseButton::Left) {
-                    set_volume(&moved, at, cx);
-                }
-            })
-            .child(
-                div()
-                    .w(u(6.))
-                    .h_full()
-                    .when(i == 0, |d| d.rounded_t(u(3.)))
-                    .when(i == STEPS - 1, |d| d.rounded_b(u(3.)))
-                    .bg(if at <= level + 0.001 { blurple } else { theme.muted_foreground.opacity(0.3) }),
-            )
-    });
+    let slider_id: SharedString = format!("{id}-track").into();
+    let open = open || crate::slider::dragging(&slider_id);
+    let change: std::rc::Rc<dyn Fn(f32, &mut App)> = std::rc::Rc::new(move |at, cx| set_volume(&url, at, cx));
     let (hover_button, hover_slider) = (id.clone(), id.clone());
     let toggle_url = a.url.clone();
     div()
@@ -204,20 +180,7 @@ fn volume_button(id: SharedString, a: &Attachment, muted: bool, cx: &App) -> imp
                             .bg(theme.popover)
                             .shadow_md()
                             .child(
-                                div()
-                                    .relative()
-                                    .w_full()
-                                    .h(u(STEPS as f32 * 5.))
-                                    .children(cells)
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .top(u((1. - level) * STEPS as f32 * 5. - 6.))
-                                            .left(u(9.))
-                                            .size(u(12.))
-                                            .rounded_full()
-                                            .bg(gpui_kit::white()),
-                                    ),
+                                div().w_full().h(u(HEIGHT)).child(crate::slider::slider(slider_id, level, true, blurple, theme.muted_foreground.opacity(0.3), change)),
                             ),
                     ),
                 )

@@ -211,11 +211,49 @@ pub struct SmoothScroller {
     state: Rc<RefCell<State>>,
     /// Lives inside a full profile, so that being open doesn't silence it.
     in_modal: bool,
+    /// A list whose rows do something when hovered: not while it's moving under the pointer.
+    calm_hover: bool,
+}
+
+/// How long after the last movement a list counts as still scrolling.
+const SETTLE: Duration = Duration::from_millis(180);
+
+/// What the row left under the pointer wants done, and whose it is.
+type AfterScrolling = (gpui_kit::SharedString, Box<dyn FnOnce(&mut gpui_kit::App)>);
+
+thread_local! {
+    static SCROLLING_UNTIL: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static AFTER_SCROLLING: RefCell<Option<AfterScrolling>> = const { RefCell::new(None) };
+}
+
+/// Whether a list with hover effects is moving under the pointer. Rows pass by far too
+/// fast for those to mean anything, and each costs a redraw and maybe a download.
+pub fn list_scrolling() -> bool {
+    SCROLLING_UNTIL.get().is_some_and(|until| Instant::now() < until)
+}
+
+/// Does `action` once the list stops, if the pointer's still on row `id` by then.
+pub fn after_scrolling(id: gpui_kit::SharedString, action: impl FnOnce(&mut gpui_kit::App) + 'static) {
+    AFTER_SCROLLING.set(Some((id, Box::new(action))));
+}
+
+/// The pointer's left row `id`: whatever it wanted is off.
+pub fn cancel_after_scrolling(id: &gpui_kit::SharedString) {
+    AFTER_SCROLLING.with_borrow_mut(|after| {
+        if after.as_ref().is_some_and(|(row, _)| row == id) {
+            *after = None;
+        }
+    });
 }
 
 impl SmoothScroller {
     pub fn new(target: ScrollTarget) -> Self {
-        SmoothScroller { target, state: Rc::default(), in_modal: false }
+        SmoothScroller { target, state: Rc::default(), in_modal: false, calm_hover: false }
+    }
+
+    pub fn calm_hover(mut self) -> Self {
+        self.calm_hover = true;
+        self
     }
 
     pub fn in_modal(mut self) -> Self {
@@ -245,7 +283,26 @@ impl SmoothScroller {
         canvas(
             // Moves before painting: put ahead of the scroll view, the frame shows
             // this step instead of the last one.
-            move |_, window, _| {
+            move |_, window, cx| {
+                if stepper.calm_hover {
+                    if stepper.state.borrow().glide.is_active() {
+                        SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
+                    } else if let Some(until) = SCROLLING_UNTIL.get() {
+                        if Instant::now() < until {
+                            window.request_animation_frame();
+                        } else {
+                            SCROLLING_UNTIL.set(None);
+                            let after = AFTER_SCROLLING.take();
+                            cx.defer(move |cx| {
+                                if let Some((_, action)) = after {
+                                    action(cx);
+                                }
+                            });
+                            // Once more with hover back on.
+                            window.request_animation_frame();
+                        }
+                    }
+                }
                 let mut state = stepper.state.borrow_mut();
                 if state.glide.is_active() {
                     let now = Instant::now();
@@ -272,7 +329,7 @@ impl SmoothScroller {
                         return;
                     }
                     // The picture viewer or a full profile is over everything: the wheel is theirs.
-                    if crate::viewer::is_open(cx) || (crate::profile_card::full_open() && !this.in_modal) {
+                    if crate::viewer::is_open(cx) || crate::confirm::is_open(cx) || ((crate::add_people::is_open(cx) || crate::profile_card::full_open()) && !this.in_modal) {
                         return;
                     }
                     let ScrollDelta::Lines(lines) = event.delta else { return };
@@ -280,6 +337,9 @@ impl SmoothScroller {
                     // Only actual scrolling moves a card out of the way.
                     if this.target.can_move(-lines.y) {
                         crate::profile_card::note_wheel(lines.y.abs(), cx);
+                    }
+                    if this.calm_hover {
+                        SCROLLING_UNTIL.set(Some(Instant::now() + SETTLE));
                     }
                     this.state.borrow_mut().glide.add(-lines.y * LINE_PX);
                     // This view alone: a window refresh redraws the other lists too.

@@ -103,6 +103,11 @@ pub struct CacheStats {
     pub messages: usize,
 }
 
+/// Whether `id` is muted right now: a timed mute is over once its end has passed.
+fn still_muted(muted: &std::collections::HashMap<Id, Option<i64>>, id: Id) -> bool {
+    muted.get(&id).is_some_and(|end| end.is_none_or(|end| end > chrono::Utc::now().timestamp_millis()))
+}
+
 #[derive(Default)]
 pub struct Cache {
     me: Option<User>,
@@ -140,8 +145,9 @@ pub struct Cache {
     /// Channel → how far we've read it and how many pings wait there.
     read: HashMap<Id, ReadMark>,
     /// Muted servers, and muted channels (by channel id).
-    muted_guilds: std::collections::HashSet<Id>,
-    muted_channels: std::collections::HashSet<Id>,
+    /// What's muted and when that ends (`None`: when it's undone).
+    muted_guilds: std::collections::HashMap<Id, Option<i64>>,
+    muted_channels: std::collections::HashMap<Id, Option<i64>>,
     /// The server rail's folders, in order (see `settings_proto`).
     folders: Vec<GuildFolder>,
     /// Voice channels' status text and when they started, ms since 1970.
@@ -207,7 +213,7 @@ impl Cache {
 
     /// Newer messages than we've read, in a channel that isn't muted.
     pub fn is_unread(&self, channel: Id) -> bool {
-        if self.muted_channels.contains(&channel) {
+        if still_muted(&self.muted_channels, channel) {
             return false;
         }
         let Some(last) = self.channels.get(&channel).and_then(|c| c.last_message_id) else { return false };
@@ -228,7 +234,7 @@ impl Cache {
 
     /// The server's unread channel with the newest message, unless the server is muted.
     pub fn newest_unread_channel(&self, guild: Id) -> Option<&Channel> {
-        if self.muted_guilds.contains(&guild) {
+        if still_muted(&self.muted_guilds, guild) {
             return None;
         }
         self.channels
@@ -240,7 +246,7 @@ impl Cache {
     /// Whether the server's rail icon gets the unread pill: some readable,
     /// unmuted channel has news, and the server itself isn't muted.
     pub fn guild_unread(&self, guild: Id) -> bool {
-        !self.muted_guilds.contains(&guild)
+        !still_muted(&self.muted_guilds, guild)
             && self.channels.values().any(|c| {
                 c.guild_id == Some(guild) && self.is_unread(c.id) && self.can_view(c.id)
             })
@@ -764,7 +770,7 @@ impl Cache {
 
     /// Muted, the channel or its server.
     pub fn is_muted(&self, channel: Id) -> bool {
-        self.muted_channels.contains(&channel) || self.channels.get(&channel).and_then(|c| c.guild_id).is_some_and(|g| self.muted_guilds.contains(&g))
+        still_muted(&self.muted_channels, channel) || self.channels.get(&channel).and_then(|c| c.guild_id).is_some_and(|g| still_muted(&self.muted_guilds, g))
     }
 
     /// Whether the user may ping @everyone, @here and any role in `channel`.
@@ -1156,12 +1162,12 @@ impl Cache {
                 }
                 for g in ready.user_guild_settings.entries {
                     if let (Some(guild), true) = (g.guild_id, g.muted) {
-                        self.muted_guilds.insert(guild);
+                        self.muted_guilds.insert(guild, crate::model::MuteConfig::ends_at(g.mute_config.as_ref()));
                     }
-                    self.muted_channels.extend(g.channel_overrides.iter().filter(|o| o.muted).map(|o| o.channel_id));
+                    self.muted_channels.extend(g.channel_overrides.iter().filter(|o| o.muted).map(|o| (o.channel_id, crate::model::MuteConfig::ends_at(o.mute_config.as_ref()))));
                 }
                 self.set_own_presence(&ready.sessions);
-                self.friends_since = ready.relationships.iter().filter_map(|r| Some((r.id, r.since.clone()?))).collect();
+                self.friends_since = ready.relationships.iter().filter(|r| r.kind == 1).filter_map(|r| Some((r.id, r.since.clone()?))).collect();
                 self.friend_nicks = ready.relationships.into_iter().filter_map(|r| Some((r.id, r.nickname?))).collect();
                 self.folders = ready.user_settings_proto.as_deref().map(settings_proto::guild_folders).unwrap_or_default();
                 tracing::info!(
@@ -1430,9 +1436,13 @@ impl Cache {
                 }
             }
             CoreEvent::MemberUpsert { guild_id, member } => self.insert_member(guild_id, member),
-            CoreEvent::MembersChunk { guild_id, members } => {
+            CoreEvent::MembersChunk { guild_id, members, presences } => {
                 for member in members {
                     self.insert_member(guild_id, member);
+                }
+                if !presences.is_empty() {
+                    self.presences.extend(presences);
+                    self.bump_sidebar();
                 }
             }
             CoreEvent::VoiceStateUpdate { guild_id, state, member } => {
@@ -1504,7 +1514,7 @@ mod tests {
     fn channel(id: u64, guild: Option<u64>, kind: ChannelKind, last: Option<u64>) -> Channel {
         Channel {
             id: Id(id), kind, guild_id: guild.map(Id), name: Some(format!("c{id}")), position: 0,
-            parent_id: None, last_message_id: last.map(Id), recipient_ids: vec![], recipients: vec![], icon: None,
+            parent_id: None, last_message_id: last.map(Id), recipient_ids: vec![], recipients: vec![], owner_id: None, icon: None,
             permission_overwrites: vec![], topic: None,
         }
     }
@@ -1515,7 +1525,7 @@ mod tests {
             id: Id(id), channel_id: Id(channel), guild_id: None, author: user(2, "lin"),
             content: format!("m{id}"), timestamp: String::new(), edited_timestamp: None, poll: None, interaction: None, interaction_metadata: None, message_snapshots: Vec::new(),
             nonce: None, attachments: vec![], member: None,
-            kind: 0, flags: 0, embeds: vec![], components: vec![], message_reference: None,
+            kind: 0, flags: 0, embeds: vec![], components: vec![], message_reference: None, call: None,
             referenced_message: None, sticker_items: vec![], mentions: vec![], reactions: vec![], mention_everyone: false, mention_roles: vec![],
         }
     }

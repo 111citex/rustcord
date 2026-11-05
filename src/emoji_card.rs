@@ -180,15 +180,17 @@ pub fn toggle(subject: Subject, here: Option<Id>, position: Point<Pixels>, cx: &
 
 /// `element`, opening the card for `subject` when clicked.
 pub fn clickable(element: AnyElement, id: SharedString, subject: Subject, here: Option<Id>) -> AnyElement {
-    div()
+    let spot = crate::markdown_view::NameSpot::default();
+    let target = spot.clone();
+    crate::markdown_view::spotted(&spot, div()
         .id(id)
         .flex_shrink_0()
         .cursor_pointer()
         .on_click(move |event, _, cx| {
             cx.stop_propagation();
-            toggle(subject.clone(), here, event.position(), cx);
+            toggle(subject.clone(), here, crate::markdown_view::card_at(&target, event.position()), cx);
         })
-        .child(element)
+        .child(element))
         .into_any_element()
 }
 
@@ -213,7 +215,7 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
     let card = v_flex()
         .id("emoji-card")
         .occlude()
-        .w(u(360.))
+        .w(u(300.))
         .rounded(u(8.))
         .border_1()
         .border_color(theme.border)

@@ -60,7 +60,7 @@ pub struct ChannelPage {
     left_tail: bool,
     /// A linked message to scroll to once it's loaded, and how many older
     /// pages were fetched looking for it.
-    jump_target: Option<(Id, u8)>,
+    jump_target: Option<(Id, u16)>,
     /// The message lit up after jumping to it, and which jump that was: a
     /// repeat click replays the glow.
     highlight: Rc<std::cell::Cell<Option<(Id, usize)>>>,
@@ -90,10 +90,6 @@ pub struct ChannelPage {
     /// Where the view was last frame: its top row, and how far into it.
     anchor: Option<Option<(Id, f32)>>,
     was_gliding: std::cell::Cell<bool>,
-    /// New messages not measured yet, to slide in when they are.
-    slide_pending: Option<usize>,
-    /// When new messages began rising in, from how far, and the list's usual height.
-    slide: Option<(std::time::Instant, f32, f32)>,
     /// A row being jumped to, and how many more times to check it landed in full.
     jump_settle: Option<(usize, u8)>,
     vc_chat_width: f32,
@@ -337,7 +333,12 @@ impl ChannelPage {
                     let _ = page.update(cx, |page, cx| {
                         if page.suggest.is_none() {
                             // Up in an empty box: edit our latest message.
-                            if key == "up" && page.editing.is_none() && page.input.read(cx).value().is_empty() && page.pending.is_empty() {
+                            let in_box = gpui_kit::Focusable::focus_handle(page.input.read(cx), cx).is_focused(window);
+                            // Whatever's on top of the page gets Esc first, and handles it itself.
+                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx)) {
+                                return;
+                            }
+                            if key == "up" && in_box && page.editing.is_none() && page.input.read(cx).value().is_empty() && page.pending.is_empty() {
                                 let last = page.channel.and_then(|channel| {
                                     let cache = page.ctx.services.store.read(cx).cache();
                                     let me = cache.me()?.id;
@@ -359,18 +360,15 @@ impl ChannelPage {
                             } else if key == "escape" && page.replying.take().is_some() {
                                 cx.notify();
                                 cx.stop_propagation();
-                            } else if key == "escape" && !page.pending.is_empty() {
+                            } else if key == "escape" && in_box && !page.pending.is_empty() {
+                                // Only what's waiting to be sent: the text stays.
                                 for file in std::mem::take(&mut page.pending) {
                                     file.discard();
                                 }
+                                page.keep_files(cx);
                                 cx.notify();
                                 cx.stop_propagation();
-                            } else if key == "escape"
-                                && page.profile.is_none()
-                                && !crate::viewer::is_open(cx)
-                                && !crate::context_menu::is_open(cx)
-                                && !page.list.is_following_tail()
-                            {
+                            } else if key == "escape" && !page.list.is_following_tail() {
                                 // Discord's Esc: back to the newest message, unread cleared.
                                 page.banner_closed = true;
                                 page.jump_to_present(cx);
@@ -439,8 +437,6 @@ impl ChannelPage {
             vc_width: Rc::default(),
             anchor: None,
             was_gliding: Default::default(),
-            slide_pending: None,
-            slide: None,
             jump_settle: None,
             vc_chat_width: cx.try_global::<VoiceChatWidth>().map_or(VC_CHAT_DEFAULT, |w| w.0),
             resizing: false,
@@ -477,7 +473,9 @@ impl ChannelPage {
         let room = (self.vc_width.get() / rem).max(320.) - 32.;
         let (columns, width, height) = voice_tile_size(room, people.len());
         let core = self.ctx.services.core.clone();
+        let speaking_now = self.ctx.services.store.read(cx).speaking().clone();
         let mut tiles = people.into_iter().map(|p| {
+            let speaking = speaking_now.contains(&p.user_id);
             let color = crate::avatar_colors::color(&p.avatar_url, &core, cx);
             let (user, name) = (p.user_id, p.name.clone());
             div()
@@ -491,6 +489,9 @@ impl ChannelPage {
                 .rounded(u(8.))
                 .overflow_hidden()
                 .bg(color.map_or(tile, |c| gpui_kit::rgb(c).into()))
+                .when(speaking, |d| {
+                    d.child(div().absolute().top_0().left_0().size_full().rounded(u(8.)).border_3().border_color(Hsla::from(gpui_kit::rgb(0x23a55a))))
+                })
                 .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(move |this, event: &gpui_kit::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     this.user_menu(user, name.clone(), event.position, cx);
@@ -734,10 +735,6 @@ impl ChannelPage {
             let top = self.list.logical_scroll_top();
             let prepended = range.start == 1 && range.is_empty() && !self.rendered.is_empty();
             self.list.splice(range, count);
-            // A few new messages while at the newest: they slide in rather than jump.
-            if appended && following && count <= 3 && self.ctx.services.settings.read(cx).get().smooth_scrolling {
-                self.slide_pending = Some(self.slide_pending.unwrap_or(0) + count);
-            }
             // Only when scrolled there: following the newest, the list is yet to be
             // measured when this comes in, and it'd be pinned to the older messages.
             if prepended && top.item_ix <= 1 && !self.list.is_following_tail() {
@@ -789,7 +786,8 @@ impl ChannelPage {
     /// Scrolls to the linked message once it's loaded, fetching older pages
     /// (a few at most) until it turns up.
     fn seek_jump_target(&mut self, cx: &mut Context<Self>) {
-        const MAX_PAGES: u8 = 8;
+        // One page at a time, each waiting for the last: quite far back, but not forever.
+        const MAX_PAGES: u16 = 400;
         let (Some((target, pages)), Some(channel)) = (self.jump_target, self.channel) else { return };
         if let Some(ix) = self.rendered.iter().position(|r| *r == target) {
             self.jump_target = None;
@@ -883,13 +881,41 @@ impl ChannelPage {
             }
         };
         let mut entries = vec![
-            Entry::item("Profile", with(|p, u, _, at, w, cx| p.open_profile(u, at, w, cx))),
+            Entry::item("Profile", with(|p, u, _, at, w, cx| {
+                p.last_closed = None;
+                p.show_profile(u, at, false, w, cx);
+            })),
             Entry::item("Mention", with(|p, u, n, _, w, cx| p.mention(u, n, w, cx))),
         ];
         if !me {
             entries.push(Entry::item("Message", with(|p, u, _, _, _, cx| p.message(u, cx))));
             entries.push(Entry::later("Start a Call"));
             entries.push(Entry::later("Add Note"));
+            // A group's owner may remove people or hand it over. Both ask first.
+            let my_id = self.ctx.services.store.read(cx).cache().me().map(|u| u.id);
+            let owned_group = self.channel.filter(|channel| {
+                let cache = self.ctx.services.store.read(cx).cache();
+                cache.channel(*channel).is_some_and(|c| c.kind == cord_core::model::ChannelKind::GroupDm && c.owner_id.is_some() && c.owner_id == my_id && c.recipient_ids.contains(&user))
+            });
+            if let Some(channel) = owned_group {
+                entries.push(Entry::Separator);
+                let store = self.ctx.services.store.clone();
+                let who = name.clone();
+                entries.push(Entry::item("Remove From Group", move |_, cx| {
+                    let store = store.clone();
+                    crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from this group?"), "Remove", move |cx| {
+                        store.update(cx, |store, cx| store.remove_from_group(channel, user, cx));
+                    }, cx);
+                }).danger());
+                let store = self.ctx.services.store.clone();
+                let who = name.clone();
+                entries.push(Entry::item("Make Group Owner", move |_, cx| {
+                    let store = store.clone();
+                    crate::confirm::ask(format!("Make {who} the owner"), format!("Hand this group over to {who}? You won't own it anymore."), "Make Owner", move |cx| {
+                        store.update(cx, |store, cx| store.make_group_owner(channel, user, cx));
+                    }, cx);
+                }).danger());
+            }
             entries.push(Entry::Separator);
             entries.push(Entry::later("Ignore"));
             entries.push(Entry::later("Block"));
@@ -995,7 +1021,7 @@ impl ChannelPage {
                         }
                     });
                 })
-                .icon(if pinned { IconName::PinOff } else { IconName::Pin }),
+                .picture(if pinned { "icons/pin-off.svg" } else { "icons/toolbar-pin.svg" }),
             );
         }
         entries.push(Entry::later("Mark Unread"));
@@ -1101,6 +1127,15 @@ impl ChannelPage {
         if !text.is_empty() {
             self.fill_input(text, window, cx);
         }
+        // Those still there: a file may have been moved or deleted since.
+        self.pending = draft.files.into_iter().filter(|file| file.path.exists()).collect();
+    }
+
+    /// Remembers the files waiting in the box along with the text.
+    fn keep_files(&self, cx: &App) {
+        if let Some(channel) = self.channel {
+            crate::drafts::set_files(channel, self.pending.clone(), cx);
+        }
     }
 
     /// A group's people, in place of a server's member list.
@@ -1108,6 +1143,7 @@ impl ChannelPage {
         use crate::members::avatar_with_status;
         use cord_core::member_list::Status;
         let theme = cx.theme();
+        let owner = channel.owner_id;
         let store = self.ctx.services.store.read(cx);
         let cache = store.cache();
         let mut people: Vec<cord_core::model::User> = channel
@@ -1181,15 +1217,19 @@ impl ChannelPage {
                         .flex_1()
                         .min_w_0()
                         .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(u(16.))
-                                .line_height(u(20.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(look.color.unwrap_or(theme.foreground))
-                                .when_some(look.font, |d, font| d.font_family(font))
-                                .child(crate::badges::gradient_text(&name, &look.stops, 0.)),
+                            h_flex()
+                                .gap(u(5.))
+                                .items_center()
+                                .child(
+                                    crate::badges::name_clip(div().min_w_0(), &look.stops)
+                                        .text_size(u(16.))
+                                        .line_height(u(20.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(look.color.unwrap_or(theme.foreground))
+                                        .when_some(look.font, |d, font| d.font_family(font))
+                                        .child(crate::badges::gradient_text(&name, &look.stops, 0.)),
+                                )
+                                .when(owner == Some(id), |d| d.child(crate::badges::owner_crown())),
                         )
                         .children(line),
                 )
@@ -1234,26 +1274,8 @@ impl ChannelPage {
             .font_weight(FontWeight::MEDIUM)
             .when(!room, |d| d.opacity(0.5))
             .when(room, |d| {
-                d.cursor_pointer().hover(|d| d.bg(theme.foreground.opacity(0.06))).on_click(move |event, _, cx| {
-                    use crate::context_menu::{self as menu, Entry};
-                    let cache = store.read(cx).cache();
-                    let me = cache.me().map(|u| u.id);
-                    let mut friends: Vec<(String, Id)> = cache
-                        .friend_ids()
-                        .into_iter()
-                        .filter(|f| !inside.contains(f) && Some(*f) != me)
-                        .filter_map(|f| Some((cache.user(f)?.display_name().to_string(), f)))
-                        .collect();
-                    friends.sort_by_cached_key(|(name, _)| name.to_lowercase());
-                    let entries = friends
-                        .into_iter()
-                        .take(16)
-                        .map(|(name, friend)| {
-                            let store = store.clone();
-                            Entry::item(name, move |_, cx| store.update(cx, |store, cx| store.add_to_group(id, friend, cx)))
-                        })
-                        .collect();
-                    menu::show(event.position(), entries, cx);
+                d.cursor_pointer().hover(|d| d.bg(theme.foreground.opacity(0.06))).on_click(move |_, window, cx| {
+                    crate::add_people::open(store.clone(), id, inside.clone(), MOST.saturating_sub(count), window, cx);
                 })
             })
             .child(Icon::new(IconName::UserPlus).size(u(18.)))
@@ -1370,7 +1392,8 @@ impl ChannelPage {
         self.replying_to_self = author_id.is_some() && author_id == me;
         self.replying = Some((message, author, author_id));
         self.editing = None;
-        self.reply_ping = true;
+        // Nobody needs pinging about their own message.
+        self.reply_ping = !self.replying_to_self;
         self.input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
     }
@@ -1465,15 +1488,6 @@ impl ChannelPage {
         if !still && was != now && let (Some(was), Some(now)) = (was, now) {
             tracing::info!(row_was = %was.0, row_now = %now.0, offset_was = was.1, offset_now = now.1, rows = self.rendered.len(), "chat view moved by itself");
         }
-    }
-
-    /// How much taller to draw the list right now, and at what height it started.
-    fn slide_offset(&self) -> Option<(f32, f32)> {
-        const SECS: f32 = 0.2;
-        let (began, height, view) = self.slide?;
-        let t = began.elapsed().as_secs_f32() / SECS;
-        // Whole pixels: text snaps to them, so anything else makes it shimmer on the way.
-        (t < 1.).then(|| ((height * (1. - crate::transition::ease(t))).round(), view))
     }
 
     /// How far down row `ix`'s top is from the top of the view; negative above it.
@@ -1918,6 +1932,7 @@ impl ChannelPage {
             }
             self.pending.push(file);
         }
+        self.keep_files(cx);
         cx.notify();
     }
 
@@ -1974,6 +1989,7 @@ impl ChannelPage {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if i < this.pending.len() {
                                 this.pending.remove(i).discard();
+                                this.keep_files(cx);
                                 cx.notify();
                             }
                         }))
@@ -2015,6 +2031,7 @@ impl ChannelPage {
                 crate::drafts::set_text(channel, String::new(), cx);
                 let ping = self.reply_ping;
                 let reply = self.replying.take().map(|(id, _, _)| (id, ping));
+                crate::drafts::set_files(channel, Vec::new(), cx);
                 let files = std::mem::take(&mut self.pending).into_iter().filter_map(|f| f.into_upload()).collect();
                 self.ctx.services.store.update(cx, |store, cx| store.send(channel, content, reply, files, cx));
             }
@@ -2462,6 +2479,9 @@ fn reply_bar() -> impl IntoElement {
 /// Whether `message` mentions the signed-in user, by name, role or @everyone.
 fn pings_me(cache: &Cache, guild: Option<Id>, message: &Message) -> bool {
     let Some(me) = cache.me() else { return false };
+    if message.author.id == me.id {
+        return false;
+    }
     let roles = guild.and_then(|g| cache.member(g, me.id)).map(|m| m.roles.as_slice()).unwrap_or(&[]);
     chat_format::mentions_me(message, me.id, roles)
 }
@@ -2760,8 +2780,13 @@ fn hover_actions(
             }))
         })
         .when(can_pin, |this| {
-            let (icon, tip) = if pinned { (IconName::PinOff, "Unpin Message") } else { (IconName::Pin, "Pin Message") };
-            this.child(button("act-pin", icon, tip).on_click({
+            let (icon, tip) = if pinned { ("icons/pin-off.svg", "Unpin Message") } else { ("icons/toolbar-pin.svg", "Pin Message") };
+            let pin_button = cell(("act-pin", ix))
+                .text_color(muted)
+                .hover(move |d| d.text_color(bright))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+                .child(Icon::default().path(icon).size(u(20.)));
+            this.child(pin_button.on_click({
                 let page = page.clone();
                 move |_, _, cx| {
                     let _ = page.update(cx, |page, cx| {
@@ -2885,7 +2910,14 @@ fn message_row(
                         .child(Icon::default().path("icons/new-member.svg").size(u(20.))),
                 )
             })
-            .when(by.bot, |this| this.child(crate::badges::app_badge()))
+            .map(|this| {
+                // Discord's own account, whose messages tell you about yours.
+                if author.id == Id(643_945_264_868_098_049) {
+                    this.child(crate::badges::official_badge())
+                } else {
+                    this.when(by.bot, |this| this.child(crate::badges::app_badge()))
+                }
+            })
             .child(
                 div()
                     .ml(u(4.))
@@ -3003,6 +3035,17 @@ fn system_row(
         .flatten();
     let named = other.unwrap_or(&m.message.author);
     let (before, after) = if other.is_some() { ("You accepted", "'s friend request.".to_string()) } else { (line.before, line.after.clone()) };
+    // Someone else's call we weren't in.
+    let missed = line.kind == rich_view::SystemKind::Call
+        && me != Some(m.message.author.id)
+        && m.message.call.as_ref().is_some_and(|call| !me.is_some_and(|me| call.participants.contains(&me)));
+    let (before, after) = if missed {
+        ("You missed a call from", rich_view::call_lasted(&m.message).map_or_else(|| ".".to_string(), |lasted| format!(" that lasted {lasted}.")))
+    } else {
+        (before, after)
+    };
+    // The message it points at, to jump to.
+    let pinned = (line.kind == rich_view::SystemKind::Pin).then(|| m.message.message_reference.as_ref().and_then(|r| r.message_id)).flatten();
     let by = byline(cache, guild, named);
     let time = nav::format_message_time(m.message.id.timestamp_ms(), &chrono::Local::now());
     let muted = theme.muted_foreground;
@@ -3013,9 +3056,10 @@ fn system_row(
         rich_view::SystemKind::Renamed => (Icon::new(IconName::Pencil), muted),
         rich_view::SystemKind::Join => (Icon::new(IconName::ArrowRight), Hsla::from(gpui_kit::rgb(0x23a55a))),
         rich_view::SystemKind::Boost => (Icon::default().path("icons/boost.svg"), Hsla::from(gpui_kit::rgb(0xff73fa))),
-        rich_view::SystemKind::Pin => (Icon::new(IconName::Pin), muted),
+        rich_view::SystemKind::Pin => (Icon::default().path("icons/toolbar-pin.svg"), muted),
         rich_view::SystemKind::FriendAccepted => (Icon::default().path("icons/user-check.svg"), Hsla::from(gpui_kit::rgb(0x23a55a))),
         rich_view::SystemKind::Thread => (Icon::new(IconName::MessageSquareText), muted),
+        rich_view::SystemKind::Call => (Icon::default().path("icons/phone.svg"), Hsla::from(gpui_kit::rgb(if missed { 0xf23f43 } else { 0x23a55a }))),
     };
     let row = h_flex()
         .id(("message", ix))
@@ -3044,11 +3088,28 @@ fn system_row(
                             move |event, window, cx| open(who, crate::markdown_view::card_at(&target, event.position()), window, cx)
                         })
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(by.color.unwrap_or(theme.foreground))
-                        .when_some(by.font, |d, font| d.font_family(font))
+                        // In a DM there's no role to color it, and these lines don't carry name styles.
+                        .text_color(if guild.is_some() { by.color.unwrap_or(theme.foreground) } else { theme.foreground })
+                        .when(guild.is_some(), |d| d.when_some(by.font, |d, font| d.font_family(font)))
                         .child(by.name.clone()),
                 ))
-                .child(format!("{}\u{a0}", after.replacen(' ', "\u{a0}", 1)))
+                .map(|d| match pinned {
+                    Some(target) => {
+                        let jump = shared.jump.clone();
+                        d.child("\u{a0}pinned\u{a0}")
+                            .child(
+                                div()
+                                    .id(("pinned-link", ix))
+                                    .text_color(theme.foreground)
+                                    .cursor_pointer()
+                                    .hover(|d| d.underline())
+                                    .on_click(move |_, _, cx| jump(target, cx))
+                                    .child("a message"),
+                            )
+                            .child("\u{a0}to this channel.\u{a0}")
+                    }
+                    None => d.child(format!("{}\u{a0}", after.replacen(' ', "\u{a0}", 1))),
+                })
                 .child(div().text_size(u(12.)).child(time)),
         );
     if margin {
@@ -3249,6 +3310,9 @@ fn message_content(message: &Message, guild: Option<Id>, cache: &Cache, shared: 
 }
 
 /// A thin rule with the date centred, between messages of different days.
+/// The height of the bar across the top of a channel.
+const TOP_BAR: f32 = 49.;
+
 /// The red line above the first message that arrived unread, "NEW" on its right.
 fn new_divider(cx: &App) -> AnyElement {
     let red = cx.theme().danger;
@@ -3368,8 +3432,11 @@ impl Render for ChannelPage {
         }
         let screens = self.ctx.services.settings.read(cx).get().image_screens;
         crate::anim::note_view(self.list.logical_scroll_top().item_ix, screens, window, cx);
-        if let Some((user, position)) = crate::links::take_profile(cx) {
-            if !self.toggled_shut(user, window, cx) {
+        if let Some((user, position, always)) = crate::links::take_profile(cx) {
+            if always {
+                self.last_closed = None;
+                self.show_profile(user, position, false, window, cx);
+            } else if !self.toggled_shut(user, window, cx) {
                 self.show_profile(user, position, false, window, cx);
             }
         }
@@ -3412,25 +3479,6 @@ impl Render for ChannelPage {
                     None => window.request_animation_frame(),
                 }
             }
-        }
-        // New messages at the newest: the list goes straight to its new end, drawn
-        // taller at first so they start below the edge and rise into place.
-        if let Some(count) = self.slide_pending {
-            let len = self.rendered.len();
-            let heights: Option<Vec<f32>> = (len.saturating_sub(count)..len).map(|ix| self.row_bounds(ix).map(|r| f32::from(r.size.height))).collect();
-            if let Some(heights) = heights {
-                let view = self.slide.map_or(f32::from(self.list.viewport_bounds().size.height), |(_, _, view)| view);
-                let left = self.slide_offset().map_or(0., |(offset, _)| offset);
-                self.slide = Some((std::time::Instant::now(), heights.iter().sum::<f32>() + left, view));
-                self.slide_pending = None;
-            }
-            window.request_animation_frame();
-        }
-        if self.slide.is_some() {
-            if self.slide_offset().is_none() {
-                self.slide = None;
-            }
-            window.request_animation_frame();
         }
         // Rows above can change height as they're measured on the way: check it
         // really landed in full, and nudge it if not.
@@ -3572,10 +3620,18 @@ impl Render for ChannelPage {
                     text_size: chat_text as f32,
                     parsed: self.parsed.clone(),
                 };
-                let beginning = format!(
-                    "This is the beginning of {}{label}.",
-                    if channel.guild_id.is_some() { "#" } else { "@" }
-                );
+                // A thread says who started it, once we know them.
+                let starter = (channel.kind == cord_core::model::ChannelKind::Thread)
+                    .then(|| {
+                        let cache = self.ctx.services.store.read(cx).cache();
+                        let user = cache.user(channel.owner_id?)?;
+                        Some(cache.display_name(channel.guild_id, user).to_string())
+                    })
+                    .flatten();
+                let beginning = match starter {
+                    Some(name) => format!("Started by {name}"),
+                    None => format!("This is the beginning of {}{label}.", if channel.guild_id.is_some() { "#" } else { "@" }),
+                };
                 let highlight = self.highlight.clone();
                 let hovered_row = self.hovered_row.clone();
                 let replying_to = self.replying.as_ref().map(|(id, _, _)| *id);
@@ -3667,12 +3723,10 @@ impl Render for ChannelPage {
                     };
                     // Only the message lights up, not the date bar above it.
                     let row = if let Some((_, jump)) = highlight.get().filter(|(id, _)| *id == m.message.id) {
-                        // A soft glow that fades, over the row so nothing shifts.
-                        let glow = Hsla::from(gpui_kit::rgb(0x5865f2));
+                        // The same look as a message being replied to, behind the row, fading.
                         div()
                             .relative()
                             .w_full()
-                            .child(row)
                             .child(
                                 div()
                                     .absolute()
@@ -3680,15 +3734,16 @@ impl Render for ChannelPage {
                                     .bottom_0()
                                     .left_0()
                                     .right_0()
-                                    .bg(glow.opacity(0.28))
-                                    .border_l_2()
-                                    .border_color(glow)
+                                    .bg(reply_tint(false))
+                                    .child(reply_bar())
                                     .with_animation(
                                         ("jump-glow", jump),
-                                        gpui_kit::Animation::new(std::time::Duration::from_millis(1900)).with_easing(gpui_kit::ease_in_out),
-                                        |d, t| d.opacity(1. - t),
+                                        gpui_kit::Animation::new(std::time::Duration::from_millis(1900)),
+                                        // Holds a moment so it can be found, then fades.
+                                        |d, t| d.opacity(if t < 0.5 { 1. } else { 1. - crate::transition::ease((t - 0.5) * 2.) }),
                                     ),
                             )
+                            .child(row)
                             .into_any_element()
                     } else {
                         row
@@ -3728,12 +3783,7 @@ impl Render for ChannelPage {
                     .line_height(u(chat_text as f32 * 22. / 16.))
                     .when(smooth, |this| this.child(self.scroller.layer()))
                     .overflow_hidden()
-                    // The new row's height isn't known for its first frame: a fair guess,
-                    // so that it doesn't show in place for a frame and then jump down.
-                    .child(match self.slide_offset().or_else(|| self.slide_pending.map(|count| (count as f32 * 48., f32::from(self.list.viewport_bounds().size.height)))) {
-                        Some((offset, view)) => list.w_full().h(gpui_kit::px(view + offset)),
-                        None => list.size_full(),
-                    })
+                    .child(list.size_full())
                     .when_some(typing_line(&self.ctx.services.store, channel_id, self.guild, cx), |this, line| this.child(line))
                     .when_some(self.new_messages_bar(channel_id, cx), |this, bar| this.child(bar))
                     .map(|this| {
@@ -3863,6 +3913,8 @@ impl Render for ChannelPage {
                     cx.notify();
                 })))
         });
+        // In a voice channel the chat has its own header; elsewhere the bar spans the page.
+        let top_header = chat_header.is_none().then_some(header);
         h_flex()
             .relative()
             .size_full()
@@ -3894,6 +3946,7 @@ impl Render for ChannelPage {
                     cx.notify();
                 }
             }))
+            .when(top_header.is_some(), |d| d.relative().pt(u(TOP_BAR)))
             .children(stage)
             .children(edge)
             .child(
@@ -3904,10 +3957,7 @@ impl Render for ChannelPage {
                         (true, false) => d.w_0().overflow_hidden(),
                     })
                     .h_full()
-                    .map(|d| match chat_header {
-                        Some(chat_header) => d.child(chat_header),
-                        None => d.child(header),
-                    })
+                    .children(chat_header)
                     .child(div().flex_1().min_h_0().child(messages))
                     .when(!forbidden, |this| {
                         let composer = match nav::composer_lock(cache, channel) {
@@ -4125,6 +4175,8 @@ impl Render for ChannelPage {
                 )
             }))
             .when_some(group_list, |this, list| this.child(list))
+            // The bar runs over the member list too, with the search above it, as Discord's.
+            .when_some(top_header, |d, header| d.child(div().absolute().top_0().left_0().right_0().h(u(TOP_BAR)).occlude().child(header)))
             .children(self.profile.as_ref().map(|(card, _)| card.clone()))
             .when_some(self.confirm_delete, |d, message| d.child(self.delete_dialog(message, window, cx)))
             .into_any_element()

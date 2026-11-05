@@ -23,16 +23,23 @@ pub struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        if let Some(bytes) = crate::discord_icons::load(path) {
+            return Ok(Some(Cow::Owned(bytes)));
+        }
         if path == "icons/new-member.svg" {
             return Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/new-member.svg"))));
         }
-        // Our own, built in.
+        // Our own, built in, for until Discord's are here.
         let bundled: Option<&'static [u8]> = match path {
             "icons/win-minimize.svg" => Some(include_bytes!("../assets/icons/win-minimize.svg")),
             "icons/win-maximize.svg" => Some(include_bytes!("../assets/icons/win-maximize.svg")),
             "icons/win-restore.svg" => Some(include_bytes!("../assets/icons/win-restore.svg")),
             "icons/win-close.svg" => Some(include_bytes!("../assets/icons/win-close.svg")),
             "icons/rules.svg" => Some(include_bytes!("../assets/icons/rules.svg")),
+            "icons/pin-off.svg" => Some(include_bytes!("../assets/icons/pin-off.svg")),
+            "icons/phone.svg" => Some(include_bytes!("../assets/icons/phone.svg")),
+            "icons/user-check.svg" => Some(include_bytes!("../assets/icons/user-check.svg")),
+            "icons/crown.svg" => Some(include_bytes!("../assets/icons/crown.svg")),
             "icons/poll.svg" => Some(include_bytes!("../assets/icons/poll.svg")),
             "icons/automod.svg" => Some(include_bytes!("../assets/icons/automod.svg")),
             "icons/toolbar-threads.svg" => Some(include_bytes!("../assets/icons/toolbar-threads.svg")),

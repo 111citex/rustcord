@@ -20,7 +20,6 @@ use crate::ui::u;
 const POOL: usize = 3;
 /// Clickable pieces of the seek bar: positions without measuring its width.
 const SEEK_CELLS: usize = 48;
-const VOLUME_STEPS: usize = 10;
 /// Narrower videos leave out the volume bar; the mute button stays.
 const MIN_WIDTH_FOR_VOLUME: f32 = 300.;
 
@@ -271,27 +270,17 @@ fn surface(
         }
     };
     let mute = player.clone();
-    // Volume, in the same clickable pieces as the seek bar.
     let level = if muted { 0. } else { volume };
-    let volume_bar = h_flex().w(u(60.)).flex_shrink_0().h(u(16.)).items_center().children((0..VOLUME_STEPS).map(|i| {
-        let to = (i + 1) as f32 / VOLUME_STEPS as f32;
+    let change: std::rc::Rc<dyn Fn(f32, &mut App)> = {
         let player = player.clone();
-        div()
-            .id(SharedString::from(format!("volume-{i}-{key}")))
-            .flex_1()
-            .h(u(16.))
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .on_click(move |_, _, cx| {
-                cx.stop_propagation();
-                player.update(cx, |p, cx| {
-                    p.set_muted(false, cx);
-                    p.set_volume(to, cx);
-                });
-            })
-            .child(div().w_full().h(u(4.)).bg(if to <= level + 0.001 { gpui_kit::white() } else { gpui_kit::white().opacity(0.3) }))
-    }));
+        std::rc::Rc::new(move |to, cx| {
+            player.update(cx, |p, cx| {
+                p.set_muted(false, cx);
+                p.set_volume(to, cx);
+            });
+        })
+    };
+    let volume_bar = div().w(u(66.)).flex_shrink_0().h(u(16.)).px(u(6.)).child(crate::slider::slider(format!("volume-{key}"), level, false, gpui_kit::white(), gpui_kit::white().opacity(0.3), change));
     frame
         .overflow_hidden()
         .on_click(toggle.clone())

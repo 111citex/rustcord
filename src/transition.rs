@@ -67,6 +67,17 @@ pub fn pointer_on(id: &SharedString) -> bool {
     POINTER.with_borrow(|p| p.as_ref() == Some(id))
 }
 
+/// Notes the pointer arriving on or leaving `id`, redrawing nothing.
+pub fn set_pointer(id: &SharedString, over: bool) {
+    POINTER.with_borrow_mut(|p| {
+        if over {
+            *p = Some(id.clone());
+        } else if p.as_ref() == Some(id) {
+            *p = None;
+        }
+    });
+}
+
 /// An `on_hover` listener keeping [`pointer_on`] up to date.
 pub fn track_pointer(id: SharedString) -> impl Fn(&bool, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static {
     move |over, window, _| {

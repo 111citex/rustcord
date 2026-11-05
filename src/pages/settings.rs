@@ -16,7 +16,9 @@ use gpui_kit::{
 
 use crate::ui::u;
 use crate::router::RouteContext;
-use crate::settings::{Settings, step_big_memory, step_chat_text, step_image_screens, step_zoom};
+use std::rc::Rc;
+
+use crate::settings::{CHAT_TEXT_MAX, CHAT_TEXT_MIN, Settings, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, step_big_memory, step_image_screens};
 use crate::store::Services;
 
 gpui_kit::actions!(rustcord, [CloseSettings]);
@@ -173,30 +175,41 @@ impl SettingsPage {
                 .child(Button::new(SharedString::from(format!("{id}-plus"))).outline().small().icon(IconName::Plus).on_click(move |_, _, cx| plus(cx)))
         };
         let s = |services: &Services| services.clone();
-        let zoom = stepper(
-            "zoom",
-            format!("{}%", settings.zoom),
-            {
-                let services = s(&services);
-                Box::new(move |cx| Self::edit(&services, cx, |s| s.zoom = step_zoom(s.zoom, -1)))
-            },
-            {
-                let services = s(&services);
-                Box::new(move |cx| Self::edit(&services, cx, |s| s.zoom = step_zoom(s.zoom, 1)))
-            },
-        );
-        let chat_text = stepper(
-            "chat-text",
-            format!("{}px", settings.chat_text),
-            {
-                let services = s(&services);
-                Box::new(move |cx| Self::edit(&services, cx, |s| s.chat_text = step_chat_text(s.chat_text, -1)))
-            },
-            {
-                let services = s(&services);
-                Box::new(move |cx| Self::edit(&services, cx, |s| s.chat_text = step_chat_text(s.chat_text, 1)))
-            },
-        );
+        let blurple = gpui_kit::Hsla::from(gpui_kit::rgb(0x5865f2));
+        let slider_colors = (blurple, cx.theme().muted_foreground.opacity(0.35), cx.theme().foreground);
+        let zoom = {
+            let services = s(&services);
+            // Applied on letting go: zooming resizes the slider under the pointer mid-drag.
+            crate::slider::ticked_on_release(
+                "zoom",
+                f32::from(settings.zoom),
+                (f32::from(ZOOM_MIN), f32::from(ZOOM_MAX), f32::from(ZOOM_STEP)),
+                |at| format!("{at:.0}%"),
+                slider_colors,
+                Rc::new(move |value, cx| {
+                    let value = value as u16;
+                    if services.settings.read(cx).get().zoom != value {
+                        Self::edit(&services, cx, |s| s.zoom = value);
+                    }
+                }),
+            )
+        };
+        let chat_text = {
+            let services = s(&services);
+            crate::slider::ticked(
+                "chat-text",
+                f32::from(settings.chat_text),
+                (f32::from(CHAT_TEXT_MIN), f32::from(CHAT_TEXT_MAX), 1.),
+                format!("{}px", settings.chat_text),
+                slider_colors,
+                Rc::new(move |value, cx| {
+                    let value = value as u8;
+                    if services.settings.read(cx).get().chat_text != value {
+                        Self::edit(&services, cx, |s| s.chat_text = value);
+                    }
+                }),
+            )
+        };
         let image_screens = stepper(
             "image-screens",
             match settings.image_screens {

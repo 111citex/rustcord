@@ -10,6 +10,7 @@ license = "GPL-3.0-or-later"
 description = "A lightweight Discord client"
 
 [dependencies]
+regex = "1"
 rlottie = "0.5.4"
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg", "gif"] }

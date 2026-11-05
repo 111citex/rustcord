@@ -41,6 +41,23 @@ fn scan(text: &str, base: usize, look: Look, out: &mut Vec<(Range<usize>, Look)>
     let mut plain = 0;
     while at < text.len() {
         let rest = &text[at..];
+        // `<https://…>`, a link asked not to embed: the brackets are only dimmed.
+        if rest.starts_with("<http")
+            && let Some(close) = rest.find('>')
+            && !rest[..close].contains(char::is_whitespace)
+        {
+            if plain < at && look != Look::default() {
+                out.push((base + plain..base + at, look));
+            }
+            out.push((base + at..base + at + 1, Look { mark: true, ..look }));
+            if look != Look::default() {
+                out.push((base + at + 1..base + at + close, look));
+            }
+            out.push((base + at + close..base + at + close + 1, Look { mark: true, ..look }));
+            at += close + 1;
+            plain = at;
+            continue;
+        }
         let opened = MARKS.iter().find(|m| rest.starts_with(**m)).and_then(|mark| {
             // The closing mark, with something between them.
             let inner = &rest[mark.len()..];
@@ -106,6 +123,10 @@ mod tests {
         assert!(styles("snake_case and 2 * 3").is_empty());
         assert!(styles("#men_in_women_field").is_empty(), "underscores inside a word");
         assert!(styles("snake_case_name").is_empty());
+        let link = styles("see <https://a.b/c_d_e> ok");
+        assert_eq!(link.iter().filter(|(_, l)| l.mark).count(), 2, "just the brackets");
+        assert!(!link.iter().any(|(_, l)| l.italic), "no italics, even with underscores");
+        assert!(styles("a <b> c").is_empty(), "not a link");
         assert!(styles("an _italic_ word").iter().any(|(_, l)| l.italic), "around a word still counts");
     }
 

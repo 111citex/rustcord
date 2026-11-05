@@ -34,6 +34,8 @@ pub enum Content {
     User(Id),
     Role(Id),
     Channel(Id),
+    /// A bare link to a message: drawn as where it is, not as the address.
+    MessageLink { channel: Id, url: String },
     /// `@everyone` or `@here`: a pill when the message really pinged, else plain text.
     Everyone(&'static str),
     /// `</name sub:id>`: a slash command, shown as "/name sub".
@@ -327,6 +329,9 @@ impl Parser {
             'h' if style.link.is_none() && prev.is_none_or(|p| !p.is_alphanumeric()) => {
                 let len = bare_url_len(rest)?;
                 let url = rest[..len].to_string();
+                if let Some((channel, _)) = crate::links::linked_message(&url) {
+                    return Some((vec![Run { content: Content::MessageLink { channel, url }, style: style.clone() }], len));
+                }
                 let linked = Style { link: Some(url.clone()), ..style.clone() };
                 Some((vec![Run { content: Content::Text(url), style: linked }], len))
             }

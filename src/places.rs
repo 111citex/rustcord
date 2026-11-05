@@ -77,6 +77,11 @@ pub fn get() -> Places {
     HELD.with_borrow_mut(|held| held.get_or_insert_with(|| read_from(&path())).clone())
 }
 
+/// Whether we've muted `user` for ourselves.
+pub fn is_muted(user: Id) -> bool {
+    HELD.with_borrow_mut(|held| held.get_or_insert_with(|| read_from(&path())).muted.contains(&user))
+}
+
 /// Remembers a page being opened.
 pub fn note(guild: Option<Id>, channel: Option<Id>) {
     let changed = HELD.with_borrow_mut(|held| {

@@ -8232,6 +8232,7 @@ dependencies = [
  "libmimalloc-sys",
  "mimalloc",
  "qrcode",
+ "regex",
  "rlottie",
  "rpassword",
  "serde",

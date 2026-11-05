@@ -8,7 +8,8 @@ mod playback;
 mod sounds;
 mod transport;
 
-pub use sounds::{Sound, decode_mp3};
+pub use playback::play_once;
+pub use sounds::{Clip, Sound, decode_mp3};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed};
@@ -100,6 +101,11 @@ impl VoiceCall {
 
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// Who's making sound right now.
+    pub fn speaking(&self) -> Vec<u64> {
+        self.speakers.lock().map_or_else(|_| Vec::new(), |speakers| speakers.speaking())
     }
 
     /// Plays one of the call's little sounds, deafened or not.

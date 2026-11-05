@@ -31,6 +31,7 @@ const AVATAR: f32 = 80.;
 /// The full profile's right side.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
+    Activity,
     Friends,
     Servers,
 }
@@ -439,7 +440,7 @@ impl Render for ProfileCard {
                             AVATAR,
                             status,
                             false,
-                            styled.decoration_url(),
+                            styled.decoration_url_at(480),
                             ring,
                             // Dims under the pointer, to say it opens something.
                             Some(
@@ -812,7 +813,93 @@ impl ProfileCard {
 
     /// The whole profile, opened from the card's avatar: everything the card
     /// has room for and more, with the people and servers you share beside it.
+    /// Under the name: Message and the friend button, the way round that fits whether
+    /// they're a friend, then the "…" menu. The main button takes their profile's color.
+    fn full_actions(&self, card: gpui_kit::WeakEntity<Self>, user: Id, name: &str, main: Hsla, text: Hsla, cx: &gpui_kit::App) -> AnyElement {
+        use crate::context_menu::{self as menu, Entry};
+        use gpui_kit::component::Icon;
+        let friend = self.services.store.read(cx).cache().is_friend(user);
+        let wide = |id: &'static str, icon: Icon, label: &'static str| {
+            h_flex()
+                .id(id)
+                .h(u(36.))
+                .px(u(14.))
+                .gap(u(6.))
+                .items_center()
+                .rounded(u(8.))
+                .bg(main)
+                .text_color(gpui_kit::white())
+                .text_size(u(14.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .hover(|d| d.opacity(0.9))
+                .child(icon.size(u(18.)))
+                .child(label)
+        };
+        let square = |id: &'static str| {
+            div()
+                .id(id)
+                .size(u(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(u(8.))
+                .bg(text.opacity(0.12))
+                .text_color(text)
+                .cursor_pointer()
+                .hover(|d| d.bg(text.opacity(0.2)))
+        };
+        let store = self.services.store.clone();
+        let message_icon = || Icon::new(gpui_kit::assets::IconName::MessageCircle);
+        let row = h_flex().gap(u(8.)).items_center();
+        let row = if friend {
+            let who = name.to_string();
+            row.child(wide("full-message", message_icon(), "Message").on_click(move |_, _, cx| {
+                let _ = card.update(cx, |_, cx| cx.emit(ProfileEvent::Message(user)));
+            }))
+                .child(square("full-friend").child(Icon::default().path("icons/user-check.svg").size(u(18.))).on_click(move |event, _, cx| {
+                    let (store, who) = (store.clone(), who.clone());
+                    menu::show(event.position(), vec![Entry::item("Remove Friend", move |_, cx| {
+                        let store = store.clone();
+                        crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from your friends?"), "Remove Friend", move |cx| {
+                            store.update(cx, |store, cx| store.remove_friend(user, cx));
+                        }, cx);
+                    }).danger()], cx);
+                }))
+        } else {
+            row.child(wide("full-add-friend", Icon::new(gpui_kit::assets::IconName::UserPlus), "Add Friend").on_click(move |_, _, cx| {
+                store.update(cx, |store, cx| store.add_friend(user, cx));
+            }))
+                .child(square("full-message").child(message_icon().size(u(18.))).on_click(move |_, _, cx| {
+                    let _ = card.update(cx, |_, cx| cx.emit(ProfileEvent::Message(user)));
+                }))
+        };
+        row.child(
+            square("full-more")
+                .child(h_flex().gap(u(3.)).children((0..3).map(|_| div().size(u(4.)).rounded_full().bg(text))))
+                .on_click(move |event, _, cx| {
+                    menu::show(
+                        event.position(),
+                        vec![
+                            Entry::later("Share Profile"),
+                            Entry::later("Shop This Look"),
+                            Entry::later("Invite to Server"),
+                            Entry::Separator,
+                            Entry::later("Ignore"),
+                            Entry::later("Block").danger(),
+                            Entry::later("Report User Profile").danger(),
+                            Entry::Separator,
+                            Entry::copy("Copy User ID", user.to_string()).icon(gpui_kit::assets::IconName::Copy),
+                        ],
+                        cx,
+                    );
+                }),
+        )
+        .into_any_element()
+    }
+
     fn full_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let card_view = cx.entity().downgrade();
         const COLUMN: f32 = 420.;
         let theme = cx.theme();
         let store = self.services.store.read(cx);
@@ -874,6 +961,7 @@ impl ProfileCard {
         });
         let is_me = cache.me().is_some_and(|me| me.id == user.id);
         let (user_id, blurple) = (user.id, Hsla::from(gpui_kit::rgb(0x5865f2)));
+        let display_for_menu = user.display_name().to_string();
         let member_roles = self.guild.and_then(|g| cache.member(g, self.user)).map(|m| m.roles.clone()).unwrap_or_default();
         let role_list = self.guild.and_then(|g| Some(role_chips(g, &cache.guild(g)?.roles, &member_roles))).unwrap_or_default();
         // The window around it wears the theme too: a little further under its overlay.
@@ -909,7 +997,7 @@ impl ProfileCard {
                             120.,
                             status,
                             false,
-                            styled.decoration_url(),
+                            styled.decoration_url_at(480),
                             ring,
                         )),
                     ))
@@ -946,27 +1034,7 @@ impl ProfileCard {
                                 })))
                             }),
                     )
-                    .when(!is_me, |d| {
-                        d.child(
-                            h_flex().child(
-                                div()
-                                    .id("full-message")
-                                    .h(u(36.))
-                                    .px(u(16.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(u(8.))
-                                    .bg(blurple)
-                                    .text_color(gpui_kit::white())
-                                    .text_size(u(14.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .cursor_pointer()
-                                    .hover(|d| d.opacity(0.9))
-                                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(ProfileEvent::Message(user_id))))
-                                    .child("Message"),
-                            ),
-                        )
-                    })
+                    .when(!is_me, |d| d.child(self.full_actions(card_view.clone(), user_id, &display_for_menu, themed.map(|t| rgb_color(t.0)).unwrap_or(blurple), card_text, cx)))
                     .when(matches!(self.load, Load::Private), |d| d.child(div().text_size(u(14.)).text_color(muted).child("This profile is private.")))
                     .children(bio)
                     .when_some(created, |d, v| d.child(fact("Member Since", v)))
@@ -1042,11 +1110,15 @@ impl ProfileCard {
                 .child(label)
         };
         // Nobody has anything mutual with themselves.
+        let activity = self.services.store.read(cx).cache().presence(user_id).and_then(|p| p.activity.clone());
+        // Their game ended while looking at it: nothing left to show there.
+        let tab = if tab == Tab::Activity && activity.is_none() { Tab::Friends } else { tab };
         let tabs = if is_me {
             h_flex()
         } else {
             h_flex()
                 .gap(u(24.))
+                .when(activity.is_some(), |d| d.child(tab_button("tab-activity", "Activity".to_string(), Tab::Activity, cx)))
                 .child(tab_button("tab-friends", format!("{friend_count} Mutual Friends"), Tab::Friends, cx))
                 .child(tab_button("tab-servers", format!("{server_count} Mutual Servers"), Tab::Servers, cx))
         };
@@ -1055,6 +1127,32 @@ impl ProfileCard {
         let cache = store.cache();
         let hover = card_text.opacity(0.06);
         let rows: Vec<AnyElement> = match tab {
+            Tab::Activity => activity
+                .iter()
+                .map(|a| {
+                    let verb = match a.kind {
+                        cord_core::member_list::ActivityKind::Listening => "Listening to",
+                        cord_core::member_list::ActivityKind::Competing => "Competing in",
+                        _ => "Playing",
+                    };
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                    h_flex()
+                        .gap(u(12.))
+                        .p(u(8.))
+                        .items_center()
+                        .when_some(a.image.clone(), |d, url| d.child(img(url).size(u(64.)).flex_shrink_0().rounded(u(8.))))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .gap(u(2.))
+                                .child(div().text_size(u(12.)).text_color(muted).child(verb))
+                                .child(div().text_size(u(14.)).font_weight(FontWeight::SEMIBOLD).child(a.name.clone()))
+                                .when_some(a.details.clone(), |d, v| d.child(div().text_size(u(13.)).child(v)))
+                                .when_some(a.start_ms, |d, at| d.child(div().text_size(u(12.)).text_color(muted).child(crate::sidebar::elapsed_label(at, now)))),
+                        )
+                        .into_any_element()
+                })
+                .collect(),
             Tab::Friends => friends_list
                 .iter()
                 .map(|f| {

@@ -57,6 +57,8 @@ pub struct SidePane {
     rail_scroller: SmoothScroller,
     channels_scroll: ScrollHandle,
     channels_scroller: SmoothScroller,
+    /// What the list was last drawn from: only then are its rows' places known.
+    drawn_list: std::cell::Cell<Option<sidebar::SidebarKey>>,
     /// The channel whose row was last brought into view, and frames left until that's due.
     revealed_channel: std::cell::Cell<Option<cord_core::Id>>,
     reveal_wait: std::cell::Cell<u8>,
@@ -97,7 +99,8 @@ impl SidePane {
             services,
             rail_scroller: SmoothScroller::new(ScrollTarget::Handle(rail_scroll.clone())),
             rail_scroll,
-            channels_scroller: SmoothScroller::new(ScrollTarget::Handle(channels_scroll.clone())),
+            channels_scroller: SmoothScroller::new(ScrollTarget::Handle(channels_scroll.clone())).calm_hover(),
+            drawn_list: std::cell::Cell::new(None),
             revealed_channel: Default::default(),
             reveal_wait: Default::default(),
             last_dm: std::cell::Cell::new(crate::places::get().dm),
@@ -459,16 +462,17 @@ impl SidePane {
                     let unread = members.iter().any(|g| g.unread);
                     let mentions = members.iter().map(|g| g.mentions).sum();
                     // Closed: up to four servers in a 2×2 grid.
-                    let grid = div()
+                    // Rows of their own, not wrapping: at some zooms rounding made two icons
+                    // not quite fit on a line, which pushed the rest out of the square.
+                    let shown: Vec<_> = members.iter().take(4).collect();
+                    let grid = v_flex()
                         .size_full()
                         .p(u(4.))
-                        .flex()
-                        .flex_wrap()
                         .gap(u(2.))
-                        .content_start()
+                        .overflow_hidden()
                         .rounded(radius)
                         .bg(color.map_or(idle_bg, |c| c.opacity(0.4)))
-                        .children(members.iter().take(4).map(|g| guild_icon(g, 15.)));
+                        .children(shown.chunks(2).map(|pair| h_flex().flex_shrink_0().gap(u(2.)).children(pair.iter().map(|g| div().flex_shrink_0().child(guild_icon(g, 15.))))));
                     item(SharedString::from(format!("folder-{id}")), selected, unread, mentions, name, folder_idle, grid.into_any_element())
                         .on_click(toggle)
                         .on_mouse_down(gpui_kit::MouseButton::Right, folder_menu_opener.clone())
@@ -538,7 +542,7 @@ impl SidePane {
 
         let row_shell = |id: SharedString, active: bool, clickable: bool, path: String| {
             let router = self.router.clone();
-            let fade_id = id.clone();
+            let (fade_id, list_view) = (id.clone(), cx.entity_id());
             h_flex()
                 .id(id)
                 .flex_shrink_0()
@@ -552,8 +556,14 @@ impl SidePane {
                 .when(!active, |this| this.text_color(muted))
                 .when(clickable, |this| {
                     this.cursor_pointer()
-                        .when(!active, |this| this.hover(|this| this.bg(hover_bg).text_color(bright)))
-                        .on_hover(crate::transition::track_pointer(fade_id))
+                        .when(!active && !crate::smooth_scroll::list_scrolling(), |this| this.hover(|this| this.bg(hover_bg).text_color(bright)))
+                        // Only this list redraws, and not at all for a row just passing by.
+                        .on_hover(move |over: &bool, _: &mut Window, cx: &mut gpui_kit::App| {
+                            crate::transition::set_pointer(&fade_id, *over);
+                            if !crate::smooth_scroll::list_scrolling() {
+                                cx.notify(list_view);
+                            }
+                        })
                         .on_click(move |_, _, cx| navigate(&router, path.clone(), cx))
                 })
         };
@@ -587,7 +597,7 @@ impl SidePane {
                 .when(!active || floating, |this| this.invisible().group_hover(group.clone(), |style| style.visible()))
                 .when(floating, |this| this.absolute().top_0().bottom_0().right_0().rounded_r(u(5.)).bg(theme.sidebar))
                 .child(actions.when(floating, |this| {
-                    this.h_full().pl(u(6.)).pr(u(9.5)).rounded_r(u(5.)).when(active || channel.clickable, |this| this.bg(row_bg))
+                    this.h_full().pl(u(6.)).pr(u(9.5)).rounded_r(u(5.)).when(active || channel.clickable || (voice && can_join), |this| this.bg(row_bg))
                 }));
             let green = Hsla::from(gpui_kit::rgb(GREEN));
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -699,7 +709,7 @@ impl SidePane {
                 .h(u(32.))
                 .mb(u(3.5))
                 .pl(u(30.))
-                .text_size(rems(16. / 16.))
+                .text_size(rems(1.))
                 .font_weight(FontWeight::MEDIUM)
                 .when(t.unread && !active, |this| this.text_color(bright).font_weight(FontWeight::SEMIBOLD))
                 .child(
@@ -731,15 +741,35 @@ impl SidePane {
                     .text_color(theme.primary_foreground)
                     .child(Icon::new(IconName::UsersRound).size(u(14.5)))
                     .into_any_element(),
-                (None, false) => crate::members::avatar_with_status(
-                    Avatar::new().border_0().src(dm.avatar_url.clone()).name(dm.label.clone()),
-                    32.,
-                    dm.status,
-                    dm.mobile,
-                    dm.decoration.clone(),
-                    theme.sidebar,
-                )
-                .into_any_element(),
+                (None, false) => {
+                    // Typing to us: three dots where their status would be. Not animated,
+                    // since that would redraw the whole list on every frame.
+                    let typing = !self.services.store.read(cx).typing(dm.id).is_empty();
+                    let dots = typing.then(|| {
+                        h_flex()
+                            .absolute()
+                            .right(u(-3.))
+                            .bottom(u(-3.))
+                            .h(u(13.))
+                            .px(u(3.))
+                            .gap(u(2.))
+                            .items_center()
+                            .rounded_full()
+                            .bg(theme.sidebar)
+                            .children((0..3).map(|_| div().size(u(3.)).rounded_full().bg(bright)))
+                            .into_any_element()
+                    });
+                    crate::members::avatar_with_overlay(
+                        Avatar::new().border_0().src(dm.avatar_url.clone()).name(dm.label.clone()),
+                        32.,
+                        if typing { None } else { dm.status },
+                        !typing && dm.mobile,
+                        dm.decoration.clone(),
+                        theme.sidebar,
+                        dots,
+                    )
+                    .into_any_element()
+                }
             };
             let line = crate::members::status_element(&dm.line, dm.in_voice, cx);
             // Measured in Discord: 42px rows, a 32px avatar, a 16/20 name over a 12/16 line.
@@ -761,16 +791,33 @@ impl SidePane {
                 // Plays while hovered, once it's ready, so there's no gap between the two.
                 .on_hover({
                     let (id, video) = (SharedString::from(format!("channel-{}", dm.id)), dm.nameplate_video.clone());
-                    let track = crate::transition::track_pointer(id);
-                    move |over: &bool, window: &mut Window, cx: &mut gpui_kit::App| {
+                    // This list alone: redrawing the window here redrew the chat for every
+                    // row that passed under the pointer.
+                    let view = cx.entity_id();
+                    move |over: &bool, _: &mut Window, cx: &mut gpui_kit::App| {
+                        crate::transition::set_pointer(&id, *over);
+                        if crate::smooth_scroll::list_scrolling() {
+                            if *over {
+                                let video = video.clone();
+                                crate::smooth_scroll::after_scrolling(id.clone(), move |cx| {
+                                    if let Some(url) = &video {
+                                        crate::nameplates::warm(url, cx);
+                                    }
+                                    cx.notify(view);
+                                });
+                            } else {
+                                crate::smooth_scroll::cancel_after_scrolling(&id);
+                            }
+                            return;
+                        }
                         if *over && let Some(url) = &video {
                             crate::nameplates::warm(url, cx);
                         }
-                        track(over, window, cx);
+                        cx.notify(view);
                     }
                 })
                 .children(dm.nameplate.clone().map(|url| {
-                    let hovered = crate::transition::pointer_on(&SharedString::from(format!("channel-{}", dm.id)));
+                    let hovered = !crate::smooth_scroll::list_scrolling() && crate::transition::pointer_on(&SharedString::from(format!("channel-{}", dm.id)));
                     let playing = dm.nameplate_video.as_deref().filter(|_| hovered).and_then(|video| crate::nameplates::ready(video, cx));
                     let picture = match playing {
                         Some(image) => crate::anim::image(image, ObjectFit::Cover, 5.).absolute().top_0().left_0().size_full().into_any_element(),
@@ -803,7 +850,7 @@ impl SidePane {
                                             crate::badges::name_text(SharedString::from(format!("dm-name-{}", dm.id)), &dm.label, &dm.stops, crate::transition::pointer_on(&SharedString::from(format!("channel-{}", dm.id)))),
                                             &dm.label,
                                             &crate::badges::NameLook { effect: dm.effect, effect_color: dm.effect_color, font: dm.font, color: dm.color, stops: Vec::new() },
-                                            crate::transition::pointer_on(&SharedString::from(format!("channel-{}", dm.id))),
+                                            !crate::smooth_scroll::list_scrolling() && crate::transition::pointer_on(&SharedString::from(format!("channel-{}", dm.id))),
                                         )),
                                 )
                                 .when_some(dm.tag.clone(), |d, (tag, badge)| {
@@ -829,7 +876,7 @@ impl SidePane {
                 .pb(u(6.5))
                 .gap(u(3.))
                 .items_center()
-                .text_size(rems(16. / 16.))
+                .text_size(rems(1.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.muted_foreground)
                 .cursor_pointer()
@@ -863,7 +910,7 @@ impl SidePane {
                     .px(u(17.))
                     .pt(u(17.5))
                     .pb(u(6.5))
-                    .text_size(rems(16. / 16.))
+                    .text_size(rems(1.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.muted_foreground)
                     .child("Direct Messages")
@@ -916,6 +963,10 @@ impl SidePane {
         // Channels that ping us, for the "new mention" pills when scrolled away.
         let mut pinged: Vec<(usize, u32)> = Vec::new();
         let mut selected_row = None;
+        // The list is built in full once whenever it changes, which tells us every row's place.
+        let list_key = self.sidebar.as_ref().map(|s| s.key);
+        let places_known = list_key.is_some() && self.drawn_list.get() == list_key;
+        self.drawn_list.set(list_key);
         for row in rows {
             if let sidebar::Row::Channel(c) | sidebar::Row::Thread(c) = row
                 && location.channel == Some(c.id)
@@ -926,6 +977,12 @@ impl SidePane {
                 && c.mentions > 0
             {
                 pinged.push((body.len(), c.mentions));
+            }
+            // Far off screen, a row is just its height: laying out every row of a long
+            // list each frame is what made scrolling it slow.
+            if let Some(height) = room_for_unseen_row(&self.channels_scroll, body.len(), places_known) {
+                body.push(div().w_full().flex_shrink_0().h(gpui_kit::px(height)).into_any_element());
+                continue;
             }
             body.push(match row {
                 sidebar::Row::Category { id, label, folded, can_add } => category_row(*id, label, *folded, *can_add).into_any_element(),
@@ -1053,7 +1110,8 @@ impl SidePane {
                             .id("channel-list")
                             .size_full()
                             .when(!has_banner, |d| d.pt(u(6.5)))
-                            .pb(u(77.))
+                            // The card floats over the end of the list: keep room for all of it.
+                            .pb(u(if self.services.store.read(cx).voice_status().is_some() { 77. + VOICE_PANEL_ROOM } else { 77. }))
                             .overflow_y_scroll()
                             .track_scroll(&self.channels_scroll)
                             .children(body),
@@ -1079,14 +1137,19 @@ impl SidePane {
     fn participant_row(&self, p: sidebar::Participant, cx: &Context<Self>) -> impl IntoElement {
         let row_top = std::rc::Rc::new(std::cell::Cell::new(gpui_kit::px(0.)));
         let theme = cx.theme();
+        let locally_muted = crate::places::is_muted(p.user_id);
+        let speaking = self.services.store.read(cx).speaking().contains(&p.user_id);
         h_flex()
             .id(SharedString::from(format!("voice-{}", p.user_id)))
             .on_mouse_down(gpui_kit::MouseButton::Right, {
                 let (services, router, user, name, guild) = (self.services.clone(), self.router.clone(), p.user_id, p.name.clone(), self.voice_row_guild(cx));
-                move |event: &gpui_kit::MouseDownEvent, _, cx: &mut gpui_kit::App| {
+                let (top, column) = (row_top.clone(), self.services.settings.read(cx).get().column_width);
+                move |event: &gpui_kit::MouseDownEvent, window: &mut Window, cx: &mut gpui_kit::App| {
                     cx.stop_propagation();
                     if let Some(guild) = guild {
-                        voice_person_menu(&services, &router, guild, user, name.clone(), event.position, cx);
+                        // Where clicking them opens it: just right of the column, level with the row.
+                        let card_at = gpui_kit::point(window.rem_size() * ((RAIL_WIDTH + column + 8.) / 16.), top.get());
+                        voice_person_menu(&services, &router, guild, user, name.clone(), event.position, card_at, cx);
                     }
                 }
             })
@@ -1117,7 +1180,15 @@ impl SidePane {
                     crate::links::open_profile(user, gpui_kit::point(x, row_top.get()), cx);
                 }
             })
-            .child(Avatar::new().border_0().src(p.avatar_url).name(p.name.clone()).size(u(25.5)))
+            .child(
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .child(Avatar::new().border_0().src(p.avatar_url).name(p.name.clone()).size(u(25.5)))
+                    .when(speaking, |d| {
+                        d.child(div().absolute().top(u(-2.)).left(u(-2.)).size(u(29.5)).rounded_full().border_2().border_color(Hsla::from(gpui_kit::rgb(GREEN))))
+                    }),
+            )
             .child(
                 h_flex()
                     .flex_1()
@@ -1146,8 +1217,10 @@ impl SidePane {
                         .child("LIVE"),
                 )
             })
-            .when(p.muted, |this| this.child(Icon::new(IconName::MicOff).size(u(16.)).flex_shrink_0()))
-            .when(p.deafened, |this| this.child(Icon::new(IconName::HeadphoneOff).size(u(16.)).flex_shrink_0()))
+            // Muted by us alone: a speaker, not a microphone, since they can still talk.
+            .when(locally_muted, |this| this.child(Icon::new(IconName::VolumeX).size(u(16.)).flex_shrink_0().text_color(theme.muted_foreground.opacity(0.7))))
+            .when(p.muted, |this| this.child(Icon::new(IconName::MicOff).size(u(16.)).flex_shrink_0().when(p.server_muted, |d| d.text_color(gpui_kit::rgb(0xf23f43)))))
+            .when(p.deafened, |this| this.child(Icon::new(IconName::HeadphoneOff).size(u(16.)).flex_shrink_0().when(p.server_deafened, |d| d.text_color(gpui_kit::rgb(0xf23f43)))))
     }
 
     /// What sits at the bottom of the column: who you are and, in a call, the call.
@@ -1500,6 +1573,9 @@ impl Shell {
     }
 }
 
+/// How much taller the bottom card is during a call.
+const VOICE_PANEL_ROOM: f32 = 66.;
+
 impl Shell {
     /// A mouse's side buttons go back and forward, wherever the pointer is.
     fn mouse_side_buttons(&self) -> impl IntoElement {
@@ -1616,6 +1692,7 @@ impl Render for Shell {
             .children(crate::context_menu::overlay(cx))
             .child(self.mouse_side_buttons())
             .children(crate::confirm::overlay(window, cx))
+            .children(crate::add_people::overlay(window, cx))
             .children(crate::emoji_card::overlay(cx))
             .when_some(self.info.clone(), |this, monitor| {
                 this.child(
@@ -1751,7 +1828,7 @@ fn folder_menu(
 /// Right click on a DM or group in the list, as Discord's. What isn't built yet shows dimmed.
 /// The right click menu of someone in a voice channel. Only what we may do; anything
 /// done to them for everyone asks first.
-fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_core::Id, user: cord_core::Id, name: String, position: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut gpui_kit::App) {
+fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_core::Id, user: cord_core::Id, name: String, position: gpui_kit::Point<gpui_kit::Pixels>, card_at: gpui_kit::Point<gpui_kit::Pixels>, cx: &mut gpui_kit::App) {
     use crate::context_menu::{self as menu, Entry};
     use cord_core::permissions as perms;
     let store = services.store.read(cx);
@@ -1764,7 +1841,7 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
     let can_kick = cache.guild_permissions(guild) & perms::KICK_MEMBERS != 0;
     let state = cache.voice_state(guild, user).map(|v| (v.mute, v.deaf)).unwrap_or_default();
     let core = store.core().clone();
-    let mut entries = vec![Entry::item("Profile", move |_, cx| crate::links::open_profile(user, position, cx))];
+    let mut entries = vec![Entry::item("Profile", move |_, cx| crate::links::show_profile(user, card_at, cx))];
     entries.push({
         let mention = name.clone();
         Entry::item("Mention", move |_, cx| crate::links::request_mention(user, mention.clone(), cx))
@@ -1803,38 +1880,30 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
     if can_mute || can_deafen || can_move || (can_kick && !itself) {
         entries.push(Entry::Separator);
     }
-    let change = |label: &'static str, field: &'static str, value: bool, title: String, body: String, action: &'static str| {
+    let change = |label: &'static str, field: &'static str, value: bool| {
         let core = core.clone();
         Entry::check(label, !value, true, move |_, cx| {
             let core = core.clone();
-            crate::confirm::ask(title.clone(), body.clone(), action, move |cx| {
-                let core = core.clone();
-                cx.spawn(async move |_| {
-                    let _ = core.update_member_voice(guild, user, serde_json::json!({ field: value })).await;
-                })
-                .detach();
-            }, cx);
+            cx.spawn(async move |_| {
+                let _ = core.update_member_voice(guild, user, serde_json::json!({ field: value })).await;
+            })
+            .detach();
         })
     };
     if can_mute {
-        let (muted, verb) = (state.0, if state.0 { "Unmute" } else { "Server Mute" });
-        entries.push(change("Server Mute", "mute", !muted, format!("{verb} {name}"), format!("{verb} {name} for everyone in this server?"), verb));
+        entries.push(change("Server Mute", "mute", !state.0));
     }
     if can_deafen {
-        let (deaf, verb) = (state.1, if state.1 { "Undeafen" } else { "Server Deafen" });
-        entries.push(change("Server Deafen", "deaf", !deaf, format!("{verb} {name}"), format!("{verb} {name} for everyone in this server?"), verb));
+        entries.push(change("Server Deafen", "deaf", !state.1));
     }
     if can_move {
-        let (core, title, body) = (core.clone(), format!("Disconnect {name}"), format!("Remove {name} from this voice channel?"));
+        let core = core.clone();
         entries.push(Entry::item("Disconnect", move |_, cx| {
             let core = core.clone();
-            crate::confirm::ask(title.clone(), body.clone(), "Disconnect", move |cx| {
-                let core = core.clone();
-                cx.spawn(async move |_| {
-                    let _ = core.update_member_voice(guild, user, serde_json::json!({ "channel_id": null })).await;
-                })
-                .detach();
-            }, cx);
+            cx.spawn(async move |_| {
+                let _ = core.update_member_voice(guild, user, serde_json::json!({ "channel_id": null })).await;
+            })
+            .detach();
         }).danger());
     }
     if can_kick && !itself {
@@ -1874,12 +1943,12 @@ fn dm_menu(
         Entry::later("Mark As Read")
     }];
     entries.push(Entry::Separator);
-    entries.push(Entry::later("Pin").icon(IconName::Pin));
+    entries.push(Entry::later("Pin").picture("icons/toolbar-pin.svg"));
     entries.push(Entry::later("Add to Favorites").icon(IconName::Star));
     entries.push(Entry::Separator);
     match dm.user {
         Some(user) => {
-            entries.push(Entry::item("Profile", move |_, cx| crate::links::open_profile(user, position, cx)));
+            entries.push(Entry::item("Profile", move |_, cx| crate::links::show_profile(user, position, cx)));
             if !dm.bot {
                 entries.push(Entry::later("Start a Call"));
             }
@@ -1936,6 +2005,30 @@ fn reveal_distance(top: f32, bottom: f32, height: f32) -> Option<f32> {
     } else {
         None
     }
+}
+
+/// How far outside the view rows stay fully built, so none shows up empty mid-glide.
+const ROWS_KEPT_BEYOND_VIEW: f32 = 600.;
+
+/// Whether a row spanning `top..bottom` (as drawn, scrolled) is out of reach of the view.
+fn out_of_reach(top: f32, bottom: f32, view_top: f32, view_bottom: f32) -> bool {
+    bottom < view_top - ROWS_KEPT_BEYOND_VIEW || top > view_bottom + ROWS_KEPT_BEYOND_VIEW
+}
+
+/// The height to keep for row `ix` if it's out of reach; `None` to build it for real.
+/// Measured up to the next row, so that its margin stays too.
+fn room_for_unseen_row(scroll: &ScrollHandle, ix: usize, places_known: bool) -> Option<f32> {
+    if !places_known {
+        return None;
+    }
+    let item = scroll.bounds_for_item(ix)?;
+    let height = f32::from(scroll.bounds_for_item(ix + 1).map_or(item.size.height, |next| next.top() - item.top()));
+    if height <= 0. {
+        return None;
+    }
+    let (view, offset) = (scroll.bounds(), scroll.offset().y);
+    let top = f32::from(item.top() + offset);
+    out_of_reach(top, top + height, f32::from(view.top()), f32::from(view.bottom())).then_some(height)
 }
 
 fn mention_pills(scroll: &ScrollHandle, scroller: &SmoothScroller, smooth: bool, pinged: &[(usize, u32)], cx: &Context<SidePane>) -> Vec<AnyElement> {
@@ -2036,5 +2129,16 @@ mod reveal_tests {
         assert!(below > 132.);
         assert_eq!(reveal_distance(100. - below, 132. - below, 800.).map(|_| ()), Some(()));
         assert_eq!(reveal_distance(900. - below, 932. - below, 800.), None);
+    }
+}
+
+#[cfg(test)]
+mod reach_tests {
+    #[test]
+    fn only_rows_well_outside_the_view_are_out_of_reach() {
+        assert!(!super::out_of_reach(100., 140., 0., 800.), "on screen");
+        assert!(!super::out_of_reach(1300., 1340., 0., 800.), "just below: kept for the glide");
+        assert!(super::out_of_reach(1500., 1540., 0., 800.));
+        assert!(super::out_of_reach(-700., -660., 0., 800.));
     }
 }

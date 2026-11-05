@@ -274,6 +274,7 @@ mod tests {
 
     fn ch(id: u64, kind: ChannelKind, name: &str, position: i32, parent: Option<u64>) -> Channel {
         Channel {
+            owner_id: None,
             id: Id(id), kind, guild_id: Some(Id(300)), name: Some(name.into()), position,
             parent_id: parent.map(Id), last_message_id: None, recipient_ids: vec![], recipients: vec![], icon: None, permission_overwrites: vec![], topic: None,
         }
@@ -281,6 +282,7 @@ mod tests {
 
     fn dm(id: u64, kind: ChannelKind, name: Option<&str>, recipients: &[u64]) -> Channel {
         Channel {
+            owner_id: None,
             id: Id(id), kind, guild_id: None, name: name.map(Into::into), position: 0, parent_id: None,
             last_message_id: None, recipient_ids: recipients.iter().copied().map(Id).collect(), recipients: vec![], icon: None,
             permission_overwrites: vec![], topic: None,
@@ -500,6 +502,7 @@ mod chat_tests {
             embeds: vec![],
             components: vec![],
             message_reference: None,
+            call: None,
             referenced_message: None,
             sticker_items: vec![],
             reactions: vec![], mention_everyone: false, mention_roles: vec![],

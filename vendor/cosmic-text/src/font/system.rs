@@ -310,6 +310,15 @@ impl FontSystem {
         if let Some(known) = self.char_fonts.get(&ch) {
             return *known;
         }
+        // Rustcord: emoji in color, from Apple's font when it's there. Newer ones it may
+        // not have are left to fontconfig.
+        if matches!(ch as u32, 0x1F300..=0x1F9FF) {
+            let apple = self.db.faces().find(|face| face.post_script_name == "AppleColorEmoji").map(|face| face.id);
+            if apple.is_some() {
+                self.char_fonts.insert(ch, apple);
+                return apple;
+            }
+        }
         let found = crate::font::fallback::fontconfig::font_with_char(ch).and_then(|(file, index)| {
             let path = std::path::Path::new(&file);
             self.db.faces().find(|face| {

@@ -156,6 +156,16 @@ impl Core {
 
     /// Asks the gateway for these members of `guild` (they arrive as
     /// `MembersChunk`): messages fetched over REST don't say who has what role.
+    /// Asks for `users`' status as well: for someone outside any list we're watching,
+    /// such as a bot in a DM.
+    pub fn request_presences(&self, guild: Id, users: &[Id]) {
+        let ids: Vec<String> = users.iter().map(Id::to_string).collect();
+        self.send_gateway(serde_json::json!({
+            "op": 8,
+            "d": { "guild_id": [guild.to_string()], "user_ids": ids, "presences": true }
+        }));
+    }
+
     pub fn request_members(&self, guild: Id, users: &[Id]) {
         for ids in users.chunks(100) {
             let ids: Vec<String> = ids.iter().map(Id::to_string).collect();
@@ -280,6 +290,30 @@ impl Core {
     }
 
     /// Adds someone to a group chat.
+    pub async fn remove_recipient(&self, channel: Id, user: Id) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.delete(&format!("/channels/{channel}/recipients/{user}")).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Hands a group DM to `user`.
+    pub async fn set_group_owner(&self, channel: Id, user: Id) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let change = serde_json::json!({ "owner": user.to_string() });
+                let _: Value = http.patch(&format!("/channels/{channel}"), &change).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
     pub async fn add_recipient(&self, channel: Id, user: Id) -> Result<(), HttpError> {
         let http = self.http.clone();
         let result = self
@@ -431,6 +465,18 @@ impl Core {
     /// The profile as it is now: opening someone's card shows the kept one at
     /// once, and this replaces it, so a change they made shows straight away.
     pub async fn fetch_profile(&self, user: Id, guild: Option<Id>) -> Result<Arc<UserProfile>, HttpError> {
+        let result = self.fetch_profile_from(user, guild, guild).await;
+        // Asked for from a server Discord won't answer about them for: their own profile
+        // still beats showing an old copy forever.
+        if matches!(result, Err(HttpError::NotFound)) && guild.is_some() {
+            tracing::info!(%user, ?guild, "profile not found for that server, asking without it");
+            return self.fetch_profile_from(user, None, guild).await;
+        }
+        result
+    }
+
+    /// Asks with `guild`; what comes back is kept under `kept_for`.
+    async fn fetch_profile_from(&self, user: Id, guild: Option<Id>, kept_for: Option<Id>) -> Result<Arc<UserProfile>, HttpError> {
         let http = self.http.clone();
         let mut path = format!("/users/{user}/profile?with_mutual_guilds=true&with_mutual_friends=true&with_mutual_friends_count=true");
         if let Some(guild) = guild {
@@ -439,12 +485,34 @@ impl Core {
         let result = self.on_rt(async move { http.get::<Value>(&path).await }).await;
         let raw = self.watch(result)?;
         log_cosmetics(user, &raw);
-        self.profile_to_disk(user, guild, &raw);
+        self.profile_to_disk(user, kept_for, &raw);
         let mut profile: UserProfile = serde_json::from_value(raw).map_err(|e| HttpError::Decode(e.to_string()))?;
         profile.seen_from(guild);
         let profile = Arc::new(profile);
-        self.profiles.lock().unwrap().insert((user, guild), profile.clone());
+        self.profiles.lock().unwrap().insert((user, kept_for), profile.clone());
         Ok(profile)
+    }
+
+    pub async fn add_friend(&self, user: Id) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.put(&format!("/users/@me/relationships/{user}")).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    pub async fn remove_friend(&self, user: Id) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.delete(&format!("/users/@me/relationships/{user}")).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
     }
 
     /// What an invite code leads to, with member counts.

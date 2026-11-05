@@ -68,6 +68,23 @@ pub fn app_badge() -> AnyElement {
         .into_any_element()
 }
 
+/// On Discord's own account, in place of the APP badge.
+pub fn official_badge() -> AnyElement {
+    div()
+        .flex_shrink_0()
+        .h(u(16.))
+        .px(u(5.))
+        .flex()
+        .items_center()
+        .rounded(u(4.))
+        .bg(gpui_kit::Hsla::from(gpui_kit::rgb(0x5865f2)))
+        .text_color(gpui_kit::white())
+        .text_size(u(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child("\u{2713} OFFICIAL")
+        .into_any_element()
+}
+
 /// A server tag as just its badge, as the voice list shows it.
 pub fn tag_icon(url: &str, cx: &App) -> AnyElement {
     div()
@@ -123,6 +140,11 @@ fn gradient_position(x: f32, phase: f32) -> f32 {
     (x / GRADIENT_LOOP - phase).rem_euclid(1.)
 }
 
+/// The little crown beside whoever owns a server or group.
+pub fn owner_crown() -> impl IntoElement {
+    gpui_kit::component::Icon::default().path("icons/crown.svg").size(gpui_kit::rems(14. / 16.)).flex_shrink_0().text_color(gpui_kit::rgb(0xf0b232))
+}
+
 /// Keeps a name to its width. A gradient name paints itself, so its sizing text must
 /// never be measured as an ellipsised string: the paint would be clipped to that.
 pub fn name_clip<E: gpui_kit::Styled>(element: E, stops: &[gpui_kit::Hsla]) -> E {
@@ -160,8 +182,20 @@ pub fn gradient_text(text: &str, stops: &[gpui_kit::Hsla], phase: f32) -> AnyEle
                     if bounds.size.width + gpui_kit::px(1.) < line.width && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         tracing::info!(text = %painted, box_width = f32::from(bounds.size.width), text_width = f32::from(line.width), "gradient name is wider than its box");
                     }
+                    // The sizing text's underline is as invisible as the rest of it, so a
+                    // name hovered draws its own, in its own colors.
+                    let underlined = style.underline.is_some();
                     let baseline = bounds.origin.y + (line_height - line.ascent - line.descent) / 2. + line.ascent;
                     let _ = cx;
+                    if underlined {
+                        let mut x = 0.;
+                        while x < f32::from(line.width) {
+                            let width = SLICE.min(f32::from(line.width) - x);
+                            let at = gpui_kit::Bounds::new(gpui_kit::point(bounds.origin.x + gpui_kit::px(x), baseline + gpui_kit::px(2.)), gpui_kit::size(gpui_kit::px(width), gpui_kit::px(1.)));
+                            window.paint_quad(gpui_kit::fill(at, gradient_at(&stops, gradient_position(x + SLICE / 2., phase))));
+                            x += SLICE;
+                        }
+                    }
                     for run in &line.runs {
                         for (i, glyph) in run.glyphs.iter().enumerate() {
                             let origin = gpui_kit::point(bounds.origin.x + glyph.position.x, baseline);

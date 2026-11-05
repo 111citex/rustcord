@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use gpui_kit::Context;
 use serde::{Deserialize, Serialize};
 
-pub const ZOOM_MIN: u16 = 50;
-pub const ZOOM_MAX: u16 = 200;
-const ZOOM_STEP: u16 = 10;
+pub const ZOOM_MIN: u16 = 100;
+pub const ZOOM_MAX: u16 = 160;
+pub const ZOOM_STEP: u16 = 5;
 pub const CHAT_TEXT_MIN: u8 = 12;
 pub const CHAT_TEXT_MAX: u8 = 24;
 /// GPUI's default rem, which zoom scales.
@@ -103,11 +103,6 @@ impl Settings {
     }
 }
 
-pub fn step_zoom(zoom: u16, direction: i8) -> u16 {
-    let next = if direction < 0 { zoom.saturating_sub(ZOOM_STEP) } else { zoom + ZOOM_STEP };
-    next.clamp(ZOOM_MIN, ZOOM_MAX)
-}
-
 pub const MAX_IMAGE_SCREENS: u8 = 5;
 pub const BIG_MEMORY_STEPS: [u16; 6] = [64, 128, 256, 512, 1024, 2048];
 
@@ -119,11 +114,6 @@ pub fn step_big_memory(kb: u16, direction: i8) -> u16 {
 
 pub fn step_image_screens(screens: u8, direction: i8) -> u8 {
     screens.saturating_add_signed(direction).min(MAX_IMAGE_SCREENS)
-}
-
-pub fn step_chat_text(size: u8, direction: i8) -> u8 {
-    let next = if direction < 0 { size.saturating_sub(1) } else { size + 1 };
-    next.clamp(CHAT_TEXT_MIN, CHAT_TEXT_MAX)
 }
 
 /// The settings as an entity views observe; every change is saved at once.
@@ -210,23 +200,18 @@ mod tests {
         let s = Settings::load_from(&path);
         assert_eq!((s.zoom, s.chat_text), (ZOOM_MAX, CHAT_TEXT_MIN));
         // Off-step zoom snaps to the nearest step.
-        assert_eq!(Settings { zoom: 113, ..Settings::default() }.clamped().zoom, 110);
+        assert_eq!(Settings { zoom: 113, ..Settings::default() }.clamped().zoom, 115);
     }
 
     #[test]
-    fn zoom_steps_stay_in_range() {
-        assert_eq!(step_zoom(100, 1), 110);
-        assert_eq!(step_zoom(ZOOM_MAX, 1), ZOOM_MAX);
-        assert_eq!(step_zoom(ZOOM_MIN, -1), ZOOM_MIN);
+    fn steps_stay_in_range() {
         assert_eq!(step_big_memory(64, -1), 64);
         assert_eq!(step_big_memory(64, 1), 128);
         assert_eq!(step_big_memory(2048, 1), 2048);
-        assert_eq!(step_big_memory(100, 0), 128, "something in between lands on a step");
+        assert_eq!(step_big_memory(100, 0), 128, "something in between lands on the next step");
         assert_eq!(step_image_screens(0, -1), 0);
         assert_eq!(step_image_screens(1, 1), 2);
         assert_eq!(step_image_screens(MAX_IMAGE_SCREENS, 1), MAX_IMAGE_SCREENS);
-        assert_eq!(step_chat_text(16, 1), 17);
-        assert_eq!(step_chat_text(CHAT_TEXT_MAX, 1), CHAT_TEXT_MAX);
         assert_eq!(Settings { zoom: 125, ..Settings::default() }.rem_px(), 20.);
     }
 }

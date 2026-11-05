@@ -18,7 +18,7 @@ use crate::ui::u;
 pub type Action = Rc<dyn Fn(&mut Window, &mut App)>;
 
 pub enum Entry {
-    Item { label: SharedString, icon: Option<IconName>, danger: bool, action: Option<Action> },
+    Item { label: SharedString, icon: Option<IconName>, picture: Option<&'static str>, danger: bool, action: Option<Action> },
     Separator,
     /// Drags from silent to double, staying open.
     Slider { label: SharedString, value: Rc<Cell<f32>>, set: Rc<dyn Fn(f32, &mut App)> },
@@ -30,7 +30,7 @@ pub enum Entry {
 
 impl Entry {
     pub fn item(label: impl Into<SharedString>, action: impl Fn(&mut Window, &mut App) + 'static) -> Self {
-        Entry::Item { label: label.into(), icon: None, danger: false, action: Some(Rc::new(action)) }
+        Entry::Item { label: label.into(), icon: None, picture: None, danger: false, action: Some(Rc::new(action)) }
     }
 
     pub fn slider(label: impl Into<SharedString>, value: f32, set: impl Fn(f32, &mut App) + 'static) -> Self {
@@ -44,11 +44,19 @@ impl Entry {
 
     /// Discord has it, rustcord doesn't do it yet.
     pub fn later(label: impl Into<SharedString>) -> Self {
-        Entry::Item { label: label.into(), icon: None, danger: false, action: None }
+        Entry::Item { label: label.into(), icon: None, picture: None, danger: false, action: None }
     }
 
     pub fn copy(label: impl Into<SharedString>, text: String) -> Self {
         Self::item(label, move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
+    }
+
+    /// An icon from our own files, as Discord draws it.
+    pub fn picture(mut self, path: &'static str) -> Self {
+        if let Entry::Item { picture, .. } = &mut self {
+            *picture = Some(path);
+        }
+        self
     }
 
     pub fn icon(mut self, name: IconName) -> Self {
@@ -110,28 +118,9 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
     let rows = open.entries.iter().enumerate().map(|(i, entry)| match entry {
         Entry::Separator => div().mx(u(8.)).my(u(4.)).h(u(1.)).bg(theme.border).into_any_element(),
         Entry::Slider { label, value, set } => {
-            const CELLS: usize = 40;
             let level = value.get();
-            let cells = (0..CELLS).map(|n| {
-                let at = (n + 1) as f32 / CELLS as f32 * MAX_GAIN;
-                let (down_value, down_set, move_value, move_set) = (value.clone(), set.clone(), value.clone(), set.clone());
-                div()
-                    .id(("menu-cell", i * CELLS + n))
-                    .flex_1()
-                    .h(u(16.))
-                    .flex()
-                    .items_center()
-                    .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
-                        cx.stop_propagation();
-                        change_level(&down_value, &down_set, at, cx);
-                    })
-                    .on_mouse_move(move |event: &gpui_kit::MouseMoveEvent, _, cx| {
-                        if event.pressed_button == Some(gpui_kit::MouseButton::Left) {
-                            change_level(&move_value, &move_set, at, cx);
-                        }
-                    })
-                    .child(div().w_full().h(u(6.)).bg(if at <= level + 0.001 { gpui_kit::Hsla::from(gpui_kit::rgb(0x5865f2)) } else { muted.opacity(0.3) }))
-            });
+            let (value, set) = (value.clone(), set.clone());
+            let change: Rc<dyn Fn(f32, &mut App)> = Rc::new(move |at, cx| change_level(&value, &set, at * MAX_GAIN, cx));
             v_flex()
                 .px(u(8.))
                 .py(u(6.))
@@ -145,7 +134,7 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
                         .child(label.clone())
                         .child(div().text_color(muted).child(format!("{}%", (level * 100.).round() as u32))),
                 )
-                .child(h_flex().w_full().items_center().children(cells))
+                .child(div().w_full().h(u(16.)).px(u(6.)).child(crate::slider::slider(format!("menu-slider-{i}"), level / MAX_GAIN, false, gpui_kit::Hsla::from(gpui_kit::rgb(0x5865f2)), muted.opacity(0.3), change)))
                 .into_any_element()
         }
         Entry::Check { label, on, danger: red, closes, action } => {
@@ -208,7 +197,7 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
                     .child(crate::badges::emoji_image(emoji, 24.))
             }))
             .into_any_element(),
-        Entry::Item { label, icon, danger: red, action } => {
+        Entry::Item { label, icon, picture, danger: red, action } => {
             let enabled = action.is_some();
             let action = action.clone();
             let color = if *red { danger } else { fg };
@@ -229,6 +218,7 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
                         action(window, cx);
                     })
                 })
+                .when_some(*picture, |d, path| d.child(Icon::default().path(path).size(u(18.)).flex_shrink_0()))
                 .when_some(icon.clone(), |d, icon| d.child(Icon::new(icon).size(u(18.)).flex_shrink_0()))
                 .child(div().flex_1().min_w_0().truncate().child(label.clone()))
                 .into_any_element()

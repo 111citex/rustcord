@@ -382,19 +382,27 @@ fn tile_grid(env: &Env, name: &str, tiles: &[Tile], width: f32, cx: &App) -> Any
 }
 
 fn sticker(env: &Env, s: &StickerItem, cx: &App) -> AnyElement {
+    // The card opens past its right edge, level with its top.
+    let spot = markdown_view::NameSpot::default();
+    let spot_layer = |spot: &markdown_view::NameSpot| {
+        let spot = spot.clone();
+        gpui_kit::canvas(move |at, _, _| spot.set(Some(at)), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
+    };
     if crate::stickers::is_rendered(s.format_type) {
         // A fixed box while it renders, so the row keeps its height.
         return match crate::stickers::image(s.id, cx) {
             Ok(image) => div()
                 .id(eid(env, "sticker", &s.id.to_string()))
+                .relative()
                 .size(u(160.))
                 .cursor_pointer()
+                .child(spot_layer(&spot))
                 .on_click({
                     let subject = crate::emoji_card::Subject::Sticker { id: s.id, name: s.name.clone(), picture: sticker_url(s).unwrap_or_default() };
-                    let here = env.guild;
+                    let (here, target) = (env.guild, spot.clone());
                     move |event, _, cx| {
                         cx.stop_propagation();
-                        crate::emoji_card::toggle(subject.clone(), here, event.position(), cx);
+                        crate::emoji_card::toggle(subject.clone(), here, markdown_view::card_at(&target, event.position()), cx);
                     }
                 })
                 .children(image.map(|image| crate::anim::image(image, ObjectFit::Contain, 0.).size(u(160.))))
@@ -406,14 +414,16 @@ fn sticker(env: &Env, s: &StickerItem, cx: &App) -> AnyElement {
         Some(url) => {
             div()
                 .id(eid(env, "sticker", &s.id.to_string()))
+                .relative()
                 .size(u(160.))
                 .cursor_pointer()
+                .child(spot_layer(&spot))
                 .on_click({
                     let subject = crate::emoji_card::Subject::Sticker { id: s.id, name: s.name.clone(), picture: sticker_url(s).unwrap_or_default() };
-                    let here = env.guild;
+                    let (here, target) = (env.guild, spot.clone());
                     move |event, _, cx| {
                         cx.stop_propagation();
-                        crate::emoji_card::toggle(subject.clone(), here, event.position(), cx);
+                        crate::emoji_card::toggle(subject.clone(), here, markdown_view::card_at(&target, event.position()), cx);
                     }
                 })
                 .child(
@@ -883,6 +893,27 @@ pub enum SystemKind {
     Pin,
     Thread,
     FriendAccepted,
+    Call,
+}
+
+/// How a call's length reads: Discord rounds it, the way people say it.
+pub fn call_length(seconds: i64) -> String {
+    let minutes = (seconds as f64 / 60.).round() as i64;
+    let hours = (seconds as f64 / 3600.).round() as i64;
+    match seconds {
+        ..45 => "a few seconds".to_string(),
+        45..90 => "a minute".to_string(),
+        90..2700 => format!("{minutes} minutes"),
+        2700..5400 => "an hour".to_string(),
+        _ => format!("{hours} hours"),
+    }
+}
+
+/// How long a finished call lasted; `None` while it's still going.
+pub fn call_lasted(message: &Message) -> Option<String> {
+    let ended = message.call.as_ref()?.ended_timestamp.as_deref()?;
+    let ended = chrono::DateTime::parse_from_rfc3339(ended).ok()?.timestamp_millis();
+    Some(call_length((ended - message.id.timestamp_ms() as i64) / 1000))
 }
 
 /// A system message, as what comes before and after the person's name.
@@ -922,6 +953,11 @@ pub fn system_line(message: &Message) -> Option<SystemLine> {
             Some(removed) => Some(SystemLine { kind: SystemKind::Left, before: "", after: format!(" removed {} from the group.", removed.display_name()) }),
             None => Some(SystemLine { kind: SystemKind::Left, before: "", after: " left the group.".into() }),
         },
+        3 => Some(SystemLine {
+            kind: SystemKind::Call,
+            before: "",
+            after: call_lasted(message).map_or_else(|| " started a call.".to_string(), |lasted| format!(" started a call that lasted {lasted}.")),
+        }),
         4 => Some(SystemLine { kind: SystemKind::Renamed, before: "", after: format!(" changed the group name: {}.", message.content) }),
         5 => Some(SystemLine { kind: SystemKind::Renamed, before: "", after: " changed the group icon.".into() }),
         6 => Some(SystemLine { kind: SystemKind::Pin, before: "", after: " pinned a message to this channel.".into() }),
@@ -1132,11 +1168,76 @@ fn embed_groups(embeds: &[Embed]) -> Vec<(usize, Vec<&EmbedMedia>)> {
     groups
 }
 
+/// How long ago something was, as Discord says it.
+fn time_ago(seconds: i64) -> String {
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match seconds {
+        ..60 => "just now".to_string(),
+        60..3600 => plural(seconds / 60, "minute"),
+        3600..86400 => plural(seconds / 3600, "hour"),
+        86400..2_592_000 => plural(seconds / 86400, "day"),
+        _ => plural(seconds / 86400, "day"),
+    }
+}
+
+/// Discord's notices about your own account come as an embed of named fields, meant for
+/// its client to lay out: its heading, when, what it says, and a link.
+fn discord_notice(env: &Env, e: &Embed, cx: &App) -> Option<AnyElement> {
+    let field = |name: &str| e.fields.iter().find(|f| f.name == name).map(|f| f.value.as_str());
+    let (header, body) = (field("header")?, field("body")?);
+    let theme = cx.theme();
+    let link_blue = gpui_kit::Hsla::from(gpui_kit::rgb(0x00a8fc));
+    let when = field("timestamp").and_then(|t| t.parse::<f64>().ok()).map(|at| time_ago(chrono::Utc::now().timestamp() - at as i64));
+    let link = field("learn_more_link").map(str::to_string);
+    Some(
+        v_flex()
+            .w_full()
+            .max_w(u(720.))
+            .mt(u(2.))
+            .rounded(u(8.))
+            .overflow_hidden()
+            .bg(theme.secondary)
+            .child(
+                v_flex()
+                    .p(u(12.))
+                    .gap(u(4.))
+                    .child(
+                        h_flex()
+                            .gap(u(6.))
+                            .items_center()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(gpui_kit::component::Icon::new(crate::sidebar::channel_icon(cord_core::model::ChannelKind::Announcement)).size(u(18.)).text_color(link_blue).flex_shrink_0())
+                            .child(header.to_string()),
+                    )
+                    .when_some(when, |d, when| d.child(div().text_size(u(12.)).text_color(theme.muted_foreground).child(when)))
+                    .child(div().pt(u(4.)).text_color(theme.muted_foreground).child(body.to_string())),
+            )
+            .when_some(link, |d, url| {
+                d.child(
+                    div()
+                        .id(eid(env, "notice-link", ""))
+                        .px(u(12.))
+                        .py(u(8.))
+                        .bg(theme.foreground.opacity(0.06))
+                        .text_color(link_blue)
+                        .cursor_pointer()
+                        .hover(|d| d.underline())
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .child("Learn More"),
+                )
+            })
+            .into_any_element(),
+    )
+}
+
 fn embed(env: &Env, e: &Embed, index: usize, extra: &[&EmbedMedia], cx: &App) -> AnyElement {
     let small = Shared { text_size: env.shared.text_size * CARD_TEXT, in_card: true, ..env.shared.clone() };
     let env = &Env { shared: &small, cache: env.cache, message: env.message, guild: env.guild };
     let theme = cx.theme();
     let key = index.to_string();
+    if let Some(card) = discord_notice(env, e, cx) {
+        return card;
+    }
     let kind = e.kind.as_deref().unwrap_or("rich");
     let open = e.url.clone().or_else(|| e.video.as_ref().map(|v| v.url.clone()));
 
@@ -1367,7 +1468,8 @@ fn component(env: &Env, c: &Component, key: &str, cx: &App) -> AnyElement {
         Component::Section { components, accessory } => h_flex()
             .w_full()
             .gap_3()
-            .items_start()
+            // Text beside a button sits level with it; beside a picture it starts at the top.
+            .map(|d| if matches!(accessory.as_deref(), Some(Component::Button { .. })) { d.items_center() } else { d.items_start() })
             .child(
                 v_flex()
                     .flex_1()
@@ -1669,11 +1771,15 @@ pub fn reply_line(env: &Env, indent: f32, cx: &App) -> Option<AnyElement> {
                             move |bounds, _, _| over.set(matches!(bounds.as_slice(), [line, room, ..] if line.size.width > room.size.width))
                         })
                         .child(
+                            // Centered, like the name beside it: at larger text the line is
+                            // taller than this box, and from the top it'd sit lower than the name.
                             h_flex()
                                 .flex_shrink_0()
                                 .absolute()
                                 .top_0()
+                                .bottom_0()
                                 .left_0()
+                                .items_center()
                                 .gap(u(6.))
                                 .whitespace_nowrap()
                                 .text_color(theme.foreground.opacity(0.85))

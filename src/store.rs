@@ -58,6 +58,39 @@ impl MemberSub {
 /// Whether a window of ours has focus.
 pub static WINDOW_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// One of Discord's sounds: from disk if it's been fetched, else fetched and kept.
+async fn sound_file(core: Arc<Core>, name: &'static str, background: gpui_kit::BackgroundExecutor) -> Option<cord_voice::Clip> {
+    let file = cord_core::paths::cache_dir().join("sounds").join(format!("{name}.mp3"));
+    let saved = file.clone();
+    let bytes = match background.spawn(async move { std::fs::read(&saved).ok() }).await {
+        Some(bytes) => Some(bytes),
+        None => {
+            let fetched = core.cdn_bytes(format!("https://discord.com/assets/{name}.mp3")).await.ok();
+            if let Some(bytes) = &fetched {
+                let (file, copy) = (file.clone(), bytes.clone());
+                background
+                    .spawn(async move {
+                        if let Some(dir) = file.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        let _ = std::fs::write(file, copy);
+                    })
+                    .detach();
+            }
+            fetched
+        }
+    };
+    let Some(bytes) = bytes else {
+        tracing::warn!(name, "couldn't get a sound");
+        return None;
+    };
+    let clip = background.spawn(async move { cord_voice::decode_mp3(bytes) }).await;
+    if clip.is_none() {
+        tracing::warn!(name, "couldn't decode a sound");
+    }
+    clip
+}
+
 /// Discord's rule: nothing on Do Not Disturb, nothing for our own messages,
 /// muted places, `@silent` messages, or what's already in front of us.
 pub fn should_notify(status: Option<Status>, mine: bool, pinged: bool, muted: bool, flags: u64, looking: bool) -> bool {
@@ -129,6 +162,10 @@ pub fn ping_band(ms: u32) -> PingBand {
 pub struct Store {
     /// The call we're in, or joining.
     voice: Option<VoiceJoin>,
+    /// Who's making sound in our call.
+    speaking: std::collections::HashSet<Id>,
+    /// Plays with a desktop notification, once it's been fetched.
+    message_sound: Option<cord_voice::Clip>,
     core: Arc<Core>,
     toasts: Entity<Toasts>,
     cache: Cache,
@@ -158,7 +195,7 @@ impl EventEmitter<StoreEvent> for Store {}
 
 impl Store {
     pub fn new(core: Arc<Core>, toasts: Entity<Toasts>) -> Self {
-        Store { voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None }
+        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None }
     }
 
     pub fn core(&self) -> &Arc<Core> {
@@ -270,10 +307,43 @@ impl Store {
     /// Shows `channel`: keeps its live messages and loads the latest page.
     /// The previously open channel's messages are dropped (only open
     /// channels keep messages).
+    /// For three seconds after opening a chat, measures how long the main thread goes
+    /// without being able to do anything: that's how long typing would freeze for.
+    fn watch_chat_opening(&self, channel: Id, cx: &mut Context<Self>) {
+        const TICK: std::time::Duration = std::time::Duration::from_millis(4);
+        const WATCH_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+        static LATEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let this_one = LATEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let held_before = crate::perf::private_mb();
+        cx.spawn(async move |_, cx| {
+            let began = std::time::Instant::now();
+            let (mut worst, mut blocked, mut over_16, mut over_50) = (0u128, 0u128, 0u32, 0u32);
+            while began.elapsed() < WATCH_FOR {
+                let asked = std::time::Instant::now();
+                cx.background_executor().timer(TICK).await;
+                if LATEST.load(std::sync::atomic::Ordering::Relaxed) != this_one {
+                    return;
+                }
+                let late = asked.elapsed().saturating_sub(TICK).as_millis();
+                worst = worst.max(late);
+                if late >= 16 {
+                    over_16 += 1;
+                    blocked += late;
+                }
+                if late >= 50 {
+                    over_50 += 1;
+                }
+            }
+            tracing::info!(%channel, worst_ms = worst, blocked_ms = blocked, over_16, over_50, held_before, held_after = crate::perf::private_mb(), "chat open");
+        })
+        .detach();
+    }
+
     pub fn open_channel(&mut self, channel: Id, cx: &mut Context<Self>) {
         if self.open == Some(channel) {
             return;
         }
+        self.watch_chat_opening(channel, cx);
         let now = std::time::Instant::now();
         if let Some(previous) = self.open.replace(channel) {
             // Kept a while, and kept current by the gateway: coming back is instant.
@@ -454,6 +524,7 @@ impl Store {
             flags: 0,
             embeds: Vec::new(),
             components: Vec::new(),
+            call: None,
             message_reference: reply.map(|(id, _)| cord_core::rich::MessageReference { message_id: Some(id), channel_id: Some(channel), guild_id: None }),
             referenced_message: answered,
             sticker_items: Vec::new(),
@@ -548,8 +619,14 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let mut last = None;
             loop {
-                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
                 let Ok(keep_going) = this.update(cx, |store, cx| {
+                    // Only a change is worth a redraw.
+                    let speaking: std::collections::HashSet<Id> = store.voice.as_ref().and_then(|v| v.call.as_ref()).map_or_else(Default::default, |call| call.speaking().into_iter().map(Id).collect());
+                    if speaking != store.speaking {
+                        store.speaking = speaking;
+                        cx.notify();
+                    }
                     // It ended for good, not by us: no panel for a call that's gone.
                     if store.voice.as_ref().and_then(|v| v.call.as_ref()).is_some_and(|c| c.stats().state() == cord_voice::State::Closed) {
                         store.voice = None;
@@ -619,6 +696,10 @@ impl Store {
         cx.notify();
     }
 
+    pub fn speaking(&self) -> &std::collections::HashSet<Id> {
+        &self.speaking
+    }
+
     pub fn voice_status(&self) -> Option<VoiceStatus> {
         let voice = self.voice.as_ref()?;
         let call = voice.call.as_ref();
@@ -636,7 +717,9 @@ impl Store {
     /// stand-ins play.
     fn load_call_sounds(&self, cx: &mut Context<Self>) {
         use cord_voice::Sound;
-        const SOUNDS: [(Sound, &str); 5] = [
+        const SOUNDS: [(Sound, &str); 7] = [
+            (Sound::StreamStarted, "abe52a3c92953edb"),
+            (Sound::StreamEnded, "cbff07b5a83e0321"),
             (Sound::Connected, "b135ff6c8e091b43"),
             (Sound::SomeoneJoined, "b135ff6c8e091b43"),
             (Sound::SomeoneLeft, "7b9a183742515fc2"),
@@ -646,35 +729,7 @@ impl Store {
         let core = self.core.clone();
         cx.spawn(async move |this, cx| {
             for (sound, name) in SOUNDS {
-                let file = cord_core::paths::cache_dir().join("sounds").join(format!("{name}.mp3"));
-                let saved = file.clone();
-                let background = cx.background_executor().clone();
-                let bytes = match background.spawn(async move { std::fs::read(&saved).ok() }).await {
-                    Some(bytes) => Some(bytes),
-                    None => {
-                        let fetched = core.cdn_bytes(format!("https://discord.com/assets/{name}.mp3")).await.ok();
-                        if let Some(bytes) = &fetched {
-                            let (file, copy) = (file.clone(), bytes.clone());
-                            background
-                                .spawn(async move {
-                                    if let Some(dir) = file.parent() {
-                                        let _ = std::fs::create_dir_all(dir);
-                                    }
-                                    let _ = std::fs::write(file, copy);
-                                })
-                                .detach();
-                        }
-                        fetched
-                    }
-                };
-                let Some(bytes) = bytes else {
-                    tracing::warn!(name, "voice: couldn't get a sound, using the stand-in");
-                    continue;
-                };
-                let Some(clip) = background.spawn(async move { cord_voice::decode_mp3(bytes) }).await else {
-                    tracing::warn!(name, "voice: couldn't decode a sound, using the stand-in");
-                    continue;
-                };
+                let Some(clip) = sound_file(core.clone(), name, cx.background_executor().clone()).await else { continue };
                 let still_here = this.update(cx, |store, _| {
                     if let Some(call) = store.voice.as_ref().and_then(|v| v.call.as_ref()) {
                         call.set_sound(sound, clip.clone());
@@ -715,11 +770,54 @@ impl Store {
         self.load_call_sounds(cx);
     }
 
-    pub fn add_to_group(&mut self, channel: Id, user: Id, cx: &mut Context<Self>) {
+    /// One at a time, stopping at the first that fails.
+    pub fn add_to_group(&mut self, channel: Id, users: Vec<Id>, cx: &mut Context<Self>) {
         let core = self.core.clone();
         cx.spawn(async move |this, cx| {
-            let result = core.add_recipient(channel, user).await;
+            let mut result = Ok(());
+            for user in users {
+                result = core.add_recipient(channel, user).await;
+                if result.is_err() {
+                    break;
+                }
+            }
             Self::report(this, result, "Couldn't add them to the group", cx);
+        })
+        .detach();
+    }
+
+    pub fn add_friend(&mut self, user: Id, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.add_friend(user).await;
+            Self::report(this, result, "Couldn't send the friend request", cx);
+        })
+        .detach();
+    }
+
+    pub fn remove_friend(&mut self, user: Id, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.remove_friend(user).await;
+            Self::report(this, result, "Couldn't remove them", cx);
+        })
+        .detach();
+    }
+
+    pub fn remove_from_group(&mut self, channel: Id, user: Id, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.remove_recipient(channel, user).await;
+            Self::report(this, result, "Couldn't remove them from the group", cx);
+        })
+        .detach();
+    }
+
+    pub fn make_group_owner(&mut self, channel: Id, user: Id, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_group_owner(channel, user).await;
+            Self::report(this, result, "Couldn't change the group's owner", cx);
         })
         .detach();
     }
@@ -765,6 +863,90 @@ impl Store {
         .detach();
     }
 
+    /// Bots aren't friends, so nothing tells us their status on its own. A server we
+    /// share knows: one request per bot in our DMs, once per connection.
+    fn ask_bot_presences(&self, cx: &mut Context<Self>) {
+        const MOST: usize = 20;
+        let bots: Vec<Id> = self
+            .cache
+            .private_channels()
+            .into_iter()
+            .filter(|c| c.recipient_ids.len() == 1)
+            .filter_map(|c| c.recipient_ids.first().copied())
+            .filter(|id| self.cache.user(*id).is_some_and(|u| u.bot) && self.cache.presence(*id).is_none())
+            .take(MOST)
+            .collect();
+        if bots.is_empty() {
+            return;
+        }
+        let core = self.core.clone();
+        cx.spawn(async move |_, _| {
+            for bot in bots {
+                let Ok(profile) = core.user_profile(bot, None).await else { continue };
+                if let Some(guild) = profile.mutual_guilds.as_ref().and_then(|g| g.first()) {
+                    core.request_presences(*guild, &[bot]);
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// "name (#channel, CATEGORY)", "name (group)", or just their name in a DM.
+    fn notification_title(&self, name: &str, channel: Id) -> String {
+        let Some(place) = self.cache.channel(channel) else { return name.to_string() };
+        let label = crate::nav::channel_label(&self.cache, place);
+        if place.guild_id.is_some() {
+            return match place.parent_id.and_then(|id| self.cache.channel(id)).and_then(|parent| parent.name.as_deref()) {
+                Some(category) => format!("{name} (#{label}, {category})"),
+                None => format!("{name} (#{label})"),
+            };
+        }
+        if place.kind == cord_core::model::ChannelKind::GroupDm { format!("{name} ({label})") } else { name.to_string() }
+    }
+
+    /// Someone put a new reaction on a message of ours. Adding to one already there
+    /// isn't news. Only for messages we're holding: asking Discord for each would be a
+    /// request per reaction.
+    fn notify_of_reaction(&self, channel: Id, message: Id, user: Id, emoji: &cord_core::model::ReactionEmoji, cx: &mut Context<Self>) {
+        let Some(me) = self.cache.me().map(|u| u.id) else { return };
+        if user == me {
+            return;
+        }
+        let Some(m) = self.cache.messages(channel).and_then(|list| list.iter().find(|m| m.message.id == message)) else { return };
+        if m.message.author.id != me || m.message.reactions.iter().any(|r| r.emoji.id == emoji.id && r.emoji.name == emoji.name) {
+            return;
+        }
+        let status = self.cache.presence(me).map(|p| p.status);
+        let looking = self.open == Some(channel) && WINDOW_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+        if !should_notify(status, false, true, self.cache.is_muted(channel), 0, looking) {
+            return;
+        }
+        let Some(who) = self.cache.user(user) else { return };
+        let guild = self.cache.channel(channel).and_then(|c| c.guild_id);
+        let name = self.cache.display_name(guild, who).to_string();
+        let shown = match (emoji.id, emoji.name.as_deref()) {
+            (Some(_), Some(name)) => format!(":{name}:"),
+            (_, Some(name)) => name.to_string(),
+            _ => "an emoji".to_string(),
+        };
+        let content = format!("Reacted {shown} to your \"{}\"", self.cache.readable_text(&m.message));
+        let (title, picture, core) = (self.notification_title(&name, channel), self.cache.avatar_url(guild, who, 128), self.core.clone());
+        if let Some(sound) = &self.message_sound {
+            cord_voice::play_once(sound.clone());
+        }
+        cx.spawn(async move |_, cx| {
+            let path = crate::notifications::picture_path(&picture);
+            let icon = if path.exists() {
+                Some(path)
+            } else {
+                let bytes = core.cdn_bytes(picture).await.ok();
+                cx.background_executor().spawn(async move { crate::notifications::keep_picture(path, bytes?) }).await
+            };
+            crate::notifications::show(&title, &content, false, icon);
+        })
+        .detach();
+    }
+
     /// A desktop notification for a message meant for us, if our status allows it.
     fn notify_of(&self, m: &Message, cx: &mut Context<Self>) {
         let me = self.cache.me().map(|u| u.id);
@@ -777,15 +959,14 @@ impl Store {
         if !should_notify(status, me == Some(m.author.id), self.cache.pings_me(m), self.cache.is_muted(m.channel_id), m.flags, looking) {
             return;
         }
+        if let Some(sound) = &self.message_sound {
+            cord_voice::play_once(sound.clone());
+        }
         let channel = self.cache.channel(m.channel_id);
         let guild = channel.and_then(|c| c.guild_id);
         let name = self.cache.display_name(guild, &m.author);
         let group = channel.filter(|c| c.kind == cord_core::model::ChannelKind::GroupDm);
-        let title = match (channel.filter(|_| guild.is_some()), group) {
-            (Some(c), _) => format!("{name} (#{})", crate::nav::channel_label(&self.cache, c)),
-            (None, Some(c)) => format!("{name} ({})", crate::nav::channel_label(&self.cache, c)),
-            (None, None) => name.to_string(),
-        };
+        let title = self.notification_title(&name, m.channel_id);
         // The group's picture in a group; else their server profile's, which the
         // message itself may be the first to tell us about; else their own.
         let picture = match (group.and_then(|c| Some((c.id, c.icon.as_ref()?))), guild.zip(m.member.as_ref().and_then(|member| member.avatar.as_deref()).filter(|a| !a.is_empty()))) {
@@ -867,6 +1048,17 @@ impl Store {
             }
             CoreEvent::Ready(ready) => {
                 self.cache.apply(CoreEvent::Ready(ready));
+                let (core, background) = (self.core.clone(), cx.background_executor().clone());
+                cx.spawn(async move |_, _| crate::discord_icons::refresh(core, background).await).detach();
+                self.ask_bot_presences(cx);
+                if self.message_sound.is_none() {
+                    let (core, background) = (self.core.clone(), cx.background_executor().clone());
+                    cx.spawn(async move |this, cx| {
+                        let clip = sound_file(core, "3ed22d14f3c30bc4", background).await;
+                        let _ = this.update(cx, |store, _| store.message_sound = clip);
+                    })
+                    .detach();
+                }
                 // Anything may have been missed while away: fetch these again when opened.
                 for kept in &mut self.recent {
                     kept.trusted = false;
@@ -911,6 +1103,16 @@ impl Store {
                         None => {}
                     }
                 }
+                // Someone in our call starting or stopping a screen share.
+                let ours = self.voice.as_ref().map(|v| v.channel);
+                if ours.is_some() && state.channel_id == ours && self.cache.me().is_some_and(|me| me.id != state.user_id) {
+                    let was = self.cache.voice_state(guild_id, state.user_id).is_some_and(|v| v.self_stream);
+                    if was != state.self_stream
+                        && let Some(call) = self.voice.as_ref().and_then(|v| v.call.as_ref())
+                    {
+                        call.play_sound(if state.self_stream { cord_voice::Sound::StreamStarted } else { cord_voice::Sound::StreamEnded });
+                    }
+                }
                 self.cache.apply(CoreEvent::VoiceStateUpdate { guild_id, state, member });
             }
             CoreEvent::MemberListUpdate(update) => {
@@ -947,6 +1149,11 @@ impl Store {
                 if self.open == Some(channel) {
                     self.mark_read(channel, cx);
                 }
+            }
+            CoreEvent::ReactionAdd { channel_id, message_id, user_id, emoji, burst } => {
+                // Before it's counted, so that "new" can be told.
+                self.notify_of_reaction(channel_id, message_id, user_id, &emoji, cx);
+                self.cache.apply(CoreEvent::ReactionAdd { channel_id, message_id, user_id, emoji, burst });
             }
             other => self.cache.apply(other),
         }

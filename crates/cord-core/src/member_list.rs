@@ -122,11 +122,13 @@ pub struct UserPresence {
     pub status: Status,
     pub mobile: bool,
     pub line: PresenceLine,
+    /// What they're playing or listening to, for their profile.
+    pub activity: Option<ActivityCard>,
 }
 
 impl UserPresence {
     pub fn new(status: Status, activities: &[Value], client_status: &Value) -> Self {
-        UserPresence { status, mobile: only_on_mobile(client_status), line: presence_line(activities) }
+        UserPresence { status, mobile: only_on_mobile(client_status), line: presence_line(activities), activity: activity_card(activities) }
     }
 }
 

@@ -97,7 +97,7 @@ mod tests {
     fn channel(overwrites: Vec<PermissionOverwrite>) -> Channel {
         Channel {
             id: Id(300), kind: ChannelKind::Text, guild_id: Some(GUILD), name: None, position: 0,
-            parent_id: None, last_message_id: None, recipient_ids: vec![], recipients: vec![], icon: None,
+            parent_id: None, last_message_id: None, recipient_ids: vec![], recipients: vec![], owner_id: None, icon: None,
             permission_overwrites: overwrites, topic: None,
         }
     }

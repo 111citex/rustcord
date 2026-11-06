@@ -24,6 +24,8 @@ use crate::identity::Identity;
 use crate::model::{Channel, Message, ReactionEmoji};
 use crate::profile::UserProfile;
 
+pub mod threads;
+
 pub const API_BASE: &str = "https://discord.com/api/v9";
 
 #[derive(Clone)]

@@ -16,6 +16,8 @@ use gpui_kit::{App, Context, Entity, EventEmitter, Task};
 
 use crate::toasts::{Toast, Toasts};
 
+mod threads;
+
 #[derive(Clone)]
 pub struct Services {
     pub core: Arc<Core>,
@@ -499,7 +501,7 @@ impl Store {
             author: me,
             content: content.clone(),
             timestamp: String::new(),
-            edited_timestamp: None, poll: None, interaction: None, interaction_metadata: None, message_snapshots: Vec::new(),
+            edited_timestamp: None, poll: None, interaction: None, interaction_metadata: None, message_snapshots: Vec::new(), thread: None,
             nonce: Some(nonce.clone()),
             // No URL yet: these show as uploading until the sent message replaces them.
             attachments: files

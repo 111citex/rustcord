@@ -21,6 +21,8 @@ use gpui_kit::{
     SharedString, StyledImage, Subscription, WeakEntity, Window, div, img, list,
 };
 
+mod threads;
+
 use crate::ui::u;
 use crate::chat_format;
 use crate::markdown_view::{Env, ParseCache, Shared};
@@ -113,6 +115,12 @@ pub struct ChannelPage {
     placeholder_named: bool,
     /// RUSTCORD_BENCH=1: scroll on its own every frame and log the frame rate.
     bench: Option<Bench>,
+    /// The Threads button's list, and what listens for its closing.
+    threads_panel: Option<(Entity<crate::threads_panel::ThreadsPanel>, Subscription)>,
+    /// Naming a thread about to be started from a message.
+    new_thread: Option<threads::NewThread>,
+    /// A forum or media channel's post list, in place of the chat.
+    forum: Option<Entity<crate::forum_view::ForumView>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -350,6 +358,8 @@ impl ChannelPage {
                                     cx.notify();
                                     cx.stop_propagation();
                                 }
+                            } else if key == "escape" && page.close_thread_overlays(cx) {
+                                cx.stop_propagation();
                             } else if key == "escape" && page.confirm_delete.is_some() {
                                 page.close_delete(cx);
                                 cx.stop_propagation();
@@ -448,6 +458,9 @@ impl ChannelPage {
             highlight: Rc::default(),
             jumps: 0,
             bench: std::env::var_os("RUSTCORD_BENCH").map(|_| Bench::new()),
+            threads_panel: None,
+            new_thread: None,
+            forum: None,
             _subscriptions: subscriptions,
         };
         page.guild = page.server(cx);
@@ -1003,7 +1016,15 @@ impl ChannelPage {
             );
         }
         entries.push(Entry::later("Forward"));
-        entries.push(Entry::later("Create Thread"));
+        if cache.can_start_thread(channel) && message.thread.is_none() && cache.thread(id).is_none() && matches!(message.kind, 0 | 19) {
+            let page = page.clone();
+            entries.push(
+                Entry::item("Create Thread", move |window, cx| {
+                    let _ = page.update(cx, |page, cx| page.start_new_thread(id, window, cx));
+                })
+                .picture("icons/toolbar-threads.svg"),
+            );
+        }
         entries.push(Entry::Separator);
         if !message.content.is_empty() {
             entries.push(Entry::copy("Copy Text", message.content.clone()).icon(IconName::Copy));
@@ -2393,6 +2414,8 @@ fn placeholder_for(cache: &Cache, channel: Id) -> Option<String> {
     Some(format!("Message {prefix}{}", nav::channel_label(cache, c)))
 }
 
+/// Discord's message type for a thread's first row, pointing at the message it grew from.
+const THREAD_STARTER: u8 = 21;
 const AVATAR: f32 = 40.;
 /// List id of the row above the first message.
 const TOP_ROW: Id = Id(0);
@@ -2581,6 +2604,7 @@ fn compact_row(ix: usize, m: &ChatMessage, guild: Option<Id>, cache: &Cache, sha
                         .flex_1()
                         .min_w_0()
                         .child(message_content(&m.message, guild, cache, shared, cx))
+                        .children(threads::chip(ix, cache, &m.message, page, cx))
                         .when(m.state == SendState::Failed, |this| {
                             this.child(div().text_xs().text_color(theme.danger).child("Failed to send"))
                         }),
@@ -2708,6 +2732,7 @@ fn hover_actions(
     let can_manage = in_server && cache.has_permission(channel, perms::MANAGE_MESSAGES);
     let can_pin = !in_server || can_manage || cache.has_permission(channel, perms::PIN_MESSAGES);
     let can_send = cache.can_send(channel);
+    let can_thread = cache.can_start_thread(channel) && message.thread.is_none() && cache.thread(id).is_none() && matches!(message.kind, 0 | 19);
     let shift = crate::ui::shift_held();
     let pinned = message.pinned;
     let quick = QUICK_REACTIONS.iter().enumerate().map(|(i, emoji)| {
@@ -2784,6 +2809,21 @@ fn hover_actions(
                     let _ = page.update(cx, |page, cx| page.reply_to(id, author.clone(), window, cx));
                 }
             }))
+        })
+        .when(can_thread, |this| {
+            this.child(
+                cell(("act-thread", ix))
+                    .text_color(muted)
+                    .hover(move |d| d.text_color(bright))
+                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Create Thread").build(window, cx))
+                    .on_click({
+                        let page = page.clone();
+                        move |_, window, cx| {
+                            let _ = page.update(cx, |page, cx| page.start_new_thread(id, window, cx));
+                        }
+                    })
+                    .child(Icon::default().path("icons/toolbar-threads.svg").size(u(20.))),
+            )
         })
         .when(can_pin, |this| {
             let (icon, tip) = if pinned { ("icons/pin-off.svg", "Unpin Message") } else { ("icons/toolbar-pin.svg", "Pin Message") };
@@ -2978,6 +3018,7 @@ fn message_row(
                         .line_height(gpui_kit::relative(1.375))
                         .children(header)
                         .child(message_content(&m.message, guild, cache, shared, cx))
+                        .children(threads::chip(ix, cache, &m.message, page, cx))
                         .when(ephemeral, |this| {
                             let (channel, id, page) = (m.message.channel_id, m.message.id, page.clone());
                             this.child(
@@ -3102,6 +3143,39 @@ fn system_row(
                         .child(by.name.clone()),
                 ))
                 .map(|d| match pinned {
+                    // "started a thread: NAME. See all threads", the name opening it.
+                    None if line.kind == rich_view::SystemKind::Thread => {
+                        let (open, all) = (page.clone(), page.clone());
+                        let thread = m.message.message_reference.as_ref().and_then(|r| r.channel_id);
+                        d.child("\u{a0}started\u{a0}a\u{a0}thread:\u{a0}")
+                            .child(
+                                div()
+                                    .id(("thread-link", ix))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.foreground)
+                                    .cursor_pointer()
+                                    .hover(|d| d.underline())
+                                    .on_click(move |_, _, cx| {
+                                        if let Some(thread) = thread {
+                                            let _ = open.update(cx, |page, cx| page.open_thread(thread, cx));
+                                        }
+                                    })
+                                    .child(m.message.content.clone()),
+                            )
+                            .child(".\u{a0}")
+                            .child(
+                                div()
+                                    .id(("all-threads", ix))
+                                    .text_color(theme.link)
+                                    .cursor_pointer()
+                                    .hover(|d| d.underline())
+                                    .on_click(move |_, _, cx| {
+                                        let _ = all.update(cx, |page, cx| page.toggle_threads(cx));
+                                    })
+                                    .child("See all threads"),
+                            )
+                            .child("\u{a0}")
+                    }
                     Some(target) => {
                         let jump = shared.jump.clone();
                         d.child("\u{a0}pinned\u{a0}")
@@ -3530,8 +3604,14 @@ impl Render for ChannelPage {
             let text = if cache.me().is_none() { "Connecting to Discord…" } else { "This channel doesn't exist, or you can't see it." };
             return self.notice(text, cx);
         };
-        if channel.kind == ChannelKind::Forum {
-            return self.notice("Forum channels aren't supported yet.", cx);
+        if channel.kind.is_forum_like() {
+            let (ctx, forum) = (self.ctx.clone(), self.forum.clone());
+            let view = forum.unwrap_or_else(|| {
+                let view = cx.new(|cx| crate::forum_view::ForumView::new(ctx, channel_id, window, cx));
+                self.forum = Some(view.clone());
+                view
+            });
+            return view.into_any_element();
         }
         if !has_chat(channel.kind) {
             return self.notice("This channel has no chat.", cx);
@@ -3630,17 +3710,8 @@ impl Render for ChannelPage {
                     parsed: self.parsed.clone(),
                 };
                 // A thread says who started it, once we know them.
-                let starter = (channel.kind == cord_core::model::ChannelKind::Thread)
-                    .then(|| {
-                        let cache = self.ctx.services.store.read(cx).cache();
-                        let user = cache.user(channel.owner_id?)?;
-                        Some(cache.display_name(channel.guild_id, user).to_string())
-                    })
-                    .flatten();
-                let beginning = match starter {
-                    Some(name) => format!("Started by {name}"),
-                    None => format!("This is the beginning of {}{label}.", if channel.guild_id.is_some() { "#" } else { "@" }),
-                };
+                let beginning = format!("This is the beginning of {}{label}.", if channel.guild_id.is_some() { "#" } else { "@" });
+                let thread_name = label.clone();
                 let highlight = self.highlight.clone();
                 let hovered_row = self.hovered_row.clone();
                 let replying_to = self.replying.as_ref().map(|(id, _, _)| *id);
@@ -3695,7 +3766,10 @@ impl Render for ChannelPage {
                         return if store.is_loading_older(channel_id) {
                             note("Loading older messages…".into()).into_any_element()
                         } else if !messages.has_older {
-                            note(beginning.clone()).into_any_element()
+                            match cache.thread(channel_id) {
+                                Some(thread) => threads::intro(cache, thread, &thread_name, cx),
+                                None => note(beginning.clone()).into_any_element(),
+                            }
                         } else if cache.scrollback_full(channel_id) {
                             note("That's as far back as rustcord keeps. Scroll down to return.".into()).into_any_element()
                         } else {
@@ -3713,14 +3787,17 @@ impl Render for ChannelPage {
                     let stacked = nav::continues_group(prev, &m.message, &chrono::Local)
                         && !rich_view::is_reply(&m.message)
                         && rich_view::system_line(&m.message).is_none()
-                        && prev.is_none_or(|p| p.kind != rich_view::KIND_POLL_RESULT && rich_view::automod_alert(p).is_none() && rich_view::system_line(p).is_none());
+                        && m.message.kind != THREAD_STARTER
+                        && prev.is_none_or(|p| p.kind != rich_view::KIND_POLL_RESULT && p.kind != THREAD_STARTER && rich_view::automod_alert(p).is_none() && rich_view::system_line(p).is_none());
                     let new_day = chat_format::starts_new_day(prev, &m.message, &chrono::Local);
                     let system = rich_view::system_line(&m.message);
-                    let notice = system.is_some() || rich_view::poll_outcome(&m.message).is_some() || rich_view::automod_alert(&m.message).is_some();
+                    let notice = system.is_some() || m.message.kind == THREAD_STARTER || rich_view::poll_outcome(&m.message).is_some() || rich_view::automod_alert(&m.message).is_some();
                     // Rows keep their gap to the group above as padding: the jump glow leaves it out.
                     let gap_above = !new_day && (notice || (!compact && !stacked));
                     let row = if let Some(line) = &system {
                         system_row(i, m, line, !new_day, guild, cache, &shared, &page, cx)
+                    } else if m.message.kind == THREAD_STARTER {
+                        threads::starter_row(i, m, !new_day, guild, cache, &shared, &page, cx)
                     } else if let Some(outcome) = rich_view::poll_outcome(&m.message) {
                         poll_result_row(i, m, &outcome, !new_day, guild, cache, &shared, &page, cx)
                     } else if let Some(alert) = rich_view::automod_alert(&m.message) {
@@ -3842,6 +3919,8 @@ impl Render for ChannelPage {
             Some(g) => format!("Search {}", g.name),
             None => "Search".to_string(),
         };
+        let in_thread = channel.thread.is_some();
+        let join_button = in_thread.then(|| self.join_button(channel_id, cx)).flatten();
         // Measured in Discord: 49px with 8px padding (16px on the left).
         let header = h_flex()
             .h(u(49.))
@@ -3852,7 +3931,7 @@ impl Render for ChannelPage {
             .items_center()
             .border_b_1()
             .border_color(border)
-            .child(Icon::new(icon).size(u(24.)).text_color(muted))
+            .child(if in_thread { Icon::default().path("icons/toolbar-threads.svg").size(u(24.)).text_color(muted) } else { Icon::new(icon).size(u(24.)).text_color(muted) })
             .child(div().flex_shrink_0().text_size(u(16.)).font_weight(FontWeight::SEMIBOLD).child(label.clone()))
             .when_some(topic, |this, topic| {
                 this.child(div().flex_shrink_0().mx(u(4.)).size(u(4.)).rounded_full().bg(muted.opacity(0.6)))
@@ -3860,7 +3939,8 @@ impl Render for ChannelPage {
             })
             // With a topic, it's what fills the row: a spacer would take half its room.
             .when(!has_topic, |this| this.child(div().flex_1()))
-            .child(tool_button("threads", "icons/toolbar-threads.svg", "Threads", cx))
+            .children(join_button)
+            .child(tool_button("threads", "icons/toolbar-threads.svg", "Threads", cx).on_click(cx.listener(|this, _, _, cx| this.toggle_threads(cx))))
             .child(tool_button("bell", "icons/toolbar-bell.svg", "Notification Settings", cx))
             .child(tool_button("pin", "icons/toolbar-pin.svg", "Pinned Messages", cx))
             .when(self.guild.is_some() || channel.kind == ChannelKind::GroupDm, |this| {
@@ -4202,6 +4282,8 @@ impl Render for ChannelPage {
             // The bar runs over the member list too, with the search above it, as Discord's.
             .when_some(top_header, |d, header| d.child(div().absolute().top_0().left_0().right_0().h(u(TOP_BAR)).occlude().child(header)))
             .children(self.profile.as_ref().map(|(card, _)| card.clone()))
+            .children(self.threads_panel.as_ref().map(|(panel, _)| panel.clone()))
+            .children(self.new_thread_dialog(window, cx))
             .when_some(self.confirm_delete, |d, message| d.child(self.delete_dialog(message, window, cx)))
             .into_any_element()
     }

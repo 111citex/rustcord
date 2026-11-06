@@ -210,6 +210,10 @@ pub fn composer_lock(cache: &Cache, channel: &Channel) -> Option<String> {
     if let Some(until) = channel.guild_id.and_then(|g| cache.timed_out_until(g)) {
         return Some(timeout_notice(&until, &chrono::Local::now()));
     }
+    // A locked thread listens to people who manage threads only.
+    if channel.thread.as_ref().is_some_and(|t| t.locked) && !cache.can_manage_threads(channel.id) {
+        return Some("This thread is locked.".to_string());
+    }
     (!cache.can_send(channel.id)).then(|| "You do not have permission to send messages in this channel.".to_string())
 }
 
@@ -276,7 +280,7 @@ mod tests {
         Channel {
             owner_id: None,
             id: Id(id), kind, guild_id: Some(Id(300)), name: Some(name.into()), position,
-            parent_id: parent.map(Id), last_message_id: None, recipient_ids: vec![], recipients: vec![], icon: None, permission_overwrites: vec![], topic: None,
+            parent_id: parent.map(Id), last_message_id: None, recipient_ids: vec![], recipients: vec![], icon: None, permission_overwrites: vec![], topic: None, thread: None, forum: None,
         }
     }
 
@@ -285,7 +289,7 @@ mod tests {
             owner_id: None,
             id: Id(id), kind, guild_id: None, name: name.map(Into::into), position: 0, parent_id: None,
             last_message_id: None, recipient_ids: recipients.iter().copied().map(Id).collect(), recipients: vec![], icon: None,
-            permission_overwrites: vec![], topic: None,
+            permission_overwrites: vec![], topic: None, thread: None, forum: None,
         }
     }
 
@@ -493,7 +497,7 @@ mod chat_tests {
             author: User { id: Id(author), username: format!("u{author}"), global_name: None, avatar: None, bot: false, extras: Default::default() },
             content: String::new(),
             timestamp: String::new(),
-            edited_timestamp: None, poll: None, interaction: None, interaction_metadata: None, message_snapshots: Vec::new(),
+            edited_timestamp: None, poll: None, interaction: None, interaction_metadata: None, message_snapshots: Vec::new(), thread: None,
             nonce: None,
             attachments: vec![],
             member: None,

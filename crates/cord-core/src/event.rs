@@ -61,6 +61,16 @@ pub enum CoreEvent {
     ReactionRemoveEmoji { channel_id: Id, message_id: Id, emoji: ReactionEmoji },
     ChannelUpsert(Channel),
     ChannelDelete { id: Id },
+    /// A thread appeared (`created`: just made) or changed (renamed, archived, locked...).
+    ThreadUpsert { thread: Channel, created: bool },
+    ThreadDelete { id: Id },
+    /// The active threads of `parents` (every channel of the server when none are named).
+    /// `joined`: the threads we're a member of, where the list says so apart from the threads.
+    ThreadListSync { guild_id: Id, parents: Option<Vec<Id>>, threads: Vec<Channel>, joined: Vec<Id> },
+    /// We joined thread `id` (on this device or another).
+    ThreadJoined { id: Id, user_id: Option<Id> },
+    /// People came or went; `count` is how many are in it now.
+    ThreadMembers { id: Id, count: Option<u32>, added: Vec<Id>, removed: Vec<Id> },
     GuildCreate(Guild),
     GuildDelete { id: Id },
     RoleUpsert { guild_id: Id, role: Role },
@@ -222,6 +232,36 @@ impl ReactionEvent {
     fn emoji(&self) -> Result<ReactionEmoji, serde_json::Error> {
         self.emoji.clone().ok_or_else(|| serde::de::Error::missing_field("emoji"))
     }
+}
+
+#[derive(Deserialize)]
+struct ThreadMemberRef {
+    #[serde(default)]
+    id: Option<Id>,
+    #[serde(default)]
+    user_id: Option<Id>,
+}
+
+#[derive(Deserialize)]
+struct ThreadListEvent {
+    guild_id: Id,
+    #[serde(default)]
+    channel_ids: Option<Vec<Id>>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    threads: Vec<Channel>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    members: Vec<ThreadMemberRef>,
+}
+
+#[derive(Deserialize)]
+struct ThreadMembersEvent {
+    id: Id,
+    #[serde(default)]
+    member_count: Option<u32>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    added_members: Vec<ThreadMemberRef>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    removed_member_ids: Vec<Id>,
 }
 
 #[derive(Deserialize)]
@@ -474,6 +514,29 @@ pub fn decode_dispatch(t: &str, d: Value) -> Option<CoreEvent> {
             .map(|a| CoreEvent::MessageAck { channel_id: a.channel_id, message_id: a.message_id }),
         "CHANNEL_CREATE" | "CHANNEL_UPDATE" => from_value(d).map(CoreEvent::ChannelUpsert),
         "CHANNEL_DELETE" => from_value::<ById>(d).map(|b| CoreEvent::ChannelDelete { id: b.id }),
+        "THREAD_CREATE" => {
+            let created = d["newly_created"].as_bool().unwrap_or(false);
+            from_value::<Channel>(d).map(|thread| CoreEvent::ThreadUpsert { thread, created })
+        }
+        "THREAD_UPDATE" => from_value::<Channel>(d).map(|thread| CoreEvent::ThreadUpsert { thread, created: false }),
+        "THREAD_DELETE" => from_value::<ById>(d).map(|b| CoreEvent::ThreadDelete { id: b.id }),
+        "THREAD_LIST_SYNC" => from_value::<ThreadListEvent>(d).map(|e| CoreEvent::ThreadListSync {
+            guild_id: e.guild_id,
+            parents: e.channel_ids,
+            // Their own `member`, or a mention in the list of members.
+            joined: e.members.iter().filter_map(|m| m.id).collect(),
+            threads: e.threads,
+        }),
+        "THREAD_MEMBER_UPDATE" => from_value::<ThreadMemberRef>(d).and_then(|m| match m.id {
+            Some(id) => Ok(CoreEvent::ThreadJoined { id, user_id: m.user_id }),
+            None => Err(serde::de::Error::missing_field("id")),
+        }),
+        "THREAD_MEMBERS_UPDATE" => from_value::<ThreadMembersEvent>(d).map(|e| CoreEvent::ThreadMembers {
+            id: e.id,
+            count: e.member_count,
+            added: e.added_members.into_iter().filter_map(|m| m.user_id).collect(),
+            removed: e.removed_member_ids,
+        }),
         "GUILD_CREATE" => from_value(d).map(CoreEvent::GuildCreate),
         "GUILD_DELETE" => match from_value::<ById>(d) {
             Ok(b) if b.unavailable => return None,
@@ -550,6 +613,68 @@ mod tests {
         assert!(matches!(add, Some(CoreEvent::PollVote { user_id: Id(7), answer_id: 2, add: true, .. })));
         let remove = decode_dispatch("MESSAGE_POLL_VOTE_REMOVE", body);
         assert!(matches!(remove, Some(CoreEvent::PollVote { add: false, .. })));
+    }
+
+    #[test]
+    fn decodes_thread_dispatches() {
+        let thread = json!({"id": "20", "type": 11, "guild_id": "1", "parent_id": "10", "name": "a thread", "owner_id": "7", "newly_created": true, "member": {"user_id": "7"},
+            "thread_metadata": {"archived": false, "locked": true, "auto_archive_duration": 4320}});
+        let Some(CoreEvent::ThreadUpsert { thread: t, created }) = decode_dispatch("THREAD_CREATE", thread.clone()) else { panic!("no thread") };
+        assert!(created);
+        let info = t.thread.unwrap();
+        assert!(info.joined && info.locked && !info.archived);
+        assert_eq!(info.auto_archive, 4320);
+        let Some(CoreEvent::ThreadUpsert { created, .. }) = decode_dispatch("THREAD_UPDATE", thread) else { panic!("no update") };
+        assert!(!created);
+        assert!(matches!(decode_dispatch("THREAD_DELETE", json!({"id": "20", "guild_id": "1", "parent_id": "10", "type": 11})), Some(CoreEvent::ThreadDelete { id: Id(20) })));
+    }
+
+    #[test]
+    fn decodes_thread_lists_and_members() {
+        let Some(CoreEvent::ThreadListSync { guild_id, parents, threads, joined }) = decode_dispatch(
+            "THREAD_LIST_SYNC",
+            json!({"guild_id": "1", "channel_ids": ["10"], "threads": [{"id": "20", "type": 11, "parent_id": "10"}, {"junk": 1}], "members": [{"id": "20", "user_id": "7"}]}),
+        ) else {
+            panic!("no sync")
+        };
+        assert_eq!((guild_id, parents, threads.len(), joined), (Id(1), Some(vec![Id(10)]), 1, vec![Id(20)]));
+        let Some(CoreEvent::ThreadListSync { parents, .. }) = decode_dispatch("THREAD_LIST_SYNC", json!({"guild_id": "1", "threads": []})) else { panic!("no sync") };
+        assert_eq!(parents, None);
+        assert!(matches!(
+            decode_dispatch("THREAD_MEMBER_UPDATE", json!({"id": "20", "guild_id": "1", "user_id": "7"})),
+            Some(CoreEvent::ThreadJoined { id: Id(20), user_id: Some(Id(7)) })
+        ));
+        let Some(CoreEvent::ThreadMembers { id, count, added, removed }) = decode_dispatch(
+            "THREAD_MEMBERS_UPDATE",
+            json!({"id": "20", "guild_id": "1", "member_count": 3, "added_members": [{"user_id": "7", "id": "20"}], "removed_member_ids": ["8"]}),
+        ) else {
+            panic!("no members")
+        };
+        assert_eq!((id, count, added, removed), (Id(20), Some(3), vec![Id(7)], vec![Id(8)]));
+    }
+
+    #[test]
+    fn a_forum_decodes_with_its_tags_and_rules() {
+        let forum: Channel = serde_json::from_value(json!({
+            "id": "9", "type": 15, "guild_id": "1", "name": "help", "topic": "Be kind.\nSearch first.", "flags": 16,
+            "available_tags": [{"id": "1", "name": "Solved", "moderated": true, "emoji_name": "ok"}, {"id": "2", "name": "Open", "emoji_id": "55"}],
+            "default_sort_order": 1, "default_forum_layout": 2, "default_reaction_emoji": {"emoji_name": "x"}, "template": "Describe it",
+        }))
+        .unwrap();
+        let info = forum.forum.unwrap();
+        assert!(info.requires_tag());
+        assert_eq!((info.sort_order, info.layout), (1, 2));
+        assert_eq!(info.tags.len(), 2);
+        assert!(info.tag(Id(1)).unwrap().moderated);
+        assert_eq!(info.tag(Id(2)).unwrap().emoji_id, Some(Id(55)));
+        assert_eq!(info.template.as_deref(), Some("Describe it"));
+        assert!(forum.thread.is_none());
+        let media: Channel = serde_json::from_value(json!({"id": "9", "type": 16})).unwrap();
+        assert!(media.kind.is_forum_like() && media.forum.is_some());
+        let post: Channel = serde_json::from_value(json!({"id": "30", "type": 11, "parent_id": "9", "applied_tags": ["1"], "flags": 2, "message_count": 4})).unwrap();
+        let post = post.thread.unwrap();
+        assert!(post.pinned());
+        assert_eq!((post.applied_tags, post.message_count), (vec![Id(1)], 4));
     }
 
     #[test]

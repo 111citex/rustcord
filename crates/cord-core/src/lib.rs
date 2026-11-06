@@ -6,6 +6,7 @@ pub mod cache;
 pub mod cdn;
 mod client;
 pub mod event;
+pub mod forum;
 pub mod gateway;
 pub mod http;
 pub mod id;
@@ -21,4 +22,5 @@ pub mod rich;
 pub mod settings_proto;
 
 pub use crate::client::{API_BASE, Core, CoreConfig, startup_identity};
+pub use crate::client::threads::{AUTO_ARCHIVE, NewPost, ThreadPage, ThreadSearch};
 pub use id::Id;

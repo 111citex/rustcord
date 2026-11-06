@@ -58,6 +58,19 @@ pub enum What {
     Nickname { guild: Id, user: Id, me: bool, name: String, current: String },
     FriendNickname { user: Id, name: String, current: String },
     Note { user: Id, name: String },
+    /// Send a copy of a message to chats picked from `to`.
+    Forward { from: Id, message: Id, guild: Option<Id>, to: Vec<(Id, String)> },
+    Thread { channel: Id, message: Id },
+    GroupName { channel: Id, current: String },
+}
+
+/// The most chats a message is forwarded to at once, as Discord's.
+const FORWARD_MOST: usize = 5;
+
+/// Whether `label` has all of `query`, ignoring case.
+fn matches(label: &str, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty() || label.to_lowercase().contains(&query)
 }
 
 pub struct Panel {
@@ -67,6 +80,8 @@ pub struct Panel {
     text: Entity<TextareaState>,
     duration: usize,
     ban_choice: Option<usize>,
+    /// Chats ticked to forward to.
+    chosen: Vec<Id>,
     history: usize,
     dropdown_open: bool,
     /// A note is being fetched: it can't be saved over what's already there.
@@ -97,6 +112,9 @@ pub fn open(store: Entity<Store>, what: What, window: &mut Window, cx: &mut App)
             What::Ban { .. } => ("Why are they being banned?", 3, String::new()),
             What::Nickname { current, .. } | What::FriendNickname { current, .. } => ("", 1, current.clone()),
             What::Note { .. } => ("Click to add a note", 4, String::new()),
+            What::Forward { .. } => ("Search", 1, String::new()),
+            What::Thread { .. } => ("New Thread", 1, String::new()),
+            What::GroupName { current, .. } => ("Group name", 1, current.clone()),
         };
         let text = cx.new(|cx| {
             let mut state = TextareaState::new(window, cx).auto_grow(rows, rows).placeholder(placeholder);
@@ -109,7 +127,7 @@ pub fn open(store: Entity<Store>, what: What, window: &mut Window, cx: &mut App)
             text.update(cx, |state, cx| state.set_value(start, window, cx));
         }
         let typed = cx.subscribe(&text, |this: &mut Panel, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { shift: false, .. }) && matches!(this.what, What::Nickname { .. } | What::FriendNickname { .. }) {
+            if matches!(event, InputEvent::PressEnter { shift: false, .. }) && matches!(this.what, What::Nickname { .. } | What::FriendNickname { .. } | What::Thread { .. } | What::GroupName { .. }) {
                 this.submit(cx);
             }
             cx.notify();
@@ -133,7 +151,7 @@ pub fn open(store: Entity<Store>, what: What, window: &mut Window, cx: &mut App)
             });
         });
         let note_for = if let What::Note { user, .. } = &what { Some(*user) } else { None };
-        let panel = Panel { store: store.clone(), what: what.clone(), text, duration: 0, ban_choice: None, history: DEFAULT_HISTORY, dropdown_open: false, loading: note_for.is_some(), focus: cx.focus_handle(), _watching: vec![typed, keys] };
+        let panel = Panel { store: store.clone(), what: what.clone(), text, duration: 0, ban_choice: None, chosen: Vec::new(), history: DEFAULT_HISTORY, dropdown_open: false, loading: note_for.is_some(), focus: cx.focus_handle(), _watching: vec![typed, keys] };
         if let Some(user) = note_for {
             let core = store.read(cx).core().clone();
             cx.spawn_in(window, async move |this, cx| {
@@ -188,6 +206,8 @@ impl Panel {
         match &self.what {
             What::Ban { .. } => ban_reason(self.ban_choice, &self.typed(cx)).is_some(),
             What::Note { .. } => !self.loading,
+            What::Forward { .. } => !self.chosen.is_empty(),
+            What::Thread { .. } => !self.typed(cx).trim().is_empty(),
             _ => true,
         }
     }
@@ -199,7 +219,7 @@ impl Panel {
         let text = self.typed(cx);
         let reason = text.trim().to_string();
         let what = self.what.clone();
-        let (duration, history, choice) = (self.duration, self.history, self.ban_choice);
+        let (duration, history, choice, chosen) = (self.duration, self.history, self.ban_choice, self.chosen.clone());
         self.store.update(cx, |store, cx| match what {
             What::Timeout { guild, user, .. } => store.timeout_member(guild, user, Some(timeout_until(chrono::Utc::now(), DURATIONS[duration].1)), reason, cx),
             What::Kick { guild, user, .. } => store.kick_member(guild, user, reason, cx),
@@ -211,6 +231,13 @@ impl Panel {
             What::Nickname { guild, user, me, .. } => store.set_nickname(guild, user, me, reason, cx),
             What::FriendNickname { user, .. } => store.set_friend_nickname(user, reason, cx),
             What::Note { user, .. } => store.set_note(user, text, cx),
+            What::Forward { from, message, guild, .. } => {
+                for to in &chosen {
+                    store.forward_message(*to, from, message, guild, cx);
+                }
+            }
+            What::Thread { channel, message } => store.create_thread(channel, message, reason, cx),
+            What::GroupName { channel, .. } => store.rename_group(channel, reason, cx),
         });
         close(cx);
     }
@@ -342,6 +369,80 @@ impl Render for Panel {
                     .gap(u(16.))
                     .child(div().text_size(u(14.)).text_color(muted).child("Only you see this, outside of servers. Leave it empty to remove it."))
                     .child(v_flex().gap(u(8.)).child(label("Friend Nickname")).child(text_box()))
+                    .into_any_element(),
+                "Save",
+                blurple,
+            ),
+            What::Forward { to, .. } => {
+                let query = self.typed(cx);
+                let shown: Vec<&(Id, String)> = to.iter().filter(|(_, label)| matches(label, &query)).collect();
+                let full = self.chosen.len() >= FORWARD_MOST;
+                (
+                    "Forward To".to_string(),
+                    v_flex()
+                        .gap(u(12.))
+                        .child(text_box())
+                        .child(
+                            v_flex()
+                                .id("forward-list")
+                                .h(u(280.))
+                                .overflow_y_scroll()
+                                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                                .children(shown.into_iter().map(|(id, label)| {
+                                    let (id, ticked, this) = (*id, self.chosen.contains(id), this.clone());
+                                    h_flex()
+                                        .id(("forward-to", id.0 as usize))
+                                        .h(u(40.))
+                                        .px(u(8.))
+                                        .gap(u(10.))
+                                        .items_center()
+                                        .rounded(u(6.))
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(fg.opacity(0.06)))
+                                        .when(!ticked && full, |d| d.opacity(0.5))
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            let _ = this.update(cx, |panel, cx| {
+                                                if let Some(at) = panel.chosen.iter().position(|c| *c == id) {
+                                                    panel.chosen.remove(at);
+                                                } else if panel.chosen.len() < FORWARD_MOST {
+                                                    panel.chosen.push(id);
+                                                }
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(div().flex_1().min_w_0().truncate().text_size(u(15.)).child(label.clone()))
+                                        .child(
+                                            div()
+                                                .size(u(22.))
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(u(5.))
+                                                .border_1()
+                                                .border_color(if ticked { blurple } else { muted.opacity(0.5) })
+                                                .when(ticked, |d| d.bg(blurple).child(Icon::new(IconName::Check).size(u(16.)).text_color(gpui_kit::white()))),
+                                        )
+                                })),
+                        )
+                        .into_any_element(),
+                    "Send",
+                    blurple,
+                )
+            }
+            What::Thread { .. } => (
+                "Create Thread".to_string(),
+                v_flex().gap(u(8.)).child(label("Thread Name")).child(text_box()).into_any_element(),
+                "Create Thread",
+                blurple,
+            ),
+            What::GroupName { .. } => (
+                "Edit Group".to_string(),
+                v_flex()
+                    .gap(u(16.))
+                    .child(div().text_size(u(14.)).text_color(muted).child("Leave it empty to name the group after who's in it."))
+                    .child(v_flex().gap(u(8.)).child(label("Group Name")).child(text_box()))
                     .into_any_element(),
                 "Save",
                 blurple,
@@ -512,6 +613,13 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-11-05T10:00:00Z").unwrap().with_timezone(&chrono::Utc);
         assert_eq!(timeout_until(now, 60), "2026-11-05T10:01:00.000Z");
         assert_eq!(timeout_until(now, 604_800), "2026-11-12T10:00:00.000Z");
+    }
+
+    #[test]
+    fn forwarding_searches_labels_ignoring_case() {
+        assert!(matches("Ada, Bob", ""));
+        assert!(matches("Ada, Bob", " bOB "));
+        assert!(!matches("Ada, Bob", "eve"));
     }
 
     #[test]

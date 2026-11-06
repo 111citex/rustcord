@@ -966,6 +966,24 @@ impl Store {
         .detach();
     }
 
+    pub fn rename_group(&mut self, channel: Id, name: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.rename_group(channel, name).await;
+            Self::report(this, result, "Couldn't rename the group", cx);
+        })
+        .detach();
+    }
+
+    pub fn create_thread(&mut self, channel: Id, message: Id, name: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.create_thread(channel, message, name).await;
+            Self::report(this, result, "Couldn't start the thread", cx);
+        })
+        .detach();
+    }
+
     pub fn remove_from_group(&mut self, channel: Id, user: Id, cx: &mut Context<Self>) {
         let core = self.core.clone();
         cx.spawn(async move |this, cx| {

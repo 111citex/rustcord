@@ -958,7 +958,11 @@ impl ChannelPage {
                 let store = store.clone();
                 entries.push(Entry::item("Add Friend", move |_, cx| store.update(cx, |store, cx| store.add_friend(user, cx))));
             }
-            entries.push(Entry::later("Ignore"));
+            let ignored = crate::places::is_ignored(user);
+            entries.push(Entry::item(if ignored { "Unignore" } else { "Ignore" }, move |_, cx| {
+                crate::places::set_ignored(user, !ignored);
+                crate::ui::redraw_chat(cx);
+            }));
             let (store, who) = (store.clone(), name.clone());
             entries.push(Entry::item("Block", move |_, cx| {
                 let store = store.clone();
@@ -1049,8 +1053,21 @@ impl ChannelPage {
                 .icon(IconName::Reply),
             );
         }
-        entries.push(Entry::later("Forward"));
-        entries.push(Entry::later("Create Thread"));
+        {
+            // Chats to send it to: the conversations we have open.
+            let to: Vec<(Id, String)> = cache.private_channels().into_iter().map(|c| (c.id, nav::channel_label(cache, c))).collect();
+            let (store, guild) = (store.clone(), message.guild_id.or(self.guild));
+            entries.push(Entry::item("Forward", move |window, cx| {
+                crate::panels::open(store.clone(), crate::panels::What::Forward { from: channel, message: id, guild, to: to.clone() }, window, cx);
+            }));
+        }
+        let can_thread = in_server && message.kind == 0 && cache.channel(channel).is_some_and(|c| c.kind == ChannelKind::Text) && cache.has_permission(channel, perms::CREATE_PUBLIC_THREADS);
+        if can_thread {
+            let store = store.clone();
+            entries.push(Entry::item("Create Thread", move |window, cx| {
+                crate::panels::open(store.clone(), crate::panels::What::Thread { channel, message: id }, window, cx);
+            }));
+        }
         entries.push(Entry::Separator);
         if !message.content.is_empty() {
             entries.push(Entry::copy("Copy Text", message.content.clone()).icon(IconName::Copy));
@@ -1071,7 +1088,10 @@ impl ChannelPage {
                 .picture(if pinned { "icons/pin-off.svg" } else { "icons/toolbar-pin.svg" }),
             );
         }
-        entries.push(Entry::later("Mark Unread"));
+        {
+            let store = store.clone();
+            entries.push(Entry::item("Mark Unread", move |_, cx| store.update(cx, |store, cx| store.mark_unread(channel, id, cx))));
+        }
         entries.push(Entry::copy("Copy Message Link", format!("https://discord.com/channels/{place}/{channel}/{id}")).icon(IconName::Link));
         // Only for who may; each still needs a confirm step when it's built.
         if !message.reactions.is_empty() && can_manage {
@@ -1103,7 +1123,8 @@ impl ChannelPage {
                 .danger(),
             );
         }
-        entries.push(Entry::later("Report Message").danger());
+        // Discord takes reports on its own pages: the message's link goes with it.
+        entries.push(Entry::item("Report Message", move |_, cx| cx.open_url(REPORT_PAGE)).danger());
         entries.push(Entry::Separator);
         entries.push(Entry::copy("Copy Message ID", id.to_string()).icon(IconName::Copy));
         menu::show(position, entries, cx);
@@ -2727,6 +2748,14 @@ fn typing_line(store: &Entity<Store>, channel: Id, guild: Option<Id>, cx: &App) 
     )
 }
 
+/// Where Discord takes reports.
+const REPORT_PAGE: &str = "https://dis.gd/report";
+
+thread_local! {
+    /// Messages of ignored people that were clicked open.
+    static UNFOLDED: RefCell<HashSet<Id>> = RefCell::default();
+}
+
 /// Discord's quick reactions at the front of the hover toolbar.
 const QUICK_REACTIONS: [&str; 3] = ["😭", "❤️", "💀"];
 
@@ -3805,6 +3834,28 @@ impl Render for ChannelPage {
                         compact_row(i, m, guild, cache, &shared, &page, replying_to, cx)
                     } else {
                         message_row(i, m, stacked, !new_day, guild, cache, &shared, &page, &hovered_row, &hovered_tools, replying_to, cx)
+                    };
+                    // Someone we ignore: a line to unfold, not their message.
+                    let row = if system.is_none() && !notice && crate::places::is_ignored(m.message.author.id) && !UNFOLDED.with_borrow(|set| set.contains(&m.message.id)) && cache.me().map(|u| u.id) != Some(m.message.author.id) {
+                        let (id, muted, remeasure) = (m.message.id, cx.theme().muted_foreground, shared.remeasure.clone());
+                        div()
+                            .id(("ignored", i))
+                            .w_full()
+                            .px_4()
+                            .py(u(6.))
+                            .text_size(u(14.))
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|d| d.underline())
+                            .on_click(move |_, _, cx| {
+                                UNFOLDED.with_borrow_mut(|set| set.insert(id));
+                                remeasure(id, cx);
+                                crate::ui::redraw_chat(cx);
+                            })
+                            .child("Ignored message. Click to show it.")
+                            .into_any_element()
+                    } else {
+                        row
                     };
                     // Only the message lights up, not the date bar above it.
                     let row = if let Some((_, jump)) = highlight.get().filter(|(id, _)| *id == m.message.id) {

@@ -23,6 +23,9 @@ pub struct Places {
     /// Those muted just for us.
     #[serde(default)]
     pub muted: Vec<Id>,
+    /// People whose messages are folded away for us.
+    #[serde(default)]
+    pub ignored: Vec<Id>,
 }
 
 impl Places {
@@ -117,6 +120,20 @@ pub fn set_muted(user: Id, muted: bool) {
         places.muted.retain(|id| *id != user);
         if muted {
             places.muted.push(user);
+        }
+    });
+}
+
+/// Whether we've ignored `user`: their messages show folded.
+pub fn is_ignored(user: Id) -> bool {
+    HELD.with_borrow_mut(|held| held.get_or_insert_with(|| read_from(&path())).ignored.contains(&user))
+}
+
+pub fn set_ignored(user: Id, ignored: bool) {
+    change(|places| {
+        places.ignored.retain(|id| *id != user);
+        if ignored {
+            places.ignored.push(user);
         }
     });
 }

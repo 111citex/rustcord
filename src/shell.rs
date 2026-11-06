@@ -1889,7 +1889,12 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
             .detach();
         }));
     }
-    entries.push(Entry::later("Add Note"));
+    if !itself {
+        let (store, who) = (services.store.clone(), name.clone());
+        entries.push(Entry::item("Add Note", move |window, cx| {
+            crate::panels::open(store.clone(), crate::panels::What::Note { user, name: who.clone() }, window, cx);
+        }).hint("Only visible to you"));
+    }
     if !itself {
         entries.push(Entry::Separator);
         let (volume, set) = (crate::places::get(), services.store.clone());
@@ -1905,8 +1910,16 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
         }));
     }
     entries.push(Entry::Separator);
-    entries.push(Entry::later("Change Nickname"));
-    entries.push(Entry::later("Roles"));
+    let mods = cache.moderation(guild, user);
+    if mods.nickname {
+        let (store, who, current) = (services.store.clone(), name.clone(), cache.member(guild, user).and_then(|m| m.nick.clone()).unwrap_or_default());
+        entries.push(Entry::item("Change Nickname", move |window, cx| {
+            crate::panels::open(store.clone(), crate::panels::What::Nickname { guild, user, me: itself, name: who.clone(), current: current.clone() }, window, cx);
+        }));
+    }
+    if mods.roles {
+        entries.push(Entry::later("Roles"));
+    }
     entries.push(Entry::later("Move To"));
     if can_mute || can_deafen || can_move || (can_kick && !itself) {
         entries.push(Entry::Separator);
@@ -1976,31 +1989,70 @@ fn dm_menu(
             if !dm.bot {
                 entries.push(Entry::later("Start a Call"));
             }
-            entries.push(Entry::later("Add Note"));
-            if dm.friend {
-                entries.push(Entry::later("Change Friend Nickname"));
+            let name = dm.label.clone();
+            {
+                let (store, name) = (store.clone(), name.clone());
+                entries.push(Entry::item("Add Note", move |window, cx| {
+                    crate::panels::open(store.clone(), crate::panels::What::Note { user, name: name.clone() }, window, cx);
+                }).hint("Only visible to you"));
             }
-            let store = store.clone();
-            entries.push(Entry::item("Close DM", move |_, cx| store.update(cx, |store, cx| store.close_dm(channel, cx))));
+            if dm.friend {
+                let current = store.read(cx).cache().friend_nickname(user).map(str::to_string);
+                let (store, name) = (store.clone(), name.clone());
+                let label = if current.is_some() { "Change Friend Nickname" } else { "Add Friend Nickname" };
+                entries.push(Entry::item(label, move |window, cx| {
+                    crate::panels::open(store.clone(), crate::panels::What::FriendNickname { user, name: name.clone(), current: current.clone().unwrap_or_default() }, window, cx);
+                }));
+            }
+            let closing = store.clone();
+            entries.push(Entry::item("Close DM", move |_, cx| closing.update(cx, |store, cx| store.close_dm(channel, cx))));
             entries.push(Entry::Separator);
             entries.push(Entry::later("Apps"));
             if dm.friend {
                 entries.push(Entry::later("Invite to Server"));
-                entries.push(Entry::later("Remove Friend"));
+                let (store, who) = (store.clone(), name.clone());
+                entries.push(Entry::item("Remove Friend", move |_, cx| {
+                    let store = store.clone();
+                    crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from your friends?"), "Remove Friend", move |cx| {
+                        store.update(cx, |store, cx| store.remove_friend(user, cx));
+                    }, cx);
+                }));
             }
-            entries.push(Entry::later("Ignore"));
-            entries.push(Entry::later("Block").danger());
+            let ignored = crate::places::is_ignored(user);
+            entries.push(Entry::item(if ignored { "Unignore" } else { "Ignore" }, move |_, cx| {
+                crate::places::set_ignored(user, !ignored);
+                crate::ui::redraw_chat(cx);
+            }));
+            let (store, who) = (store.clone(), name.clone());
+            entries.push(Entry::item("Block", move |_, cx| {
+                let store = store.clone();
+                crate::confirm::ask(format!("Block {who}"), format!("Block {who}? They won't be able to message you, and you won't see them in your friends."), "Block", move |cx| {
+                    store.update(cx, |store, cx| store.block_user(user, cx));
+                }, cx);
+            }).danger());
             entries.push(Entry::Separator);
             entries.push(Entry::later(format!("Mute @{}", dm.label)));
             entries.push(Entry::Separator);
             entries.push(Entry::copy("Copy User ID", user.to_string()).icon(IconName::Copy));
         }
         None => {
-            entries.push(Entry::later("Edit Group"));
+            {
+                let current = store.read(cx).cache().channel(channel).and_then(|c| c.name.clone()).unwrap_or_default();
+                let store = store.clone();
+                entries.push(Entry::item("Edit Group", move |window, cx| {
+                    crate::panels::open(store.clone(), crate::panels::What::GroupName { channel, current: current.clone() }, window, cx);
+                }));
+            }
             entries.push(Entry::Separator);
             entries.push(Entry::later("Mute Conversation"));
             entries.push(Entry::Separator);
-            entries.push(Entry::later("Leave Group").danger());
+            let (store, label) = (store.clone(), dm.label.clone());
+            entries.push(Entry::item("Leave Group", move |_, cx| {
+                let store = store.clone();
+                crate::confirm::ask(format!("Leave {label}"), format!("Leave {label}? You won't see its messages unless someone adds you back."), "Leave Group", move |cx| {
+                    store.update(cx, |store, cx| store.close_dm(channel, cx));
+                }, cx);
+            }).danger());
             entries.push(Entry::Separator);
         }
     }

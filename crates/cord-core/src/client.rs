@@ -753,6 +753,32 @@ impl Core {
     }
 
     /// Opens (or finds) the direct message channel with `user`.
+    /// Renames a group chat; empty goes back to naming it by who's in it.
+    pub async fn rename_group(&self, channel: Id, name: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
+                let _: Value = http.patch(&format!("/channels/{channel}"), &json!({ "name": name })).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Starts a thread on a message.
+    pub async fn create_thread(&self, channel: Id, message: Id, name: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let body = json!({ "name": name.trim(), "auto_archive_duration": 1440 });
+                let _: Value = http.post(&format!("/channels/{channel}/messages/{message}/threads"), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
     pub async fn open_dm(&self, user: Id) -> Result<Channel, HttpError> {
         let http = self.http.clone();
         let body = json!({"recipient_id": user.to_string()});

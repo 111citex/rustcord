@@ -767,12 +767,15 @@ impl SidePane {
                             .children((0..3).map(|_| div().size(u(3.)).rounded_full().bg(theme.sidebar)))
                             .into_any_element()
                     });
+                    // Still, until the pointer is on the row.
+                    let row_hovered = !crate::smooth_scroll::list_scrolling() && crate::transition::pointer_on(&SharedString::from(format!("channel-{}", dm.id)));
+                    let decoration = dm.decoration.clone().map(|url| if row_hovered { crate::decorations::animated(&url) } else { url });
                     crate::members::avatar_with_overlay(
                         Avatar::new().border_0().src(dm.avatar_url.clone()).name(dm.label.clone()),
                         32.,
                         if typing { None } else { dm.status },
                         !typing && dm.mobile,
-                        dm.decoration.clone(),
+                        decoration,
                         theme.sidebar,
                         dots,
                     )

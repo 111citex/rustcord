@@ -298,7 +298,7 @@ pub fn avatar_with_overlay(
                     .left(u(1. - size * 0.1))
                     .size(u(size * 1.2 - 2.))
                     .overflow_hidden()
-                    .child(img(url).absolute().top(u(-1.)).left(u(-1.)).size(u(size * 1.2))),
+                    .child(div().absolute().top(u(-1.)).left(u(-1.)).size(u(size * 1.2)).child(crate::decorations::view(&url))),
             )
         })
         .when_some(status, |this, status| {
@@ -511,7 +511,8 @@ fn member_row(
     let nameplate_video = m.user.nameplate_video_url();
     let animated = nameplate_video.as_deref().filter(|_| hovered).and_then(|url| crate::nameplates::ready(url, cx));
     let look = crate::badges::name_look(&m.user, colors);
-    let decoration = m.user.decoration_url();
+    // Still, until the pointer is on the row.
+    let decoration = m.user.decoration_url().map(|url| if hovered { crate::decorations::animated(&url) } else { url });
     // What the art fades out into: the colour of the list behind it.
     let row_bg = theme.secondary;
     let row = div()

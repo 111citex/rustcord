@@ -358,6 +358,7 @@ impl PictureCache {
                     crate::profile_effects::rest(cx);
                     crate::nameplates::rest(cx);
                     crate::stickers::rest(cx);
+                    crate::decorations::rest(cx);
                 });
             }
         });

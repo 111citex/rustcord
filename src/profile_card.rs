@@ -481,7 +481,7 @@ impl Render for ProfileCard {
                             AVATAR,
                             status,
                             false,
-                            styled.decoration_url_at(480),
+                            styled.decoration_url_at(240).map(|url| crate::decorations::animated(&url)),
                             ring,
                             // Dims under the pointer, to say it opens something.
                             Some(
@@ -1039,7 +1039,7 @@ impl ProfileCard {
                             120.,
                             status,
                             false,
-                            styled.decoration_url_at(480),
+                            styled.decoration_url_at(240).map(|url| crate::decorations::animated(&url)),
                             ring,
                         )),
                     ))

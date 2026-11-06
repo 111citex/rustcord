@@ -2931,7 +2931,10 @@ fn message_row(
             .relative()
             // Avatar decorations are 1.2× the avatar, centred on it.
             .when_some(by.decoration.clone(), |this, url| {
-                this.child(img(url).absolute().top(u(-AVATAR * 0.1)).left(u(-AVATAR * 0.1)).size(u(AVATAR * 1.2)))
+                // Still, until the pointer is on the message.
+                let playing = !crate::smooth_scroll::list_scrolling() && (hovered.get() == Some(m.message.id) || hovered_tools.get() == Some(m.message.id));
+                let url = if playing { crate::decorations::animated(&url) } else { url };
+                this.child(div().absolute().top(u(-AVATAR * 0.1)).left(u(-AVATAR * 0.1)).size(u(AVATAR * 1.2)).child(crate::decorations::view(&url)))
             }))
             .into_any_element()
     };

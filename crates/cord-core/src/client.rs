@@ -582,6 +582,96 @@ impl Core {
         self.on_rt(async move { reqwest::get(url).await?.error_for_status()?.text().await }).await
     }
 
+    /// Trending GIF searches, and a GIF for the trending tile.
+    pub async fn gif_trending(&self) -> Result<crate::gifs::Trending, HttpError> {
+        let http = self.http.clone();
+        let path = format!("/gifs/trending?{}", crate::gifs::params("en-US"));
+        let result = self.on_rt(async move { http.get(&path).await }).await;
+        self.watch(result)
+    }
+
+    /// GIFs for `query`, or the trending ones when it's `None`.
+    pub async fn gif_search(&self, query: Option<String>) -> Result<Vec<crate::gifs::Gif>, HttpError> {
+        let http = self.http.clone();
+        let path = match query {
+            Some(q) => {
+                let q: String = q.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+                format!("/gifs/search?q={q}&{}", crate::gifs::params("en-US"))
+            }
+            None => format!("/gifs/trending-gifs?{}", crate::gifs::params("en-US")),
+        };
+        let result = self.on_rt(async move { http.get::<Value>(&path).await }).await;
+        self.watch(result).map(|v| crate::model::lenient_vec(v).unwrap_or_default())
+    }
+
+    /// The account's `FrecencyUserSettings` protobuf (starred GIFs, emoji history).
+    pub async fn frecency_settings(&self) -> Result<Vec<u8>, HttpError> {
+        use base64::Engine;
+        let http = self.http.clone();
+        let result = self.on_rt(async move { http.get::<Value>("/users/@me/settings-proto/2").await }).await;
+        let body = self.watch(result)?;
+        let blob = body["settings"].as_str().unwrap_or("");
+        base64::engine::general_purpose::STANDARD.decode(blob).map_err(|e| HttpError::Decode(e.to_string()))
+    }
+
+    /// Saves a whole `FrecencyUserSettings`, as Discord's client does.
+    pub async fn set_frecency_settings(&self, proto: Vec<u8>) -> Result<(), HttpError> {
+        use base64::Engine;
+        let http = self.http.clone();
+        let body = json!({"settings": base64::engine::general_purpose::STANDARD.encode(proto)});
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.patch("/users/@me/settings-proto/2", &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// A channel's pinned messages, newest pin first.
+    pub async fn pins(&self, channel: Id) -> Result<Vec<Message>, HttpError> {
+        let http = self.http.clone();
+        let result = self.on_rt(async move { http.get::<Value>(&format!("/channels/{channel}/messages/pins?limit=50")).await }).await;
+        self.watch(result).map(crate::search::read_pins)
+    }
+
+    /// One page of a message search: in a whole server, or in one DM or group.
+    pub async fn search(&self, guild: Option<Id>, channel: Id, query: &crate::search::Query) -> Result<crate::search::Answer, HttpError> {
+        let http = self.http.clone();
+        let path = match guild {
+            Some(guild) => format!("/guilds/{guild}/messages/search?{}", query.query_string()),
+            None => format!("/channels/{channel}/messages/search?{}", query.query_string()),
+        };
+        let result = self.on_rt(async move { http.get::<Value>(&path).await }).await;
+        self.watch(result).map(crate::search::read_answer)
+    }
+
+    /// Rings a DM or group call: everyone in it when `users` is `None`.
+    pub async fn ring(&self, channel: Id, users: Option<Vec<Id>>) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let body = json!({"recipients": users.map(|u| u.iter().map(Id::to_string).collect::<Vec<_>>())});
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.post(&format!("/channels/{channel}/call/ring"), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Stops ringing `users` (ourselves, to decline).
+    pub async fn stop_ringing(&self, channel: Id, users: Vec<Id>) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let body = json!({"recipients": users.iter().map(Id::to_string).collect::<Vec<_>>()});
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.post(&format!("/channels/{channel}/call/stop-ringing"), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
     /// Takes a DM off the list. Nothing is deleted; it comes back with the next message.
     pub async fn close_dm(&self, channel: Id) -> Result<(), HttpError> {
         let http = self.http.clone();

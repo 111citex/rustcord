@@ -3,11 +3,13 @@
 pub mod auth;
 pub mod build_number;
 pub mod cache;
+pub mod call;
 pub mod cdn;
 mod client;
 pub mod event;
 pub mod forum;
 pub mod gateway;
+pub mod gifs;
 pub mod http;
 pub mod id;
 pub mod poll;
@@ -19,6 +21,7 @@ pub mod paths;
 pub mod permissions;
 pub mod profile;
 pub mod rich;
+pub mod search;
 pub mod settings_proto;
 
 pub use crate::client::{API_BASE, Core, CoreConfig, startup_identity};

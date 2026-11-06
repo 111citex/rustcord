@@ -8,12 +8,14 @@ static ALLOCATOR: perf::CountingAlloc = perf::CountingAlloc;
 
 mod animated;
 mod add_people;
+mod call_ring;
 mod confirm;
 mod discord_icons;
 mod emoji_card;
 mod font_pages;
 mod image_disk;
 mod places;
+mod picker;
 mod perf;
 mod captcha;
 mod chat_format;
@@ -41,6 +43,7 @@ mod badges;
 mod markdown;
 mod markdown_view;
 mod members;
+mod message_card;
 mod message_text;
 mod nav;
 mod pages;
@@ -49,9 +52,12 @@ mod reaction_names;
 mod profile_preload;
 mod rich_view;
 mod router;
+mod search;
+mod search_view;
 mod settings;
 mod shell;
 mod sidebar;
+mod switcher;
 mod slider;
 mod smooth_scroll;
 mod stickers;
@@ -148,6 +154,7 @@ fn run() -> anyhow::Result<()> {
         font_pages::start();
         cx.bind_keys([
             gpui_kit::KeyBinding::new("ctrl-i", shell::ToggleInfo, None),
+            gpui_kit::KeyBinding::new("ctrl-k", shell::OpenSwitcher, None),
             gpui_kit::KeyBinding::new("ctrl-,", shell::OpenSettings, None),
             gpui_kit::KeyBinding::new("escape", pages::settings::CloseSettings, Some("Settings")),
         ]);

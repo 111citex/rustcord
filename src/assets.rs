@@ -15,7 +15,8 @@ gpui_kit::assets::icon_assets!(
         FaceSlightlySmilingPlus, Film, Gamepad2, Gift, Hash, HeadphoneOff, Headphones, Image, Lock, Megaphone,
         MessageCircle, MessageSquare, Mic, MicOff, Monitor, Moon, Music, Paperclip, Pencil, Pin, Reply, Search,
         Shield, Smartphone, Sparkles, Sticker, Trash, Users, UsersRound, Volume2, ArrowLeft, ArrowRight, Inbox,
-        CircleQuestionMark, Languages, Blocks, SendHorizontal, MessageSquareText, Folder, Gem,
+        CircleQuestionMark, Languages, Blocks, SendHorizontal, MessageSquareText, Folder, Gem, Clock, Flag, Leaf, Coffee,
+        Plane, Lightbulb,
     ]
 );
 

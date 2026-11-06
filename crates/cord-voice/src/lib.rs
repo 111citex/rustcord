@@ -8,8 +8,8 @@ mod playback;
 mod sounds;
 mod transport;
 
-pub use playback::play_once;
-pub use sounds::{Clip, Sound, decode_mp3};
+pub use playback::{Looping, play_looping, play_once};
+pub use sounds::{Clip, Sound, decode_mp3, fallback as stand_in};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering::Relaxed};

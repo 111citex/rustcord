@@ -170,6 +170,66 @@ pub fn play_once(clip: Clip) {
     }
 }
 
+/// A sound played over and over until this is dropped: a call ringing.
+pub struct Looping {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Looping {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+    }
+}
+
+/// Plays `clip` again and again, with `gap` of quiet between, until the handle goes.
+pub fn play_looping(clip: Clip, gap: Duration) -> Looping {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let spawned = std::thread::Builder::new().name("ringing".into()).spawn(move || {
+        if let Err(error) = loop_alone(&clip, gap, &stopped) {
+            tracing::warn!(%error, "couldn't play a ring");
+        }
+    });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "couldn't start a ring");
+    }
+    Looping { stop }
+}
+
+fn loop_alone(clip: &Clip, gap: Duration, stop: &Arc<AtomicBool>) -> Result<(), String> {
+    let device = cpal::default_host().default_output_device().ok_or("no output device")?;
+    let default = device.default_output_config().map_err(|e| e.to_string())?;
+    let channels = usize::from(default.channels()).max(1);
+    let mut config: cpal::StreamConfig = default.into();
+    config.sample_rate = RATE;
+    // The clip, then the gap as silence, round and round; silent once stopped.
+    let period = clip.len() + (gap.as_secs_f32() * RATE as f32) as usize * 2;
+    let (samples, mut at, quiet) = (clip.clone(), 0usize, stop.clone());
+    let stream = device
+        .build_output_stream(
+            config,
+            move |data: &mut [f32], _| {
+                let done = quiet.load(Relaxed);
+                for frame in data.chunks_mut(channels) {
+                    let place = at % period.max(2);
+                    let (left, right) = if done { (0., 0.) } else { (samples.get(place).copied().unwrap_or(0.), samples.get(place + 1).copied().unwrap_or(0.)) };
+                    at += 2;
+                    for (i, sample) in frame.iter_mut().enumerate() {
+                        *sample = if i % 2 == 0 { left } else { right };
+                    }
+                }
+            },
+            |error| tracing::warn!(%error, "ringing: output trouble"),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    stream.play().map_err(|e| e.to_string())?;
+    while !stop.load(Relaxed) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 fn sound_alone(clip: &Clip) -> Result<(), String> {
     let device = cpal::default_host().default_output_device().ok_or("no output device")?;
     let default = device.default_output_config().map_err(|e| e.to_string())?;

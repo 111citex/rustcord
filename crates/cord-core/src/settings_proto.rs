@@ -68,6 +68,136 @@ fn wrapped_varint(bytes: &[u8]) -> Option<u64> {
     })
 }
 
+/// A GIF starred in the GIF picker. `FrecencyUserSettings` (settings-proto type 2)
+/// field 2 is `FavoriteGIFs { map<string, FavoriteGIF> gifs = 1; bool hide_tooltip = 2; }`,
+/// keyed by the GIF's page address; a `FavoriteGIF` is `{ GIFType format = 1; string src
+/// = 2; uint32 width = 3; uint32 height = 4; uint32 order = 5; }`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FavoriteGif {
+    /// The page address: what gets sent, and the map's key.
+    pub url: String,
+    /// The video (or picture) itself.
+    pub src: String,
+    /// 1 a picture, 2 a video.
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Higher is starred later.
+    pub order: u32,
+}
+
+const FAVORITE_GIFS: u64 = 2;
+
+fn favorite_from(bytes: &[u8], url: String) -> FavoriteGif {
+    let mut gif = FavoriteGif { url, ..Default::default() };
+    for (field, value) in Fields::new(bytes) {
+        match (field, value) {
+            (1, Value::Varint(v)) => gif.format = v as u32,
+            (2, Value::Bytes(s)) => gif.src = String::from_utf8_lossy(s).into_owned(),
+            (3, Value::Varint(v)) => gif.width = v as u32,
+            (4, Value::Varint(v)) => gif.height = v as u32,
+            (5, Value::Varint(v)) => gif.order = v as u32,
+            _ => {}
+        }
+    }
+    gif
+}
+
+/// The starred GIFs in a `FrecencyUserSettings`, latest first.
+pub fn favorite_gifs(proto: &[u8]) -> Vec<FavoriteGif> {
+    let mut gifs = Vec::new();
+    for (field, value) in Fields::new(proto) {
+        let (FAVORITE_GIFS, Value::Bytes(favorites)) = (field, value) else { continue };
+        for (field, value) in Fields::new(favorites) {
+            let (1, Value::Bytes(entry)) = (field, value) else { continue };
+            let (mut key, mut body) = (None, &[][..]);
+            for (field, value) in Fields::new(entry) {
+                match (field, value) {
+                    (1, Value::Bytes(k)) => key = Some(String::from_utf8_lossy(k).into_owned()),
+                    (2, Value::Bytes(v)) => body = v,
+                    _ => {}
+                }
+            }
+            if let Some(key) = key {
+                gifs.push(favorite_from(body, key));
+            }
+        }
+    }
+    gifs.sort_by(|a, b| b.order.cmp(&a.order));
+    gifs
+}
+
+fn put_varint(mut v: u64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn put_bytes(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+    put_varint(field << 3 | 2, out);
+    put_varint(bytes.len() as u64, out);
+    out.extend_from_slice(bytes);
+}
+
+fn put_number(field: u64, value: u64, out: &mut Vec<u8>) {
+    put_varint(field << 3, out);
+    put_varint(value, out);
+}
+
+/// Each top-level field of `bytes` as (number, its whole encoding). `None` if malformed.
+fn raw_fields(bytes: &[u8]) -> Option<Vec<(u64, &[u8])>> {
+    let mut fields = Fields::new(bytes);
+    let mut out = Vec::new();
+    while !fields.rest.is_empty() {
+        let start = bytes.len() - fields.rest.len();
+        let (number, _) = fields.next()?;
+        out.push((number, &bytes[start..bytes.len() - fields.rest.len()]));
+    }
+    Some(out)
+}
+
+/// `proto` with its starred GIFs replaced by `gifs`, and everything else in it (emoji
+/// and sticker history, the tooltip flag, fields this doesn't know) kept byte for byte.
+/// `None` if `proto` can't be read: then nothing should be written.
+pub fn with_favorite_gifs(proto: &[u8], gifs: &[FavoriteGif]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut kept_inside = Vec::new();
+    for (number, raw) in raw_fields(proto)? {
+        if number != FAVORITE_GIFS {
+            out.extend_from_slice(raw);
+            continue;
+        }
+        let Some((_, Value::Bytes(inner))) = Fields::new(raw).next() else { return None };
+        for (number, raw) in raw_fields(inner)? {
+            if number != 1 {
+                kept_inside.extend_from_slice(raw);
+            }
+        }
+    }
+    let mut favorites = Vec::new();
+    for gif in gifs {
+        let mut body = Vec::new();
+        put_number(1, u64::from(gif.format), &mut body);
+        put_bytes(2, gif.src.as_bytes(), &mut body);
+        put_number(3, u64::from(gif.width), &mut body);
+        put_number(4, u64::from(gif.height), &mut body);
+        put_number(5, u64::from(gif.order), &mut body);
+        let mut entry = Vec::new();
+        put_bytes(1, gif.url.as_bytes(), &mut entry);
+        put_bytes(2, &body, &mut entry);
+        put_bytes(1, &entry, &mut favorites);
+    }
+    favorites.extend_from_slice(&kept_inside);
+    put_bytes(FAVORITE_GIFS, &favorites, &mut out);
+    Some(out)
+}
+
 enum Value<'a> {
     Varint(u64),
     Fixed64(u64),
@@ -198,6 +328,38 @@ mod tests {
         assert_eq!(folders[0].color, Some(0xff0000));
         assert_eq!(folders[0].guild_ids, vec![Id(11), Id(12)]);
         assert_eq!(folders[1], GuildFolder { guild_ids: vec![Id(13)], ..Default::default() });
+    }
+
+    #[test]
+    fn starred_gifs_change_and_the_rest_stays() {
+        let gif = |url: &str, order| FavoriteGif { url: url.into(), src: format!("{url}.mp4"), format: 2, width: 498, height: 280, order };
+        // Something else first (emoji history, say), then favourites with the tooltip flag.
+        let mut proto = Vec::new();
+        field_bytes(4, b"emoji history", &mut proto);
+        let start = with_favorite_gifs(&proto, &[gif("https://tenor.com/a", 1)]).unwrap();
+        let mut tooltip = Vec::new();
+        varint(2 << 3, &mut tooltip);
+        varint(1, &mut tooltip);
+        // The flag sits inside field 2: put it there, as Discord would.
+        let mut with_flag = Vec::new();
+        for (number, raw) in raw_fields(&start).unwrap() {
+            if number == 2 {
+                let Some((_, Value::Bytes(inner))) = Fields::new(raw).next() else { panic!() };
+                let mut inner = inner.to_vec();
+                inner.extend_from_slice(&tooltip);
+                field_bytes(2, &inner, &mut with_flag);
+            } else {
+                with_flag.extend_from_slice(raw);
+            }
+        }
+        assert_eq!(favorite_gifs(&with_flag), vec![gif("https://tenor.com/a", 1)]);
+        let both = with_favorite_gifs(&with_flag, &[gif("https://tenor.com/a", 1), gif("https://tenor.com/b", 2)]).unwrap();
+        assert_eq!(favorite_gifs(&both).iter().map(|g| g.url.as_str()).collect::<Vec<_>>(), vec!["https://tenor.com/b", "https://tenor.com/a"], "latest first");
+        let none = with_favorite_gifs(&both, &[]).unwrap();
+        assert!(favorite_gifs(&none).is_empty());
+        assert!(none.starts_with(&proto), "the other field is untouched");
+        assert!(none.ends_with(&tooltip), "so is the tooltip flag");
+        assert!(with_favorite_gifs(&[0xff], &[]).is_none(), "unreadable: write nothing");
     }
 
     #[test]

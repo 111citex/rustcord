@@ -23,7 +23,13 @@ pub struct Places {
     /// Those muted just for us.
     #[serde(default)]
     pub muted: Vec<Id>,
+    /// Channels opened lately, the latest first: the switcher's Previous Channels.
+    #[serde(default)]
+    pub recent: Vec<Id>,
 }
+
+/// How many channels Previous Channels remembers.
+const RECENT: usize = 20;
 
 impl Places {
     /// Takes in a page being opened. Whether it changed anything.
@@ -35,6 +41,11 @@ impl Places {
             (None, Some(channel)) => format!("/channels/@me/{channel}"),
             (None, None) => "/channels/@me".to_string(),
         });
+        if let Some(channel) = channel {
+            self.recent.retain(|c| *c != channel);
+            self.recent.insert(0, channel);
+            self.recent.truncate(RECENT);
+        }
         match (guild, channel) {
             (Some(guild), Some(channel)) => {
                 self.guilds.insert(guild, channel);
@@ -149,6 +160,21 @@ mod tests {
         assert_eq!(back.path.as_deref(), Some("/channels/@me/3"));
         assert_eq!(back.dm, Some(Id(3)));
         assert_eq!(back.guilds.get(&Id(1)), Some(&Id(2)));
+    }
+
+    #[test]
+    fn previous_channels_put_the_latest_first_once() {
+        let mut places = Places::default();
+        for channel in [2, 3, 2] {
+            places.note(Some(Id(1)), Some(Id(channel)));
+        }
+        places.note(Some(Id(1)), None);
+        assert_eq!(places.recent, vec![Id(2), Id(3)]);
+        for channel in 0..40 {
+            places.note(None, Some(Id(100 + channel)));
+        }
+        assert_eq!(places.recent.len(), RECENT);
+        assert_eq!(places.recent[0], Id(139));
     }
 
     #[test]

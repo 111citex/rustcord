@@ -18,6 +18,10 @@ pub enum Sound {
     Undeafened,
     StreamStarted,
     StreamEnded,
+    /// Someone's calling us.
+    Incoming,
+    /// We're calling someone and they haven't answered.
+    Outgoing,
 }
 
 /// Stereo samples at 48 kHz.
@@ -50,6 +54,9 @@ pub fn fallback(sound: Sound) -> Clip {
         Sound::Undeafened => tones(&[(390., 0.07), (520., 0.11)]),
         Sound::StreamStarted => tones(&[(520., 0.08), (780., 0.14)]),
         Sound::StreamEnded => tones(&[(780., 0.08), (520., 0.14)]),
+        // A ring is its two notes twice; the gap between rings comes from the loop.
+        Sound::Incoming => tones(&[(784., 0.18), (988., 0.18), (784., 0.18), (988., 0.3)]),
+        Sound::Outgoing => tones(&[(440., 0.35), (440., 0.35)]),
     }
 }
 
@@ -137,6 +144,16 @@ mod tests {
             assert!(clip.len() < RATE as usize, "{sound:?} is under half a second");
             assert!(clip.iter().all(|s| s.abs() <= 0.3));
             assert!(clip[0].abs() < 0.01, "no click at the start");
+        }
+    }
+
+    #[test]
+    fn rings_are_quiet_and_start_silently() {
+        for sound in [Sound::Incoming, Sound::Outgoing] {
+            let clip = fallback(sound);
+            assert!(clip.len() < RATE as usize * 4, "{sound:?} is under two seconds");
+            assert!(clip.iter().all(|s| s.abs() <= 0.3));
+            assert!(clip[0].abs() < 0.01);
         }
     }
 

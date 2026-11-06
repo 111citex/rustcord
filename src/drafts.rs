@@ -112,6 +112,11 @@ pub fn set_edit(channel: Id, edit: Option<(Id, String)>, cx: &App) {
     }
 }
 
+/// Channels with something written and not sent, text or files.
+pub fn waiting() -> Vec<(Id, String)> {
+    with(|drafts| drafts.iter().filter(|(_, d)| !d.text.trim().is_empty() || !d.files.is_empty()).map(|(c, d)| (*c, d.text.clone())).collect())
+}
+
 /// Signing out: they're not the next account's to see.
 pub fn forget_all() {
     with(Drafts::clear);

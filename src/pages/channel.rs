@@ -113,6 +113,11 @@ pub struct ChannelPage {
     delete_closing: bool,
     /// The composer says "Message #name" (not just "Message") yet.
     placeholder_named: bool,
+    /// The pinned messages popout is open, hanging from this point (the pin button).
+    pins_at: Option<Point<Pixels>>,
+    pins_scroll: gpui_kit::ScrollHandle,
+    /// The app's message search, which this page shows when it's for here.
+    search: Entity<crate::search::Search>,
     /// RUSTCORD_BENCH=1: scroll on its own every frame and log the frame rate.
     bench: Option<Bench>,
     /// The Threads button's list, and what listens for its closing.
@@ -339,11 +344,23 @@ impl ChannelPage {
                         return;
                     }
                     let _ = page.update(cx, |page, cx| {
+                        // Esc in the search box leaves it for the message box.
+                        let search_input = page.search.read(cx).input.clone();
+                        if key == "escape" && gpui_kit::Focusable::focus_handle(search_input.read(cx), cx).is_focused(window) {
+                            page.input.update(cx, |input, cx| input.focus(window, cx));
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if key == "escape" && page.pins_at.is_some() && !crate::confirm::is_open(cx) {
+                            page.toggle_pins(None, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         if page.suggest.is_none() {
                             // Up in an empty box: edit our latest message.
                             let in_box = gpui_kit::Focusable::focus_handle(page.input.read(cx), cx).is_focused(window);
                             // Whatever's on top of the page gets Esc first, and handles it itself.
-                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx)) {
+                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx) || crate::switcher::is_open(cx) || crate::picker::is_open(cx)) {
                                 return;
                             }
                             if key == "up" && in_box && page.editing.is_none() && page.input.read(cx).value().is_empty() && page.pending.is_empty() {
@@ -411,6 +428,19 @@ impl ChannelPage {
             input.update(cx, |input, cx| input.focus(window, cx));
         }
 
+        let search = crate::search::get(&ctx.services.core, window, cx);
+        let mut subscriptions = subscriptions;
+        subscriptions.push(cx.observe(&search, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(&search, |this: &mut Self, search, event: &crate::search::SearchEvent, cx| match event {
+            // Only the page on screen searches: kept pages hear it too.
+            crate::search::SearchEvent::Submit => {
+                let here = nav::parse_location(this.ctx.router.read(cx).current_path()).and_then(|l| l.channel);
+                let Some(channel) = this.channel.filter(|c| here == Some(*c)) else { return };
+                let scope = crate::search::Scope { guild: this.guild, channel };
+                let store = this.ctx.services.store.clone();
+                search.update(cx, |search, cx| search.run(scope, &store, cx));
+            }
+        }));
         let mut page = ChannelPage {
             ctx,
             channel,
@@ -461,13 +491,264 @@ impl ChannelPage {
             threads_panel: None,
             new_thread: None,
             forum: None,
+            pins_at: None,
+            pins_scroll: gpui_kit::ScrollHandle::new(),
+            search,
             _subscriptions: subscriptions,
         };
         page.guild = page.server(cx);
+        // Somewhere the search wasn't for: it's over, as in Discord.
+        let (guild, here) = (page.guild, page.channel);
+        if page.search.read(cx).scope.is_some_and(|s| here.is_none_or(|c| !s.covers(guild, c))) {
+            page.search.update(cx, |search, cx| search.close(window, cx));
+        }
         page.sync_members(window, cx);
         page.restore_draft(window, cx);
         page.sync_list(cx);
         page
+    }
+
+    /// A DM or group call, over the chat while there is one: who's in it, who's being
+    /// rung, and joining or leaving it.
+    fn call_area(&self, channel: Id, cx: &Context<Self>) -> Option<AnyElement> {
+        let store = self.ctx.services.store.read(cx);
+        let cache = store.cache();
+        let call = cache.call(channel)?;
+        let place = cache.channel(channel).filter(|c| c.guild_id.is_none())?;
+        let status = store.voice_status().filter(|v| v.channel == channel);
+        let me = cache.me().map(|u| u.id);
+        let mut people: Vec<(Id, bool)> = call.participants().map(|u| (u, false)).collect();
+        // Whoever's being rung, faded, after those already in.
+        let rung: Vec<(Id, bool)> = call.ringing.iter().filter(|u| !people.iter().any(|(p, _)| p == *u)).map(|u| (*u, true)).collect();
+        people.extend(rung);
+        // We started it and left: nothing to show but the chat.
+        if status.is_none() && people.iter().all(|(u, rung)| *rung || Some(*u) == me) && call.participants().next().is_none() {
+            return None;
+        }
+        let theme = cx.theme();
+        let green = Hsla::from(gpui_kit::rgb(0x23a55a));
+        let speaking = store.speaking();
+        let faces = people.iter().filter_map(|(id, rung)| {
+            let user = cache.user(*id)?;
+            let lit = !rung && speaking.contains(id);
+            let face = div()
+                .relative()
+                .size(u(80.))
+                .flex_shrink_0()
+                .child(Avatar::new().border_0().src(cache.avatar_url(None, user, 128)).name(cache.display_name(None, user).to_string()).size(u(80.)))
+                .when(lit, |d| d.child(div().absolute().top(u(-4.)).left(u(-4.)).size(u(88.)).rounded_full().border_3().border_color(green)));
+            // Being rung: faded, breathing.
+            Some(if *rung {
+                face.with_animation(("call-rung", id.0), gpui_kit::Animation::new(std::time::Duration::from_millis(1400)).repeat(), |d, t| {
+                    d.opacity(0.35 + 0.25 * (1. - (t * 2. - 1.).abs()))
+                })
+                .into_any_element()
+            } else {
+                face.into_any_element()
+            })
+        });
+        let button = |id: &'static str, bg: Hsla, tip: &'static str| {
+            div()
+                .id(id)
+                .size(u(48.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(bg)
+                .text_color(gpui_kit::white())
+                .cursor_pointer()
+                .hover(|d| d.opacity(0.85))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx))
+        };
+        let store_entity = self.ctx.services.store.clone();
+        let controls = match &status {
+            Some(status) => {
+                let (deafen, leave) = (store_entity.clone(), store_entity.clone());
+                h_flex()
+                    .gap(u(16.))
+                    .child(
+                        button("call-deafen", theme.foreground.opacity(0.15), if status.deaf { "Undeafen" } else { "Deafen" })
+                            .on_click(move |_, _, cx| deafen.update(cx, |store, cx| store.toggle_deaf(cx)))
+                            .child(Icon::new(if status.deaf { IconName::HeadphoneOff } else { IconName::Headphones }).size(u(22.))),
+                    )
+                    .child(
+                        button("call-leave", Hsla::from(gpui_kit::rgb(0xda373c)), "Disconnect")
+                            .on_click(move |_, _, cx| leave.update(cx, |store, cx| store.leave_voice(cx)))
+                            .child(Icon::new(IconName::PhoneOff).size(u(22.))),
+                    )
+            }
+            None => h_flex().child(
+                button("call-join", Hsla::from(gpui_kit::rgb(0x248046)), "Join Call")
+                    .on_click(move |_, _, cx| store_entity.update(cx, |store, cx| store.join_voice(None, channel, cx)))
+                    .child(Icon::default().path("icons/phone.svg").size(u(22.))),
+            ),
+        };
+        let line = match (&status, place.kind) {
+            (Some(s), _) if !s.connected => "Connecting…".to_string(),
+            (Some(_), _) if call.participants().all(|u| Some(u) == me) && !call.ringing.is_empty() => "Calling…".to_string(),
+            (Some(_), _) => String::new(),
+            (None, _) => format!("{} in the call", call.participants().count()),
+        };
+        Some(
+            v_flex()
+                .flex_shrink_0()
+                .h(u(240.))
+                .items_center()
+                .justify_center()
+                .gap(u(16.))
+                .bg(gpui_kit::black().opacity(0.35))
+                .border_b_1()
+                .border_color(theme.border)
+                .child(h_flex().gap(u(16.)).items_center().justify_center().children(faces))
+                .when(!line.is_empty(), |d| d.child(div().text_size(u(14.)).text_color(theme.muted_foreground).child(line)))
+                .child(controls)
+                .into_any_element(),
+        )
+    }
+
+    /// Opens the GIF or emoji picker over the message box's button at `at`.
+    fn open_picker(&mut self, tab: crate::picker::Tab, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel else { return };
+        let page = cx.entity().downgrade();
+        let on_pick: crate::picker::OnPick = Rc::new(move |picked, window, cx| {
+            let _ = page.update(cx, |page, cx| page.take_pick(picked, window, cx));
+        });
+        crate::picker::open(self.ctx.services.store.clone(), channel, tab, at, true, on_pick, window, cx);
+    }
+
+    /// What the picker gave: an emoji into the message box where the cursor is, or a GIF sent.
+    fn take_pick(&mut self, picked: crate::picker::Picked, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::picker::Picked;
+        let Some(channel) = self.channel else { return };
+        let token = match picked {
+            Picked::Unicode(emoji) => emoji_token(emoji),
+            Picked::Custom { name, id, animated } => ping_token(self.ctx.services.store.read(cx).cache(), self.guild, ComposerPing::CustomEmoji { name, id, animated }),
+            // As in Discord: a GIF goes at once, as its own message.
+            Picked::Gif(url) => {
+                self.ctx.services.store.update(cx, |store, cx| store.send(channel, url, None, Vec::new(), cx));
+                return;
+            }
+        };
+        self.input.update(cx, |input, cx| {
+            let _ = input.replace_with_token(token, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Add Reaction: the emoji picker, and the pick goes on `message`.
+    fn react_picker(&mut self, message: Id, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel else { return };
+        let store = self.ctx.services.store.clone();
+        let on_pick: crate::picker::OnPick = Rc::new(move |picked, _, cx| {
+            let emoji = match picked {
+                crate::picker::Picked::Unicode(e) => ReactionEmoji { name: Some(e.to_string()), ..Default::default() },
+                crate::picker::Picked::Custom { name, id, animated } => ReactionEmoji { id: Some(id), name: Some(name), animated },
+                crate::picker::Picked::Gif(_) => return,
+            };
+            store.update(cx, |store, cx| store.set_reaction(channel, message, emoji, true, cx));
+        });
+        crate::picker::open(self.ctx.services.store.clone(), channel, crate::picker::Tab::Emoji, at, false, on_pick, window, cx);
+    }
+
+    /// Opens the pinned messages under `at`, or closes them (`None`, or a second click).
+    fn toggle_pins(&mut self, at: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        self.pins_at = if self.pins_at.is_some() { None } else { at };
+        let shown = self.pins_at.and(self.channel);
+        self.ctx.services.store.update(cx, |store, cx| store.show_pins(shown, cx));
+        cx.notify();
+    }
+
+    /// Discord's pinned messages popout: newest pin first, each with Jump, and Unpin
+    /// for whoever may.
+    fn pins_popout(&self, channel: Id, at: Point<Pixels>, window: &Window, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let store = self.ctx.services.store.read(cx);
+        let cache = store.cache();
+        let guild = self.guild;
+        let may_unpin = guild.is_none() || cache.has_permission(channel, cord_core::permissions::PIN_MESSAGES) || cache.has_permission(channel, cord_core::permissions::MANAGE_MESSAGES);
+        let note = |text: String| div().py(u(32.)).px(u(16.)).text_center().text_size(u(14.)).text_color(theme.muted_foreground).child(text);
+        let body = match store.pins(channel) {
+            None | Some(crate::store::Pins::Loading) => note("Loading…".into()).into_any_element(),
+            Some(crate::store::Pins::Failed(error)) => note(format!("Couldn't load the pinned messages: {error}")).into_any_element(),
+            Some(crate::store::Pins::Loaded(list)) if list.is_empty() => note("This channel doesn't have any pinned messages... yet.".into()).into_any_element(),
+            Some(crate::store::Pins::Loaded(list)) => {
+                let channel_of = Rc::new(list.iter().map(|m| (m.id, channel)).collect());
+                let shared = crate::message_card::shared(&self.ctx.services.store, channel_of, self.parsed.clone(), self.revealed.clone(), self.ctx.services.settings.read(cx).get().chat_text as f32);
+                v_flex()
+                    .gap(u(8.))
+                    .p(u(12.))
+                    .children(list.iter().map(|m| {
+                        let unpin = may_unpin.then(|| {
+                            let (store, id) = (self.ctx.services.store.clone(), m.id);
+                            div()
+                                .id(SharedString::from(format!("unpin-{id}")))
+                                .size(u(24.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(u(4.))
+                                .bg(theme.background)
+                                .cursor_pointer()
+                                .hover(|d| d.bg(theme.danger.opacity(0.3)))
+                                .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Unpin").build(window, cx))
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let store = store.clone();
+                                    crate::confirm::ask("Unpin Message".into(), "You sure you want to remove this pinned message?".into(), "Remove it please!", move |cx| {
+                                        store.update(cx, |store, cx| store.unpin_message(channel, id, cx));
+                                    }, cx);
+                                })
+                                .child(Icon::new(IconName::Close).size(u(14.)))
+                                .into_any_element()
+                        });
+                        crate::message_card::card(SharedString::from(format!("pin-{}", m.id)), m, guild, cache, &shared, unpin, cx)
+                    }))
+                    .into_any_element()
+            }
+        };
+        let page = cx.entity().downgrade();
+        let viewport = window.viewport_size();
+        let panel = v_flex()
+            .id("pins-popout")
+            .occlude()
+            .w(u(420.))
+            .max_h(u(560.))
+            .rounded(u(8.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .shadow_lg()
+            .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .h(u(48.))
+                    .px(u(16.))
+                    .gap(u(8.))
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(Icon::default().path("icons/toolbar-pin.svg").size(u(20.)))
+                    .child(div().text_size(u(16.)).font_weight(FontWeight::SEMIBOLD).child("Pinned Messages")),
+            )
+            .child(div().id("pins-list").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.pins_scroll).child(body));
+        // A click anywhere else closes it, as Discord's popouts do.
+        gpui_kit::deferred(
+            gpui_kit::anchored().position(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.))).child(
+                div()
+                    .id("pins-outside")
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
+                        let _ = page.update(cx, |page, cx| page.toggle_pins(None, cx));
+                    })
+                    .child(gpui_kit::anchored().anchor(gpui_kit::Anchor::TopRight).position(gpui_kit::point(at.x + gpui_kit::px(16.), at.y + gpui_kit::px(20.))).snap_to_window_with_margin(gpui_kit::px(8.)).child(panel)),
+            ),
+        )
+        .with_priority(3)
+        .into_any_element()
     }
 
     fn is_voice(&self, cx: &App) -> bool {
@@ -902,7 +1183,10 @@ impl ChannelPage {
         ];
         if !me {
             entries.push(Entry::item("Message", with(|p, u, _, _, _, cx| p.message(u, cx))));
-            entries.push(Entry::later("Start a Call"));
+            if self.ctx.services.store.read(cx).cache().user(user).is_none_or(|u| !u.bot) {
+                let store = self.ctx.services.store.clone();
+                entries.push(Entry::item("Start a Call", move |_, cx| store.update(cx, |store, cx| store.call_user(user, cx))));
+            }
             entries.push(Entry::later("Add Note"));
             // A group's owner may remove people or hand it over. Both ask first.
             let my_id = self.ctx.services.store.read(cx).cache().me().map(|u| u.id);
@@ -2792,7 +3076,12 @@ fn hover_actions(
         .when(can_react, |this| {
             this.children(quick)
                 .child(div().mx(u(4.)).w(u(1.)).h(u(20.)).bg(theme.border))
-                .child(button("act-react", IconName::FaceSlightlySmilingPlus, "Add Reaction"))
+                .child(button("act-react", IconName::FaceSlightlySmilingPlus, "Add Reaction").on_click({
+                    let page = page.clone();
+                    move |event, window, cx| {
+                        let _ = page.update(cx, |page, cx| page.react_picker(id, event.position(), window, cx));
+                    }
+                }))
         })
         .when(own, |this| {
             this.child(button("act-edit", IconName::Pencil, "Edit").on_click({
@@ -3523,6 +3812,10 @@ impl Render for ChannelPage {
             }
         }
         if let Some(target) = self.channel.and_then(|c| crate::links::take_jump(c, cx)) {
+            // Jumping from the pins: they've done their job.
+            if self.pins_at.take().is_some() {
+                self.ctx.services.store.update(cx, |store, cx| store.show_pins(None, cx));
+            }
             self.jump_target = Some((target, 0));
             self.seek_jump_target(cx);
         }
@@ -3591,6 +3884,19 @@ impl Render for ChannelPage {
         let width = f32::from(window.viewport_size().width) / f32::from(window.rem_size()) * 16.;
         let layout = self.ctx.services.settings.read(cx).get();
         let (column_width, members_width) = (layout.column_width, layout.members_width);
+        // The search box, built before the store's borrowed for the rest; voice channels have none.
+        let mut search_box = match self.channel.filter(|_| !self.is_voice(cx)) {
+            Some(channel) => {
+                let placeholder = match self.guild.and_then(|g| self.ctx.services.store.read(cx).cache().guild(g)) {
+                    Some(g) => format!("Search {}", g.name),
+                    None => "Search".to_string(),
+                };
+                let scope = crate::search::Scope { guild: self.guild, channel };
+                Some(crate::search_view::search_box(&self.search, &self.ctx.services.store, scope, placeholder, window, cx))
+            }
+            None => None,
+        };
+        let searching = search_box.is_some() && self.search.read(cx).scope.is_some_and(|s| self.channel.is_some_and(|c| s.covers(self.guild, c)));
         let members_fit = width - 72. - column_width - members_width >= CHAT_MIN
             || std::env::var_os("RUSTCORD_FORCE_MEMBERS").is_some();
         let store = self.ctx.services.store.read(cx);
@@ -3915,12 +4221,18 @@ impl Render for ChannelPage {
         // marks dropped (the full styling would need a whole message to render in).
         let topic = channel.topic.as_deref().map(plain_topic);
         let has_topic = topic.is_some();
-        let search = match channel.guild_id.and_then(|g| cache.guild(g)) {
-            Some(g) => format!("Search {}", g.name),
-            None => "Search".to_string(),
-        };
         let in_thread = channel.thread.is_some();
         let join_button = in_thread.then(|| self.join_button(channel_id, cx)).flatten();
+        // Discord's search sits atop the column on the right (members, or results);
+        // with no column there, at the header's end.
+        let side_list = members_fit && (self.members.is_some() || group_list.is_some());
+        let header_search = if side_list || searching { None } else { search_box.take() };
+        // The call button's tip, in a DM or group we're not already calling in; none elsewhere.
+        let in_this_call = store.voice_status().is_some_and(|v| v.channel == channel_id);
+        let bot_dm = channel.kind == ChannelKind::Dm && channel.recipient_ids.first().and_then(|u| cache.user(*u)).is_some_and(|u| u.bot);
+        let private_call = (channel.guild_id.is_none() && !in_this_call && !bot_dm)
+            .then(|| if cache.call(channel_id).is_some_and(|c| c.participants().next().is_some()) { "Join Call" } else { "Start Voice Call" });
+        let call_area = self.call_area(channel_id, cx);
         // Measured in Discord: 49px with 8px padding (16px on the left).
         let header = h_flex()
             .h(u(49.))
@@ -3940,9 +4252,20 @@ impl Render for ChannelPage {
             // With a topic, it's what fills the row: a spacer would take half its room.
             .when(!has_topic, |this| this.child(div().flex_1()))
             .children(join_button)
-            .child(tool_button("threads", "icons/toolbar-threads.svg", "Threads", cx).on_click(cx.listener(|this, _, _, cx| this.toggle_threads(cx))))
-            .child(tool_button("bell", "icons/toolbar-bell.svg", "Notification Settings", cx))
-            .child(tool_button("pin", "icons/toolbar-pin.svg", "Pinned Messages", cx))
+            .when(channel.guild_id.is_some(), |this| {
+                this.child(tool_button("threads", "icons/toolbar-threads.svg", "Threads", cx).on_click(cx.listener(|this, _, _, cx| this.toggle_threads(cx))))
+                    .child(tool_button("bell", "icons/toolbar-bell.svg", "Notification Settings", cx))
+            })
+            // DMs and groups call from here, or join the call already going.
+            .when(private_call.is_some(), |this| {
+                let (store, tip) = (self.ctx.services.store.clone(), private_call.unwrap_or("Start Voice Call"));
+                this.child(tool_button("start-call", "icons/phone.svg", tip, cx).on_click(move |_, _, cx| {
+                    store.update(cx, |store, cx| store.start_call(channel_id, cx));
+                }))
+            })
+            .child(tool_button("pin", "icons/toolbar-pin.svg", "Pinned Messages", cx).on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                this.toggle_pins(Some(event.position()), cx);
+            })))
             .when(self.guild.is_some() || channel.kind == ChannelKind::GroupDm, |this| {
                 this.child(
                     Button::new("toggle-members")
@@ -3954,24 +4277,7 @@ impl Render for ChannelPage {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_members(cx))),
                 )
             })
-            .child(
-                h_flex()
-                    .id("search-box")
-                    .cursor_default()
-                    .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Search — arrives later").build(window, cx))
-                    .w(u(240.))
-                    .h(u(32.))
-                    .px_2()
-                    .ml_2()
-                    .items_center()
-                    .justify_between()
-                    .rounded(u(4.))
-                    .bg(theme.popover)
-                    .text_size(u(14.))
-                    .text_color(muted)
-                    .child(div().min_w_0().truncate().child(search))
-                    .child(Icon::new(IconName::Search).size(u(16.))),
-            );
+            .when_some(header_search, |this, search| this.child(div().w(u(240.)).ml_2().flex_shrink_0().child(search)));
         // A voice channel: who's in it on the left, its chat in a panel beside
         // them that opens from the channel list and drags wider or narrower.
         let voice = matches!(channel.kind, ChannelKind::Voice | ChannelKind::Stage);
@@ -4017,8 +4323,44 @@ impl Render for ChannelPage {
                     cx.notify();
                 })))
         });
-        // In a voice channel the chat has its own header; elsewhere the bar spans the page.
+        // In a voice channel the chat has its own header; elsewhere the bar tops the chat
+        // alone, and the column on the right reaches the top with the search over it.
         let top_header = chat_header.is_none().then_some(header);
+        let strip = |search: AnyElement| h_flex().flex_shrink_0().h(u(TOP_BAR)).px(u(8.)).items_center().border_b_1().border_color(border).child(search);
+        let right_column = if searching {
+            // Wider while searching, without touching the width the member list was given.
+            let text_size = self.ctx.services.settings.read(cx).get().chat_text as f32;
+            let results = crate::search_view::results(&self.search, &self.ctx.services.store, self.parsed.clone(), self.revealed.clone(), text_size, cx);
+            Some(
+                v_flex()
+                    .w(u(members_width.max(crate::search_view::RESULTS_WIDTH)))
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_l_1()
+                    .border_color(border)
+                    .children(search_box.take().map(strip))
+                    .child(div().flex_1().min_h_0().child(results))
+                    .into_any_element(),
+            )
+        } else if side_list {
+            let list: AnyElement = match (&self.members, group_list) {
+                // Cached: while the chat scrolls the member list reuses its last frame.
+                (Some((panel, _)), _) => AnyView::from(panel.clone()).cached(gpui_kit::StyleRefinement::default().size_full()).into_any_element(),
+                (None, Some(list)) => list,
+                (None, None) => div().into_any_element(),
+            };
+            Some(
+                v_flex()
+                    .w(u(members_width))
+                    .h_full()
+                    .flex_shrink_0()
+                    .children(search_box.take().map(strip))
+                    .child(div().flex_1().min_h_0().child(list))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         h_flex()
             .relative()
             .size_full()
@@ -4050,7 +4392,6 @@ impl Render for ChannelPage {
                     cx.notify();
                 }
             }))
-            .when(top_header.is_some(), |d| d.relative().pt(u(TOP_BAR)))
             .children(stage)
             .children(edge)
             .child(
@@ -4061,7 +4402,9 @@ impl Render for ChannelPage {
                         (true, false) => d.w_0().overflow_hidden(),
                     })
                     .h_full()
+                    .children(top_header)
                     .children(chat_header)
+                    .children(call_area)
                     .child(div().flex_1().min_h_0().child(messages))
                     .when(!forbidden, |this| {
                         let composer = match nav::composer_lock(cache, channel) {
@@ -4092,9 +4435,9 @@ impl Render for ChannelPage {
                                     .child(
                                         div()
                                             .id("animated")
-                                            .tooltip(|window, cx| {
-                                                gpui_kit::component::tooltip::Tooltip::new("GIFs — arrives with the pickers").build(window, cx)
-                                            })
+                                            .cursor_pointer()
+                                            .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Open GIF picker").build(window, cx))
+                                            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| this.open_picker(crate::picker::Tab::Gifs, event.position(), window, cx)))
                                             .mx(u(4.))
                                             .w(u(24.))
                                             .h(u(20.))
@@ -4110,7 +4453,9 @@ impl Render for ChannelPage {
                                             .child("GIF"),
                                     )
                                     .child(tool_button("sticker", IconName::Sticker, "Stickers — arrives with the pickers", cx)))
-                                    .child(tool_button("emoji", IconName::FaceSlightlySmiling, "Emoji — arrives with the pickers", cx))
+                                    .child(tool_button("emoji", IconName::FaceSlightlySmiling, "Select emoji", cx).on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                        this.open_picker(crate::picker::Tab::Emoji, event.position(), window, cx)
+                                    })))
                                     .child(tool_button("apps", IconName::Blocks, "Apps", cx))
                                     .child(div().mx(u(6.)).w(u(1.)).h(u(24.)).bg(border))
                                     .child(
@@ -4254,8 +4599,7 @@ impl Render for ChannelPage {
                         )
                     }),
             )
-            // Cached: while the chat scrolls the member list reuses its last frame.
-            .when(self.members.is_some() && members_fit, |d| {
+            .when(side_list && !searching, |d| {
                 d.child(
                     div().relative().w_0().h_full().flex_shrink_0().child(
                         div()
@@ -4273,18 +4617,12 @@ impl Render for ChannelPage {
                     ),
                 )
             })
-            .children(self.members.as_ref().filter(|_| members_fit).map(|(panel, _)| {
-                AnyView::from(panel.clone()).cached(
-                    gpui_kit::StyleRefinement::default().h_full().w(u(members_width)).flex_shrink_0(),
-                )
-            }))
-            .when_some(group_list, |this, list| this.child(list))
-            // The bar runs over the member list too, with the search above it, as Discord's.
-            .when_some(top_header, |d, header| d.child(div().absolute().top_0().left_0().right_0().h(u(TOP_BAR)).occlude().child(header)))
+            .when_some(right_column, |d, column| d.child(column))
             .children(self.profile.as_ref().map(|(card, _)| card.clone()))
             .children(self.threads_panel.as_ref().map(|(panel, _)| panel.clone()))
             .children(self.new_thread_dialog(window, cx))
             .when_some(self.confirm_delete, |d, message| d.child(self.delete_dialog(message, window, cx)))
+            .when_some(self.pins_at, |d, at| d.child(self.pins_popout(channel_id, at, window, cx)))
             .into_any_element()
     }
 }

@@ -1279,7 +1279,11 @@ impl Store {
                 return;
             }
             CoreEvent::PinsChanged { channel_id } => self.pins_changed(channel_id, cx),
-            CoreEvent::MessageUpdate(edit) if edit.pinned.is_some() => {
+            // Edits often carry `pinned` unchanged: only a real change matters.
+            CoreEvent::MessageUpdate(edit)
+                if edit.pinned.is_some()
+                    && self.cache.messages(edit.channel_id).and_then(|m| m.iter().find(|m| m.message.id == edit.id)).is_some_and(|m| Some(m.message.pinned) != edit.pinned) =>
+            {
                 let channel = edit.channel_id;
                 self.cache.apply(CoreEvent::MessageUpdate(edit));
                 self.pins_changed(channel, cx);

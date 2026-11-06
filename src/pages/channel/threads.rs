@@ -17,8 +17,21 @@ const BLURPLE: u32 = 0x5865f2;
 
 impl ChannelPage {
     pub(super) fn open_thread(&self, thread: Id, cx: &mut Context<Self>) {
-        let Some(path) = self.ctx.services.store.read(cx).cache().channel(thread).map(nav::channel_path) else { return };
-        navigate(&self.ctx.router, path, cx);
+        if let Some(path) = self.ctx.services.store.read(cx).cache().channel(thread).map(nav::channel_path) {
+            navigate(&self.ctx.router, path, cx);
+            return;
+        }
+        // A thread we've never heard of (a link in a notice): ask Discord what it is.
+        let (core, store) = (self.ctx.services.core.clone(), self.ctx.services.store.clone());
+        cx.spawn(async move |this, cx| {
+            let Ok(found) = core.fetch_channel(thread).await else { return };
+            let path = nav::channel_path(&found);
+            let _ = this.update(cx, |page, cx| {
+                store.update(cx, |store, cx| store.add_threads(vec![found], &[], cx));
+                navigate(&page.ctx.router, path, cx);
+            });
+        })
+        .detach();
     }
 
     /// Opens the box that names a new thread, started from `message`.
@@ -254,7 +267,12 @@ pub(super) fn starter_row(
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
-    let original = m.message.referenced_message.as_deref();
+    // Discord sends the message it grew from; if not, the channel above may still hold it.
+    let original = m.message.referenced_message.as_deref().or_else(|| {
+        let reference = m.message.message_reference.as_ref()?;
+        let (channel, message) = (reference.channel_id?, reference.message_id?);
+        cache.messages(channel)?.iter().find(|c| c.message.id == message).map(|c| &c.message)
+    });
     let parent = cache.thread(m.message.channel_id).and_then(|t| t.parent_id);
     let body = match original {
         Some(original) => {
@@ -351,7 +369,7 @@ pub(super) fn chip(ix: usize, cache: &Cache, message: &Message, page: &WeakEntit
                             .child(div().flex_1().min_w_0().truncate().child(preview.unwrap_or_else(|| wording::ago(now, active)))),
                     ),
             )
-            .when(unread, |d| d.child(div().flex_shrink_0().size(u(8.)).rounded_full().bg(theme.danger)))
+            .when(unread, |d| d.child(div().flex_shrink_0().size(u(8.)).rounded_full().bg(theme.foreground)))
             .child(Icon::new(IconName::ChevronRight).size(u(16.)).text_color(theme.muted_foreground))
             .into_any_element(),
     )

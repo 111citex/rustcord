@@ -111,7 +111,7 @@ impl ThreadsPanel {
 
     fn pick_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
-        if self.fetch[Self::index(tab)] == Fetch::Idle {
+        if matches!(self.fetch[Self::index(tab)], Fetch::Idle | Fetch::Failed(_)) {
             self.fetch_more(cx);
         }
         cx.notify();

@@ -98,10 +98,19 @@ impl ForumView {
         let (core, store, channel, generation) = (self.ctx.services.core.clone(), self.ctx.services.store.clone(), self.channel, self.generation);
         cx.notify();
         cx.spawn(async move |this, cx| {
+            // The first page also asks for the active posts alone: whether the listing
+            // with archived posts includes them isn't something we can see from here.
+            let active = if search.offset == 0 { core.search_threads(channel, ThreadSearch { archived: false, ..search.clone() }).await.ok() } else { None };
             let result = core.search_threads(channel, search).await;
             let _ = this.update(cx, |view, cx| {
                 if view.generation != generation {
                     return;
+                }
+                if let Some(page) = active {
+                    for first in page.first_messages {
+                        view.firsts.insert(first.channel_id, first);
+                    }
+                    store.update(cx, |store, cx| store.add_threads(page.threads, &page.joined, cx));
                 }
                 match result {
                     Ok(page) => {
@@ -415,6 +424,7 @@ impl Render for ForumView {
                 .children(topic.lines().map(|line| div().text_size(u(14.)).child(SharedString::from(line.trim().to_string()))).collect::<Vec<_>>())
         });
 
+        let failed = matches!(self.fetch, Fetch::Failed(_));
         let status = match &self.fetch {
             Fetch::Loading => Some("Loading posts\u{2026}".to_string()),
             Fetch::Failed(error) => Some(format!("Couldn't load posts: {error}")),
@@ -443,6 +453,23 @@ impl Render for ForumView {
                     v_flex().w_full().gap(u(8.)).children(card_views).into_any_element()
                 })
                 .when_some(status, |d, text| d.child(div().p(u(24.)).text_center().text_size(u(14.)).text_color(muted).child(text)))
+                .when(failed, |d| {
+                    d.child(
+                        div()
+                            .id("posts-retry")
+                            .h(u(36.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(u(6.))
+                            .cursor_pointer()
+                            .text_size(u(14.))
+                            .text_color(theme.link)
+                            .hover(|d| d.bg(theme.foreground.opacity(0.06)))
+                            .on_click(cx.listener(|this, _, _, cx| this.refetch(cx)))
+                            .child("Try again"),
+                    )
+                })
                 .when(more, |d| {
                     d.child(
                         div()

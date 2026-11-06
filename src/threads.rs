@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn times_read_the_way_discord_says_them() {
-        let now = 10_000_000_000;
+        let now = 100_000_000_000;
         assert_eq!(ago(now, now - 20_000), "just now");
         assert_eq!(ago(now, now - 60_000), "1 minute ago");
         assert_eq!(ago(now, now - 5 * 60_000), "5 minutes ago");
@@ -147,6 +147,36 @@ mod tests {
         let mut base = serde_json::json!({"id": "20", "channel_id": "20", "timestamp": "t", "author": {"id": "5", "username": "ada"}});
         base.as_object_mut().unwrap().extend(v.as_object().unwrap().clone());
         serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn a_card_shows_the_post_as_the_forum_knows_it() {
+        use cord_core::event::CoreEvent;
+        let channel = |v: serde_json::Value| serde_json::from_value::<Channel>(v).unwrap();
+        let mut cache = Cache::default();
+        cache.apply(CoreEvent::ChannelUpsert(channel(serde_json::json!({
+            "id": "9", "type": 15, "guild_id": "1", "available_tags": [{"id": "3", "name": "Solved", "emoji_name": "ok"}, {"id": "4", "name": "Open"}],
+        }))));
+        let post = channel(serde_json::json!({
+            "id": "20", "type": 11, "parent_id": "9", "guild_id": "1", "name": "How do I?", "message_count": 6, "last_message_id": "9999999999999999",
+            "applied_tags": ["3", "77"], "thread_metadata": {"archived": true, "locked": true},
+        }));
+        let first = message(serde_json::json!({
+            "content": "  Please\nhelp  ", "attachments": [{"id": "2", "filename": "b.png", "url": "https://x/b.png", "content_type": "image/png"}],
+        }));
+        let card = post_card(&cache, &post, Some(&first));
+        assert_eq!(card.title, "How do I?");
+        assert_eq!(card.replies, 6);
+        assert_eq!(card.preview, "Please help");
+        // A tag the forum no longer has is dropped.
+        assert_eq!(card.tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["Solved"]);
+        assert!(card.image.unwrap().contains("b.png"));
+        assert!(card.archived && card.locked && !card.pinned);
+        assert!(card.active_ms > card.created_ms);
+        assert_eq!(card.author.as_deref(), Some("ada"));
+        // Before its first message has come, only what the post itself says.
+        let bare = post_card(&cache, &post, None);
+        assert!(bare.preview.is_empty() && bare.image.is_none() && bare.author.is_none());
     }
 
     #[test]

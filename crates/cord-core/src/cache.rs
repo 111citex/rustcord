@@ -762,10 +762,12 @@ impl Cache {
         }
         let ranks = permissions::outranks(g, me, &roles(me), target, &roles(target));
         let admin = permissions::base(g, target, &roles(target)) & permissions::ADMINISTRATOR != 0;
+        // A bot can only be kicked: Discord has no banning or timing out apps from the client.
+        let bot = self.users.get(&target).is_some_and(|u| u.bot);
         Moderation {
             kick: ranks && may(permissions::KICK_MEMBERS),
-            ban: ranks && may(permissions::BAN_MEMBERS),
-            timeout: ranks && !admin && may(permissions::MODERATE_MEMBERS),
+            ban: ranks && !bot && may(permissions::BAN_MEMBERS),
+            timeout: ranks && !admin && !bot && may(permissions::MODERATE_MEMBERS),
             nickname: ranks && may(permissions::MANAGE_NICKNAMES),
             roles: ranks && may(permissions::MANAGE_ROLES),
             mod_view: may(permissions::KICK_MEMBERS | permissions::BAN_MEMBERS | permissions::MODERATE_MEMBERS),

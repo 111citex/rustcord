@@ -273,6 +273,8 @@ pub struct SmoothScroller {
     state: Rc<RefCell<State>>,
     /// Lives inside a full profile, so that being open doesn't silence it.
     in_modal: bool,
+    /// Lives inside a popout, which takes the wheel from everything else while it's open.
+    in_popout: bool,
     /// A list whose rows do something when hovered: not while it's moving under the pointer.
     calm_hover: bool,
     /// Moves a layer of what's already painted, instead of rebuilding the list to move it.
@@ -318,6 +320,16 @@ const FOLLOW_EVERY: Duration = Duration::from_millis(4);
 type AfterScrolling = (gpui_kit::SharedString, Box<dyn FnOnce(&mut gpui_kit::App)>);
 
 thread_local! {
+    /// A popout like Pinned Messages is open: only its own list scrolls.
+    static POPOUT_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Says whether a popout is open, each render of whatever shows it.
+pub fn set_popout_open(open: bool) {
+    POPOUT_OPEN.set(open);
+}
+
+thread_local! {
     static SCROLLING_UNTIL: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     static AFTER_SCROLLING: RefCell<Option<AfterScrolling>> = const { RefCell::new(None) };
 }
@@ -344,7 +356,7 @@ pub fn cancel_after_scrolling(id: &gpui_kit::SharedString) {
 
 impl SmoothScroller {
     pub fn new(target: ScrollTarget) -> Self {
-        SmoothScroller { target, motion: Arc::default(), state: Rc::default(), in_modal: false, calm_hover: false, layer: None }
+        SmoothScroller { target, motion: Arc::default(), state: Rc::default(), in_modal: false, in_popout: false, calm_hover: false, layer: None }
     }
 
     /// Moves the list by moving a layer of what's painted, whenever that gives the same picture
@@ -510,6 +522,11 @@ impl SmoothScroller {
         self
     }
 
+    pub fn in_popout(mut self) -> Self {
+        self.in_popout = true;
+        self
+    }
+
     pub fn in_modal(mut self) -> Self {
         self.in_modal = true;
         self
@@ -603,6 +620,9 @@ impl SmoothScroller {
                     }
                     // The picture viewer or a full profile is over everything: the wheel is theirs.
                     if crate::viewer::is_open(cx) || crate::confirm::is_open(cx) || crate::panels::is_open(cx) || ((crate::add_people::is_open(cx) || crate::profile_card::full_open()) && !this.in_modal) {
+                        return;
+                    }
+                    if POPOUT_OPEN.get() != this.in_popout {
                         return;
                     }
                     let ScrollDelta::Lines(lines) = event.delta else { return };

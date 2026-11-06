@@ -178,10 +178,13 @@ pub struct User {
     pub extras: UserExtras,
 }
 
+/// Discord's own account, whose messages tell you about yours.
+pub const DISCORD_ACCOUNT: Id = Id(643_945_264_868_098_049);
+
 impl User {
     /// Discord's own account, whose messages tell you about yours.
     pub fn is_discord(&self) -> bool {
-        self.id == Id(643_945_264_868_098_049)
+        self.id == DISCORD_ACCOUNT
     }
 
     pub fn is_verified_bot(&self) -> bool {

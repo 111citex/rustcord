@@ -116,6 +116,7 @@ pub struct ChannelPage {
     /// The pinned messages popout is open, hanging from this point (the pin button).
     pins_at: Option<Point<Pixels>>,
     pins_scroll: gpui_kit::ScrollHandle,
+    pins_scroller: SmoothScroller,
     /// The app's message search, which this page shows when it's for here.
     search: Entity<crate::search::Search>,
     /// RUSTCORD_BENCH=1: scroll on its own every frame and log the frame rate.
@@ -237,6 +238,7 @@ impl ChannelPage {
         // Rows are measured this far beyond the screen, so they've settled their
         // height before scrolling in, and the chat doesn't shift as they do.
         let list = ListState::new(0, ListAlignment::Bottom, gpui_kit::px(1500.));
+        let pins_scroll = gpui_kit::ScrollHandle::new();
         if let Some(channel) = channel {
             let (store, guild_id) = (ctx.services.store.clone(), ctx.param("guild").and_then(|g| g.parse().ok()).map(Id));
             crate::viewer::watch_gallery(std::rc::Rc::new(move |cx: &App| {
@@ -492,7 +494,8 @@ impl ChannelPage {
             new_thread: None,
             forum: None,
             pins_at: None,
-            pins_scroll: gpui_kit::ScrollHandle::new(),
+            pins_scroll: pins_scroll.clone(),
+            pins_scroller: SmoothScroller::new(ScrollTarget::Handle(pins_scroll)).in_popout(),
             search,
             _subscriptions: subscriptions,
         };
@@ -733,7 +736,16 @@ impl ChannelPage {
                     .child(Icon::default().path("icons/toolbar-pin.svg").size(u(20.)))
                     .child(div().text_size(u(16.)).font_weight(FontWeight::SEMIBOLD).child("Pinned Messages")),
             )
-            .child(div().id("pins-list").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.pins_scroll).child(body));
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .when(self.ctx.services.settings.read(cx).get().smooth_scrolling, |d| d.child(self.pins_scroller.layer()))
+                    .child(div().id("pins-list").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.pins_scroll).child(body)),
+            );
         // A click anywhere else closes it, as Discord's popouts do.
         gpui_kit::deferred(
             gpui_kit::anchored().position(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.))).child(
@@ -1249,7 +1261,7 @@ impl ChannelPage {
                         store.update(cx, |store, cx| store.remove_friend(user, cx));
                     }, cx);
                 }));
-            } else if !bot {
+            } else if !bot && user != cord_core::model::DISCORD_ACCOUNT {
                 let store = store.clone();
                 entries.push(Entry::item("Add Friend", move |_, cx| store.update(cx, |store, cx| store.add_friend(user, cx))));
             }
@@ -3874,6 +3886,8 @@ fn locked_composer(reason: String, cx: &App) -> impl IntoElement {
 
 impl Render for ChannelPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Open, the pins popout has the wheel; the chat behind keeps still.
+        crate::smooth_scroll::set_popout_open(self.pins_at.is_some());
         // In a stretch back in the history, reaching its bottom fetches the messages below.
         if let Some(channel) = self.channel.filter(|c| self.ctx.services.store.read(cx).is_detached(*c)) {
             if !self.list.is_following_tail() && self.near_newest() {

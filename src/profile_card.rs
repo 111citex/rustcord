@@ -859,7 +859,10 @@ impl ProfileCard {
     fn full_actions(&self, card: gpui_kit::WeakEntity<Self>, user: Id, name: &str, main: Hsla, surface: Hsla, text: Hsla, cx: &gpui_kit::App) -> AnyElement {
         use crate::context_menu::{self as menu, Entry};
         use gpui_kit::component::Icon;
-        let friend = self.services.store.read(cx).cache().is_friend(user);
+        let cache = self.services.store.read(cx).cache();
+        let friend = cache.is_friend(user);
+        // Bots and Discord's own account can't be friended: Message is the main button instead.
+        let befriendable = user != cord_core::model::DISCORD_ACCOUNT && cache.user(user).is_none_or(|u| !u.bot);
         let (fill, on_fill) = button_colors(main, surface, text);
         let wide = |id: &'static str, icon: Icon, label: &'static str| {
             h_flex()
@@ -910,6 +913,10 @@ impl ProfileCard {
                         }, cx);
                     }).danger()], cx);
                 }))
+        } else if !befriendable {
+            row.child(wide("full-message", message_icon(), "Message").on_click(move |_, _, cx| {
+                let _ = card.update(cx, |_, cx| cx.emit(ProfileEvent::Message(user)));
+            }))
         } else {
             row.child(wide("full-add-friend", Icon::new(gpui_kit::assets::IconName::UserPlus), "Add Friend").on_click(move |_, _, cx| {
                 store.update(cx, |store, cx| store.add_friend(user, cx));

@@ -1054,9 +1054,10 @@ impl ChannelPage {
             );
         }
         {
-            // Chats to send it to: the conversations we have open.
-            let to: Vec<(Id, String)> = cache.private_channels().into_iter().map(|c| (c.id, nav::channel_label(cache, c))).collect();
+            // Where to send it: the conversations we have open, then every channel we may write in.
             let (store, guild) = (store.clone(), message.guild_id.or(self.guild));
+            let chats = cache.private_channels().into_iter().map(|c| (c.id, nav::channel_label(cache, c))).collect();
+            let to = crate::panels::forward_targets(chats, cache.post_destinations(), guild);
             entries.push(Entry::item("Forward", move |window, cx| {
                 crate::panels::open(store.clone(), crate::panels::What::Forward { from: channel, message: id, guild, to: to.clone() }, window, cx);
             }));

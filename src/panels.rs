@@ -59,7 +59,7 @@ pub enum What {
     FriendNickname { user: Id, name: String, current: String },
     Note { user: Id, name: String },
     /// Send a copy of a message to chats picked from `to`.
-    Forward { from: Id, message: Id, guild: Option<Id>, to: Vec<(Id, String)> },
+    Forward { from: Id, message: Id, guild: Option<Id>, to: Vec<Target> },
     Thread { channel: Id, message: Id },
     GroupName { channel: Id, current: String },
 }
@@ -67,10 +67,29 @@ pub enum What {
 /// The most chats a message is forwarded to at once, as Discord's.
 const FORWARD_MOST: usize = 5;
 
-/// Whether `label` has all of `query`, ignoring case.
-fn matches(label: &str, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
-    query.is_empty() || label.to_lowercase().contains(&query)
+/// Somewhere to forward to: a chat, or a channel of a server (`place`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub id: Id,
+    pub label: String,
+    pub place: Option<String>,
+}
+
+impl Target {
+    /// Whether the label or the server has `query`, ignoring case.
+    fn matches(&self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        query.is_empty() || self.label.to_lowercase().contains(&query) || self.place.as_deref().is_some_and(|p| p.to_lowercase().contains(&query))
+    }
+}
+
+/// Where a message may be forwarded from `guild`: the open chats first, then the channels
+/// of the server it's in, then every other server's. `chats` and `servers` are in the order to show.
+pub fn forward_targets(chats: Vec<(Id, String)>, servers: Vec<cord_core::cache::Destination>, guild: Option<Id>) -> Vec<Target> {
+    let (here, elsewhere): (Vec<_>, Vec<_>) = servers.into_iter().partition(|d| Some(d.guild) == guild);
+    let chats = chats.into_iter().map(|(id, label)| Target { id, label, place: None });
+    let channels = here.into_iter().chain(elsewhere).map(|d| Target { id: d.id, label: format!("#{}", d.name), place: Some(d.server) });
+    chats.chain(channels).collect()
 }
 
 pub struct Panel {
@@ -375,7 +394,7 @@ impl Render for Panel {
             ),
             What::Forward { to, .. } => {
                 let query = self.typed(cx);
-                let shown: Vec<&(Id, String)> = to.iter().filter(|(_, label)| matches(label, &query)).collect();
+                let shown: Vec<&Target> = to.iter().filter(|t| t.matches(&query)).collect();
                 let full = self.chosen.len() >= FORWARD_MOST;
                 (
                     "Forward To".to_string(),
@@ -388,8 +407,8 @@ impl Render for Panel {
                                 .h(u(280.))
                                 .overflow_y_scroll()
                                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                                .children(shown.into_iter().map(|(id, label)| {
-                                    let (id, ticked, this) = (*id, self.chosen.contains(id), this.clone());
+                                .children(shown.into_iter().map(|target| {
+                                    let (id, ticked, this) = (target.id, self.chosen.contains(&target.id), this.clone());
                                     h_flex()
                                         .id(("forward-to", id.0 as usize))
                                         .h(u(40.))
@@ -411,7 +430,15 @@ impl Render for Panel {
                                                 cx.notify();
                                             });
                                         })
-                                        .child(div().flex_1().min_w_0().truncate().text_size(u(15.)).child(label.clone()))
+                                        .child(
+                                            h_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap(u(8.))
+                                                .items_baseline()
+                                                .child(div().flex_shrink_0().max_w_full().truncate().text_size(u(15.)).child(target.label.clone()))
+                                                .children(target.place.clone().map(|place| div().min_w_0().truncate().text_size(u(12.)).text_color(muted).child(place))),
+                                        )
                                         .child(
                                             div()
                                                 .size(u(22.))
@@ -615,11 +642,32 @@ mod tests {
         assert_eq!(timeout_until(now, 604_800), "2026-11-12T10:00:00.000Z");
     }
 
+    fn target(id: u64, label: &str, place: Option<&str>) -> Target {
+        Target { id: Id(id), label: label.into(), place: place.map(str::to_string) }
+    }
+
     #[test]
-    fn forwarding_searches_labels_ignoring_case() {
-        assert!(matches("Ada, Bob", ""));
-        assert!(matches("Ada, Bob", " bOB "));
-        assert!(!matches("Ada, Bob", "eve"));
+    fn forwarding_searches_the_label_and_the_server_ignoring_case() {
+        let channel = target(1, "#general", Some("Rust Friends"));
+        assert!(channel.matches(""));
+        assert!(channel.matches(" GENERAL "));
+        assert!(channel.matches("rust fri"), "a channel is found by its server too");
+        assert!(!channel.matches("eve"));
+        assert!(!target(2, "Ada, Bob", None).matches("rust"));
+    }
+
+    #[test]
+    fn forward_targets_list_chats_then_the_same_server_then_the_rest() {
+        use cord_core::cache::Destination;
+        let dest = |id: u64, name: &str, guild: u64, server: &str| Destination { id: Id(id), name: name.into(), guild: Id(guild), server: server.into() };
+        let all = forward_targets(
+            vec![(Id(1), "Ada".into())],
+            vec![dest(10, "a", 7, "Other"), dest(11, "b", 8, "Here"), dest(12, "c", 7, "Other"), dest(13, "d", 8, "Here")],
+            Some(Id(8)),
+        );
+        assert_eq!(all.iter().map(|t| t.id.0).collect::<Vec<_>>(), [1, 11, 13, 10, 12]);
+        assert_eq!((all[1].label.as_str(), all[1].place.as_deref()), ("#b", Some("Here")));
+        assert_eq!(all[0].place, None);
     }
 
     #[test]

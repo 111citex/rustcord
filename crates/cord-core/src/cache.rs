@@ -8,7 +8,7 @@ use crate::Id;
 use crate::cdn;
 use crate::event::CoreEvent;
 use crate::member_list::{self, ListMember, MemberListModel};
-use crate::model::{Channel, Guild, Member, Message, ReactionEmoji, User, VoiceState};
+use crate::model::{Channel, ChannelKind, Guild, Member, Message, ReactionEmoji, User, VoiceState};
 use crate::permissions;
 use crate::settings_proto::{self, GuildFolder};
 
@@ -109,6 +109,15 @@ pub struct CacheStats {
 /// Whether `id` is muted right now: a timed mute is over once its end has passed.
 fn still_muted(muted: &std::collections::HashMap<Id, Option<i64>>, id: Id) -> bool {
     muted.get(&id).is_some_and(|end| end.is_none_or(|end| end > chrono::Utc::now().timestamp_millis()))
+}
+
+/// A server channel a message can be sent to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Destination {
+    pub id: Id,
+    pub name: String,
+    pub guild: Id,
+    pub server: String,
 }
 
 /// What we may do to one person in a server.
@@ -867,6 +876,39 @@ impl Cache {
 
     pub fn channel(&self, id: Id) -> Option<&Channel> {
         self.channels.get(&id)
+    }
+
+    /// Whether we may view `channel` and write in it: a thread has no permissions of its
+    /// own, so its parent's count, with the thread rule for sending. Someone in timeout
+    /// may not. Unknown permissions count as no, since this offers places rather than
+    /// trying them.
+    pub fn may_post_in(&self, channel: &Channel) -> bool {
+        let Some(guild) = channel.guild_id else { return true };
+        if self.timed_out_until(guild).is_some() {
+            return false;
+        }
+        let thread = channel.kind == ChannelKind::Thread;
+        let source = if thread { channel.parent_id.and_then(|p| self.channels.get(&p)) } else { Some(channel) };
+        let Some(held) = source.and_then(|c| self.my_permissions(c.id)) else { return false };
+        let send = if thread { permissions::SEND_MESSAGES_IN_THREADS } else { permissions::SEND_MESSAGES };
+        held & permissions::VIEW_CHANNEL != 0 && held & send != 0
+    }
+
+    /// Every server channel we may view and write in, by server in the order of the rail,
+    /// each server's channels in order and its threads after them.
+    pub fn post_destinations(&self) -> Vec<Destination> {
+        let mut out = Vec::new();
+        for guild in self.guilds() {
+            let mut channels: Vec<&Channel> = self
+                .channels
+                .values()
+                .filter(|c| c.guild_id == Some(guild.id) && matches!(c.kind, ChannelKind::Text | ChannelKind::Announcement | ChannelKind::Thread))
+                .filter(|c| self.may_post_in(c))
+                .collect();
+            channels.sort_by_key(|c| (c.kind == ChannelKind::Thread, c.position, c.id));
+            out.extend(channels.into_iter().map(|c| Destination { id: c.id, name: c.name.clone().unwrap_or_default(), guild: guild.id, server: guild.name.clone() }));
+        }
+        out
     }
 
     pub fn guild_channels(&self, guild: Id) -> Vec<&Channel> {
@@ -1812,6 +1854,95 @@ mod tests {
         m.author.global_name = Some("New Name".into());
         c.set_history(Id(311), vec![m], 50);
         assert_eq!(c.user(Id(7)).unwrap().display_name(), "New Name");
+    }
+
+    /// A server where we hold `base` for @everyone, with the channels given as
+    /// (id, kind, parent, overwrites).
+    fn server_with(base: u64, channels: Vec<Channel>) -> Cache {
+        use crate::model::Role;
+        let mut c = Cache::default();
+        c.me = Some(user(1, "me"));
+        let everyone = Role { id: Id(300), name: String::new(), color: 0, position: 0, permissions: base, hoist: false, icon: None, unicode_emoji: None, colors: None, mentionable: false };
+        c.guilds.insert(Id(300), Guild {
+            id: Id(300), name: "Rust Friends".into(), icon: None, unavailable: false, channels: vec![],
+            roles: vec![everyone], owner_id: None, voice_states: vec![], emojis: vec![], premium_tier: 0, banner: None, rules_channel: None,
+        });
+        c.guild_order.push(Id(300));
+        c.members.insert((Id(300), Id(1)), member(1, None, &[]));
+        for ch in channels {
+            c.channels.insert(ch.id, ch);
+        }
+        c
+    }
+
+    fn denying(id: u64, kind: ChannelKind, parent: Option<u64>, deny: u64) -> Channel {
+        let mut ch = channel(id, Some(300), kind, None);
+        ch.parent_id = parent.map(Id);
+        if deny != 0 {
+            ch.permission_overwrites = vec![crate::model::PermissionOverwrite { id: Id(300), kind: crate::model::OverwriteKind::Role, allow: 0, deny }];
+        }
+        ch
+    }
+
+    fn names(c: &Cache) -> Vec<u64> {
+        c.post_destinations().into_iter().map(|d| d.id.0).collect()
+    }
+
+    #[test]
+    fn only_channels_we_may_view_and_write_in_are_offered() {
+        use crate::permissions as p;
+        let base = p::VIEW_CHANNEL | p::SEND_MESSAGES;
+        let c = server_with(base, vec![
+            denying(1, ChannelKind::Text, None, 0),
+            denying(2, ChannelKind::Text, None, p::SEND_MESSAGES),
+            denying(3, ChannelKind::Text, None, p::VIEW_CHANNEL),
+            denying(4, ChannelKind::Announcement, None, 0),
+            denying(5, ChannelKind::Voice, None, 0),
+            denying(6, ChannelKind::Category, None, 0),
+        ]);
+        assert_eq!(names(&c), [1, 4], "no read-only, hidden, voice or category channels");
+    }
+
+    #[test]
+    fn a_thread_follows_its_parent_and_the_thread_rule() {
+        use crate::permissions as p;
+        let base = p::VIEW_CHANNEL | p::SEND_MESSAGES | p::SEND_MESSAGES_IN_THREADS;
+        let c = server_with(base, vec![
+            denying(1, ChannelKind::Text, None, 0),
+            denying(2, ChannelKind::Text, None, p::VIEW_CHANNEL),
+            denying(11, ChannelKind::Thread, Some(1), 0),
+            denying(12, ChannelKind::Thread, Some(2), 0),
+            denying(13, ChannelKind::Thread, Some(99), 0),
+        ]);
+        assert_eq!(names(&c), [1, 11], "a thread under a hidden or unknown parent isn't offered; threads come after channels");
+        // Without the right to write in threads, no thread, whatever its parent allows.
+        let c = server_with(p::VIEW_CHANNEL | p::SEND_MESSAGES, vec![denying(1, ChannelKind::Text, None, 0), denying(11, ChannelKind::Thread, Some(1), 0)]);
+        assert_eq!(names(&c), [1]);
+    }
+
+    #[test]
+    fn someone_in_timeout_and_a_server_whose_permissions_are_unknown_are_offered_nothing() {
+        use crate::permissions as p;
+        let base = p::VIEW_CHANNEL | p::SEND_MESSAGES;
+        let mut c = server_with(base, vec![denying(1, ChannelKind::Text, None, 0)]);
+        c.members.get_mut(&(Id(300), Id(1))).unwrap().communication_disabled_until = Some("2999-01-01T00:00:00Z".into());
+        assert!(names(&c).is_empty());
+        let mut c = server_with(base, vec![denying(1, ChannelKind::Text, None, 0)]);
+        c.members.clear();
+        assert!(names(&c).is_empty());
+    }
+
+    #[test]
+    fn destinations_say_which_server_they_are_in_and_keep_channel_order() {
+        use crate::permissions as p;
+        let mut b = denying(2, ChannelKind::Text, None, 0);
+        b.position = 5;
+        let mut a = denying(3, ChannelKind::Text, None, 0);
+        a.position = 1;
+        let c = server_with(p::VIEW_CHANNEL | p::SEND_MESSAGES, vec![b, a]);
+        let all = c.post_destinations();
+        assert_eq!(all.iter().map(|d| d.id.0).collect::<Vec<_>>(), [3, 2]);
+        assert_eq!((all[0].server.as_str(), all[0].guild), ("Rust Friends", Id(300)));
     }
 
     fn member(user: u64, nick: Option<&str>, roles: &[u64]) -> Member {

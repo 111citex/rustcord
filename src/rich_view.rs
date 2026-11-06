@@ -1753,6 +1753,13 @@ pub fn reply_line(env: &Env, indent: f32, cx: &App) -> Option<AnyElement> {
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(look.color.unwrap_or(theme.foreground))
                         .when_some(look.font, |d, f| d.font_family(f))
+                        .on_mouse_down(gpui_kit::MouseButton::Right, {
+                            let menu = env.shared.open_user_menu.clone();
+                            move |event, _, cx| {
+                                cx.stop_propagation();
+                                menu(who, event.position, cx);
+                            }
+                        })
                         .on_click(move |event, window, cx| {
                             cx.stop_propagation();
                             open(who, markdown_view::card_at(&target, event.position()), window, cx);

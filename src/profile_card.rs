@@ -481,7 +481,7 @@ impl Render for ProfileCard {
                             AVATAR,
                             status,
                             false,
-                            styled.decoration_url_at(480),
+                            styled.decoration_url_at(240).map(|url| crate::decorations::animated(&url)),
                             ring,
                             // Dims under the pointer, to say it opens something.
                             Some(
@@ -918,6 +918,7 @@ impl ProfileCard {
                     let _ = card.update(cx, |_, cx| cx.emit(ProfileEvent::Message(user)));
                 }))
         };
+        let (more_store, more_name) = (self.services.store.clone(), name.to_string());
         row.child(
             square("full-more")
                 .child(h_flex().gap(u(3.)).children((0..3).map(|_| div().size(u(4.)).rounded_full().bg(text))))
@@ -933,6 +934,8 @@ impl ProfileCard {
                         })
                         .picture("icons/phone.svg")
                     });
+                    let (store, who) = (more_store.clone(), more_name.clone());
+                    let ignored = crate::places::is_ignored(user);
                     menu::show(
                         event.position(),
                         call.into_iter().chain([
@@ -940,9 +943,17 @@ impl ProfileCard {
                             Entry::later("Shop This Look"),
                             Entry::later("Invite to Server"),
                             Entry::Separator,
-                            Entry::later("Ignore"),
-                            Entry::later("Block").danger(),
-                            Entry::later("Report User Profile").danger(),
+                            Entry::item(if ignored { "Unignore" } else { "Ignore" }, move |_, cx| {
+                                crate::places::set_ignored(user, !ignored);
+                                crate::ui::redraw_chat(cx);
+                            }),
+                            Entry::item("Block", move |_, cx| {
+                                let store = store.clone();
+                                crate::confirm::ask(format!("Block {who}"), format!("Block {who}? They won't be able to message you, and you won't see them in your friends."), "Block", move |cx| {
+                                    store.update(cx, |store, cx| store.block_user(user, cx));
+                                }, cx);
+                            }).danger(),
+                            Entry::item("Report User Profile", |_, cx| cx.open_url("https://dis.gd/report")).danger(),
                             Entry::Separator,
                             Entry::copy("Copy User ID", user.to_string()).icon(gpui_kit::assets::IconName::Copy),
                         ])
@@ -1053,7 +1064,7 @@ impl ProfileCard {
                             120.,
                             status,
                             false,
-                            styled.decoration_url_at(480),
+                            styled.decoration_url_at(240).map(|url| crate::decorations::animated(&url)),
                             ring,
                         )),
                     ))
@@ -1433,6 +1444,7 @@ fn no_op_shared(parsed: Rc<RefCell<crate::markdown_view::ParseCache>>) -> crate:
         jump: Rc::new(|_, _| {}),
         react: Rc::new(|_, _, _, _| {}),
         open_user: Rc::new(|_, _, _, _| {}),
+        open_user_menu: Rc::new(|_, _, _| {}),
         who_reacted: Rc::new(|_, _| {}),
         text_size: 14.,
         parsed,

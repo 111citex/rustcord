@@ -33,6 +33,8 @@ pub struct Jitter {
     concealed: u32,
     /// Frames dropped to catch up, not yet told about.
     skipped: u32,
+    /// Started again after a silence, not yet told about.
+    restarted: bool,
 }
 
 impl Jitter {
@@ -52,6 +54,12 @@ impl Jitter {
     /// Frames dropped to catch up since last asked.
     pub fn take_skipped(&mut self) -> u32 {
         std::mem::take(&mut self.skipped)
+    }
+
+    /// Whether a new burst of speech began since last asked, after a gap no cover could
+    /// bridge: what's played from here has nothing to do with what came before.
+    pub fn take_restarted(&mut self) -> bool {
+        std::mem::take(&mut self.restarted)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -107,11 +115,20 @@ impl Jitter {
             self.concealed = 0;
             return Next::Play(payload);
         }
-        if self.held.is_empty() && self.concealed >= MAX_CONCEALED {
+        if self.concealed >= MAX_CONCEALED {
+            // Not talking any more. What's held was sent after a gap, and covering the
+            // whole gap would play noise for as long as it lasted: start again from it.
+            let (next, base) = (self.next, self.base);
+            self.held = std::mem::take(&mut self.held)
+                .into_iter()
+                .map(|(key, payload)| (next.map_or(key, |n| n.wrapping_add(key.wrapping_sub(base) as u16) as u32), payload))
+                .collect();
+            let anything = !self.held.is_empty();
             self.next = None;
             self.base = 0;
             self.concealed = 0;
-            return Next::Nothing;
+            self.restarted = anything;
+            return if anything { self.next() } else { Next::Nothing };
         }
         self.concealed += 1;
         let following = self.held.get(&wanted.wrapping_add(1)).cloned();
@@ -208,5 +225,58 @@ mod tests {
             Next::Play(first) => assert!(first[0] >= 8, "started at {}", first[0]),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn coming_back_after_a_long_gap_resumes_at_once() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[10, 11, 12]);
+        for _ in 0..3 {
+            assert!(matches!(j.next(), Next::Play(_)));
+        }
+        // Muted and unmuted: the sequence jumps well past what could be covered.
+        fill(&mut j, &[200, 201, 202]);
+        let mut concealed = 0;
+        let first = loop {
+            match j.next() {
+                Next::Conceal => concealed += 1,
+                other => break other,
+            }
+        };
+        assert_eq!(concealed, MAX_CONCEALED, "no more than the cover");
+        assert_eq!(first, Next::Play(p(200)), "and not the whole gap of 190 frames");
+        assert!(j.take_restarted());
+        assert!(!j.take_restarted(), "told once");
+        assert_eq!(j.next(), Next::Play(p(201)));
+    }
+
+    #[test]
+    fn a_new_burst_still_filling_waits_and_a_plain_stop_is_no_restart() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[10, 11, 12]);
+        for _ in 0..3 {
+            j.next();
+        }
+        fill(&mut j, &[100]);
+        for _ in 0..MAX_CONCEALED {
+            assert_eq!(j.next(), Next::Conceal);
+        }
+        assert_eq!(j.next(), Next::Nothing, "one packet isn't enough to start from");
+        fill(&mut j, &[101, 102]);
+        assert_eq!(j.next(), Next::Play(p(100)));
+    }
+
+    #[test]
+    fn stopping_for_good_is_not_a_restart() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[10, 11, 12]);
+        for _ in 0..3 {
+            j.next();
+        }
+        for _ in 0..=MAX_CONCEALED {
+            j.next();
+        }
+        assert!(j.is_empty());
+        assert!(!j.take_restarted());
     }
 }

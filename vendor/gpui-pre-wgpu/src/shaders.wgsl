@@ -1293,13 +1293,20 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    // Rustcord: tiles are packed edge to edge, and a linear sample on a tile's edge
+    // reads half a texel of whatever lies beyond it (a neighbour's last row, or empty
+    // space): a bright, blurry line along the top of a banner. Held half a texel
+    // inside, only the outermost pixels change, and the rest stays as sharp as it was.
+    let sprite = load_poly_sprite(input.sprite_id);
+    let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    let tile_low = (vec2<f32>(sprite.tile.bounds.origin) + vec2<f32>(0.5)) / atlas_size;
+    let tile_high = (vec2<f32>(sprite.tile.bounds.origin) + vec2<f32>(sprite.tile.bounds.size) - vec2<f32>(0.5)) / atlas_size;
+    let sample = textureSample(t_sprite, s_sprite, clamp(input.tile_position, tile_low, tile_high));
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    let sprite = load_poly_sprite(input.sprite_id);
     let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
     var color = sample;

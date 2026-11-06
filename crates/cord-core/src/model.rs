@@ -282,7 +282,7 @@ impl User {
 
     pub fn decoration_url(&self) -> Option<String> {
         let asset = &self.extras.avatar_decoration_data.as_ref()?.asset;
-        (!asset.is_empty()).then(|| format!("https://cdn.discordapp.com/avatar-decoration-presets/{asset}.png?size=96&passthrough=false"))
+        (!asset.is_empty()).then(|| format!("https://cdn.discordapp.com/avatar-decoration-presets/{asset}.png?size=128&passthrough=false"))
     }
 
     /// The nameplate's animated version, played while the row is hovered.

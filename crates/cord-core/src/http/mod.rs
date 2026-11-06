@@ -109,6 +109,18 @@ impl Http {
         self.send(Method::DELETE, path, None, HeaderMap::new()).await
     }
 
+    pub async fn put_json_with_headers<T: DeserializeOwned>(&self, path: &str, body: &Value, extra: HeaderMap) -> Result<T, HttpError> {
+        self.send(Method::PUT, path, Some(body), extra).await
+    }
+
+    pub async fn patch_with_headers<T: DeserializeOwned>(&self, path: &str, body: &Value, extra: HeaderMap) -> Result<T, HttpError> {
+        self.send(Method::PATCH, path, Some(body), extra).await
+    }
+
+    pub async fn delete_with_headers<T: DeserializeOwned>(&self, path: &str, extra: HeaderMap) -> Result<T, HttpError> {
+        self.send(Method::DELETE, path, None, extra).await
+    }
+
     pub async fn post_with_headers<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -235,5 +247,42 @@ impl Http {
                 _ => Err(HttpError::BadRequest(resp.json().await.unwrap_or(Value::Null))),
             };
         }
+    }
+}
+
+/// The header that puts a moderator's reason in the server's audit log: percent-encoded,
+/// since header values are bytes. Empty means no header.
+pub fn audit_reason(reason: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return headers;
+    }
+    let mut encoded = String::new();
+    for byte in reason.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => encoded.push(byte as char),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    if let Ok(value) = HeaderValue::from_str(&encoded) {
+        headers.insert("x-audit-log-reason", value);
+    }
+    headers
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::audit_reason;
+
+    #[test]
+    fn the_reason_travels_percent_encoded() {
+        let headers = audit_reason(" spam & \u{e9}cho ");
+        assert_eq!(headers["x-audit-log-reason"], "spam%20%26%20%C3%A9cho");
+    }
+
+    #[test]
+    fn no_reason_sends_no_header() {
+        assert!(audit_reason("  ").is_empty());
     }
 }

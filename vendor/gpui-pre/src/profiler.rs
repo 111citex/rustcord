@@ -1158,7 +1158,11 @@ impl WindowProfiler {
                 .record(animation_interval.as_nanos() as u64)
                 .ok();
         }
-        record_frame_event(FrameEvent::Present(present_timing));
+        // The render thread reports what it presents, which is more than the main thread
+        // draws: counting these too would count the drawn ones twice.
+        if !crate::frame_stats::PRESENTED_BY_RENDER_THREAD.load(std::sync::atomic::Ordering::Relaxed) {
+            record_frame_event(FrameEvent::Present(present_timing));
+        }
 
         self.last_present_at = Some(present_end);
         self.animating_at_last_present = next_frame_scheduled && window_active;

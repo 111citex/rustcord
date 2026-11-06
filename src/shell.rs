@@ -767,12 +767,15 @@ impl SidePane {
                             .children((0..3).map(|_| div().size(u(3.)).rounded_full().bg(theme.sidebar)))
                             .into_any_element()
                     });
+                    // Still, until the pointer is on the row.
+                    let row_hovered = !crate::smooth_scroll::list_scrolling() && crate::transition::pointer_on(&SharedString::from(format!("channel-{}", dm.id)));
+                    let decoration = dm.decoration.clone().map(|url| if row_hovered { crate::decorations::animated(&url) } else { url });
                     crate::members::avatar_with_overlay(
                         Avatar::new().border_0().src(dm.avatar_url.clone()).name(dm.label.clone()),
                         32.,
                         if typing { None } else { dm.status },
                         !typing && dm.mobile,
-                        dm.decoration.clone(),
+                        decoration,
                         theme.sidebar,
                         dots,
                     )
@@ -1735,6 +1738,7 @@ impl Render for Shell {
             .children(crate::add_people::overlay(window, cx))
             .children(crate::switcher::overlay(window, cx))
             .children(crate::picker::overlay(window, cx))
+            .children(crate::panels::overlay(window, cx))
             .children(crate::emoji_card::overlay(cx))
             .children(crate::call_ring::overlay(&self.services.store.clone(), window, cx))
             .when_some(self.info.clone(), |this, monitor| {
@@ -1881,7 +1885,8 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
     let in_channel = cache.voice_state(guild, user).and_then(|v| v.channel_id);
     let may = |permission: u64| in_channel.is_some_and(|c| cache.has_permission(c, permission));
     let (can_mute, can_deafen, can_move) = (may(perms::MUTE_MEMBERS), may(perms::DEAFEN_MEMBERS), may(perms::MOVE_MEMBERS));
-    let can_kick = cache.guild_permissions(guild) & perms::KICK_MEMBERS != 0;
+    let can_kick = cache.moderation(guild, user).kick;
+    let handle = cache.user(user).map_or_else(|| name.clone(), |u| u.username.clone());
     let state = cache.voice_state(guild, user).map(|v| (v.mute, v.deaf)).unwrap_or_default();
     let core = store.core().clone();
     let mut entries = vec![Entry::item("Profile", move |_, cx| crate::links::show_profile(user, card_at, cx))];
@@ -1901,7 +1906,12 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
             .detach();
         }));
     }
-    entries.push(Entry::later("Add Note"));
+    if !itself {
+        let (store, who) = (services.store.clone(), name.clone());
+        entries.push(Entry::item("Add Note", move |window, cx| {
+            crate::panels::open(store.clone(), crate::panels::What::Note { user, name: who.clone() }, window, cx);
+        }).hint("Only visible to you"));
+    }
     if !itself {
         entries.push(Entry::Separator);
         let (volume, set) = (crate::places::get(), services.store.clone());
@@ -1917,8 +1927,16 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
         }));
     }
     entries.push(Entry::Separator);
-    entries.push(Entry::later("Change Nickname"));
-    entries.push(Entry::later("Roles"));
+    let mods = cache.moderation(guild, user);
+    if mods.nickname {
+        let (store, who, current) = (services.store.clone(), name.clone(), cache.member(guild, user).and_then(|m| m.nick.clone()).unwrap_or_default());
+        entries.push(Entry::item("Change Nickname", move |window, cx| {
+            crate::panels::open(store.clone(), crate::panels::What::Nickname { guild, user, me: itself, name: who.clone(), current: current.clone() }, window, cx);
+        }));
+    }
+    if mods.roles {
+        entries.push(Entry::later("Roles"));
+    }
     entries.push(Entry::later("Move To"));
     if can_mute || can_deafen || can_move || (can_kick && !itself) {
         entries.push(Entry::Separator);
@@ -1949,17 +1967,10 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
             .detach();
         }).danger());
     }
-    if can_kick && !itself {
-        let (core, title, body) = (core.clone(), format!("Kick {name}"), format!("Kick {name} from this server? They can come back with a new invite."));
-        entries.push(Entry::item(format!("Kick {name}"), move |_, cx| {
-            let core = core.clone();
-            crate::confirm::ask(title.clone(), body.clone(), "Kick", move |cx| {
-                let core = core.clone();
-                cx.spawn(async move |_| {
-                    let _ = core.kick_member(guild, user).await;
-                })
-                .detach();
-            }, cx);
+    if can_kick {
+        let (store, handle, who) = (services.store.clone(), handle, name.clone());
+        entries.push(Entry::item(format!("Kick {name}"), move |window, cx| {
+            crate::panels::open(store.clone(), crate::panels::What::Kick { guild, user, name: who.clone(), handle: handle.clone() }, window, cx);
         }).danger());
     }
     entries.push(Entry::Separator);
@@ -1996,36 +2007,84 @@ fn dm_menu(
                 let store = store.clone();
                 entries.push(Entry::item("Start a Call", move |_, cx| store.update(cx, |store, cx| store.start_call(channel, cx))));
             }
-            entries.push(Entry::later("Add Note"));
-            if dm.friend {
-                entries.push(Entry::later("Change Friend Nickname"));
+            let name = dm.label.clone();
+            {
+                let (store, name) = (store.clone(), name.clone());
+                entries.push(Entry::item("Add Note", move |window, cx| {
+                    crate::panels::open(store.clone(), crate::panels::What::Note { user, name: name.clone() }, window, cx);
+                }).hint("Only visible to you"));
             }
-            let store = store.clone();
-            entries.push(Entry::item("Close DM", move |_, cx| store.update(cx, |store, cx| store.close_dm(channel, cx))));
+            if dm.friend {
+                let current = store.read(cx).cache().friend_nickname(user).map(str::to_string);
+                let (store, name) = (store.clone(), name.clone());
+                let label = if current.is_some() { "Change Friend Nickname" } else { "Add Friend Nickname" };
+                entries.push(Entry::item(label, move |window, cx| {
+                    crate::panels::open(store.clone(), crate::panels::What::FriendNickname { user, name: name.clone(), current: current.clone().unwrap_or_default() }, window, cx);
+                }));
+            }
+            let closing = store.clone();
+            entries.push(Entry::item("Close DM", move |_, cx| closing.update(cx, |store, cx| store.close_dm(channel, cx))));
             entries.push(Entry::Separator);
             entries.push(Entry::later("Apps"));
             if dm.friend {
                 entries.push(Entry::later("Invite to Server"));
-                entries.push(Entry::later("Remove Friend"));
+                let (store, who) = (store.clone(), name.clone());
+                entries.push(Entry::item("Remove Friend", move |_, cx| {
+                    let store = store.clone();
+                    crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from your friends?"), "Remove Friend", move |cx| {
+                        store.update(cx, |store, cx| store.remove_friend(user, cx));
+                    }, cx);
+                }));
             }
-            entries.push(Entry::later("Ignore"));
-            entries.push(Entry::later("Block").danger());
+            let ignored = crate::places::is_ignored(user);
+            entries.push(Entry::item(if ignored { "Unignore" } else { "Ignore" }, move |_, cx| {
+                crate::places::set_ignored(user, !ignored);
+                crate::ui::redraw_chat(cx);
+            }));
+            let (blocker, who) = (store.clone(), name.clone());
+            entries.push(Entry::item("Block", move |_, cx| {
+                let store = blocker.clone();
+                crate::confirm::ask(format!("Block {who}"), format!("Block {who}? They won't be able to message you, and you won't see them in your friends."), "Block", move |cx| {
+                    store.update(cx, |store, cx| store.block_user(user, cx));
+                }, cx);
+            }).danger());
             entries.push(Entry::Separator);
-            entries.push(Entry::later(format!("Mute @{}", dm.label)));
+            entries.push(mute_entry(&store, channel, format!("@{}", dm.label), cx));
             entries.push(Entry::Separator);
             entries.push(Entry::copy("Copy User ID", user.to_string()).icon(IconName::Copy));
         }
         None => {
-            entries.push(Entry::later("Edit Group"));
+            {
+                let current = store.read(cx).cache().channel(channel).and_then(|c| c.name.clone()).unwrap_or_default();
+                let store = store.clone();
+                entries.push(Entry::item("Edit Group", move |window, cx| {
+                    crate::panels::open(store.clone(), crate::panels::What::GroupName { channel, current: current.clone() }, window, cx);
+                }));
+            }
             entries.push(Entry::Separator);
-            entries.push(Entry::later("Mute Conversation"));
+            entries.push(mute_entry(store, channel, "Conversation".to_string(), cx));
             entries.push(Entry::Separator);
-            entries.push(Entry::later("Leave Group").danger());
+            let (store, label) = (store.clone(), dm.label.clone());
+            entries.push(Entry::item("Leave Group", move |_, cx| {
+                let store = store.clone();
+                crate::confirm::ask(format!("Leave {label}"), format!("Leave {label}? You won't see its messages unless someone adds you back."), "Leave Group", move |cx| {
+                    store.update(cx, |store, cx| store.close_dm(channel, cx));
+                }, cx);
+            }).danger());
             entries.push(Entry::Separator);
         }
     }
     entries.push(Entry::copy("Copy Channel ID", channel.to_string()).icon(IconName::Copy));
     entries
+}
+
+/// "Mute …" or "Unmute …", whichever the conversation needs.
+fn mute_entry(store: &gpui_kit::Entity<crate::store::Store>, channel: cord_core::Id, what: String, cx: &gpui_kit::App) -> crate::context_menu::Entry {
+    let muted = store.read(cx).cache().is_muted(channel);
+    let store = store.clone();
+    crate::context_menu::Entry::item(format!("{} {what}", if muted { "Unmute" } else { "Mute" }), move |_, cx| {
+        store.update(cx, |store, cx| store.set_conversation_muted(channel, !muted, cx));
+    })
 }
 
 /// How far to scroll for item `ix` to be in view, clear of the panel over the

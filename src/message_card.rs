@@ -42,6 +42,8 @@ pub fn shared(store: &Entity<Store>, channel_of: Rc<HashMap<Id, Id>>, parsed: Rc
             }
         }),
         open_user: Rc::new(|user, position, _, cx| crate::links::open_profile(user, position, cx)),
+        // Pins and search cards keep it simple: no person menu there.
+        open_user_menu: Rc::new(|_, _, _| {}),
         who_reacted: Rc::new(|_, _| {}),
         remeasure: Rc::new(|_, cx| crate::ui::redraw_chat(cx)),
         inert: false,

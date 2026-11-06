@@ -2103,7 +2103,10 @@ impl Window {
             live_scrolls: FxHashMap::default(),
             input_rate_tracker,
             #[cfg(feature = "profiler")]
-            window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
+            window_profiler: {
+                crate::frame_stats::set_present_window(handle.window_id().as_u64());
+                profiler::WindowProfiler::new(handle.window_id())?
+            },
             last_input_modality: InputModality::Mouse,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform

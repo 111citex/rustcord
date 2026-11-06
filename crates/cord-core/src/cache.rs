@@ -8,7 +8,7 @@ use crate::Id;
 use crate::cdn;
 use crate::event::CoreEvent;
 use crate::member_list::{self, ListMember, MemberListModel};
-use crate::model::{Channel, Guild, Member, Message, ReactionEmoji, User, VoiceState};
+use crate::model::{Channel, ChannelKind, Guild, Member, Message, ReactionEmoji, User, VoiceState};
 use crate::permissions;
 use crate::settings_proto::{self, GuildFolder};
 
@@ -56,13 +56,16 @@ pub struct ChannelMessages {
     items: VecDeque<ChatMessage>,
     /// Older messages exist on the server than the ones held here.
     pub has_older: bool,
+    /// Newer messages exist than the ones held here: it's a window somewhere back in
+    /// the channel (a linked message), not the end of it. Live ones aren't added to it.
+    pub has_newer: bool,
     /// Live messages evict the oldest beyond this.
     cap: usize,
 }
 
 impl Default for ChannelMessages {
     fn default() -> Self {
-        ChannelMessages { items: VecDeque::new(), has_older: false, cap: MESSAGE_CAP }
+        ChannelMessages { items: VecDeque::new(), has_older: false, has_newer: false, cap: MESSAGE_CAP }
     }
 }
 
@@ -108,6 +111,27 @@ pub struct CacheStats {
 /// Whether `id` is muted right now: a timed mute is over once its end has passed.
 fn still_muted(muted: &std::collections::HashMap<Id, Option<i64>>, id: Id) -> bool {
     muted.get(&id).is_some_and(|end| end.is_none_or(|end| end > chrono::Utc::now().timestamp_millis()))
+}
+
+/// A server channel a message can be sent to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Destination {
+    pub id: Id,
+    pub name: String,
+    pub guild: Id,
+    pub server: String,
+}
+
+/// What we may do to one person in a server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Moderation {
+    pub kick: bool,
+    pub ban: bool,
+    pub timeout: bool,
+    pub nickname: bool,
+    pub roles: bool,
+    /// Whether Discord's mod view is ours to open.
+    pub mod_view: bool,
 }
 
 #[derive(Default)]
@@ -269,6 +293,22 @@ impl Cache {
             self.read.insert(channel, ReadMark { last, mentions: 0 });
             self.bump_sidebar();
         }
+    }
+
+    /// A conversation muted, or not, until we say otherwise.
+    pub fn set_muted(&mut self, channel: Id, muted: bool) {
+        if muted {
+            self.muted_channels.insert(channel, None);
+        } else {
+            self.muted_channels.remove(&channel);
+        }
+        self.bump_sidebar();
+    }
+
+    /// Marks `channel` unread from the message after `before` on.
+    pub fn mark_unread_after(&mut self, channel: Id, before: Id) {
+        self.read.insert(channel, ReadMark { last: Some(before), mentions: 0 });
+        self.bump_sidebar();
     }
 
     pub fn guild_folders(&self) -> &[GuildFolder] {
@@ -705,6 +745,33 @@ impl Cache {
         }
     }
 
+    /// What we call a friend, if we gave them a name of our own.
+    pub fn friend_nickname(&self, user: Id) -> Option<&str> {
+        self.friend_nicks.get(&user).map(String::as_str).filter(|n| !n.is_empty())
+    }
+
+    /// What we may do to `target` in `guild`: each action needs its permission and, but for
+    /// our own nickname, a higher place in the server's ranking than they have.
+    pub fn moderation(&self, guild: Id, target: Id) -> Moderation {
+        let (Some(me), Some(g)) = (self.me.as_ref().map(|u| u.id), self.guilds.get(&guild)) else { return Moderation::default() };
+        let held = self.guild_permissions(guild);
+        let may = |p: u64| held & p != 0;
+        let roles = |user: Id| self.member(guild, user).map(|m| m.roles.clone()).unwrap_or_default();
+        if target == me {
+            return Moderation { nickname: may(permissions::CHANGE_NICKNAME), ..Moderation::default() };
+        }
+        let ranks = permissions::outranks(g, me, &roles(me), target, &roles(target));
+        let admin = permissions::base(g, target, &roles(target)) & permissions::ADMINISTRATOR != 0;
+        Moderation {
+            kick: ranks && may(permissions::KICK_MEMBERS),
+            ban: ranks && may(permissions::BAN_MEMBERS),
+            timeout: ranks && !admin && may(permissions::MODERATE_MEMBERS),
+            nickname: ranks && may(permissions::MANAGE_NICKNAMES),
+            roles: ranks && may(permissions::MANAGE_ROLES),
+            mod_view: may(permissions::KICK_MEMBERS | permissions::BAN_MEMBERS | permissions::MODERATE_MEMBERS),
+        }
+    }
+
     /// What's unread in a server, as (channel, newest message).
     pub fn unread_channels(&self, guild: Id) -> Vec<(Id, Id)> {
         self.channels
@@ -842,6 +909,39 @@ impl Cache {
         self.channels.get(&id)
     }
 
+    /// Whether we may view `channel` and write in it: a thread has no permissions of its
+    /// own, so its parent's count, with the thread rule for sending. Someone in timeout
+    /// may not. Unknown permissions count as no, since this offers places rather than
+    /// trying them.
+    pub fn may_post_in(&self, channel: &Channel) -> bool {
+        let Some(guild) = channel.guild_id else { return true };
+        if self.timed_out_until(guild).is_some() {
+            return false;
+        }
+        let thread = channel.kind == ChannelKind::Thread;
+        let source = if thread { channel.parent_id.and_then(|p| self.channels.get(&p)) } else { Some(channel) };
+        let Some(held) = source.and_then(|c| self.my_permissions(c.id)) else { return false };
+        let send = if thread { permissions::SEND_MESSAGES_IN_THREADS } else { permissions::SEND_MESSAGES };
+        held & permissions::VIEW_CHANNEL != 0 && held & send != 0
+    }
+
+    /// Every server channel we may view and write in, by server in the order of the rail,
+    /// each server's channels in order and its threads after them.
+    pub fn post_destinations(&self) -> Vec<Destination> {
+        let mut out = Vec::new();
+        for guild in self.guilds() {
+            let mut channels: Vec<&Channel> = self
+                .channels
+                .values()
+                .filter(|c| c.guild_id == Some(guild.id) && matches!(c.kind, ChannelKind::Text | ChannelKind::Announcement | ChannelKind::Thread))
+                .filter(|c| self.may_post_in(c))
+                .collect();
+            channels.sort_by_key(|c| (c.kind == ChannelKind::Thread, c.position, c.id));
+            out.extend(channels.into_iter().map(|c| Destination { id: c.id, name: c.name.clone().unwrap_or_default(), guild: guild.id, server: guild.name.clone() }));
+        }
+        out
+    }
+
     pub fn guild_channels(&self, guild: Id) -> Vec<&Channel> {
         self.channels.values().filter(|c| c.guild_id == Some(guild)).collect()
     }
@@ -868,6 +968,7 @@ impl Cache {
     /// Replaces the buffer with a REST page (newest first, as Discord returns
     /// it). Live messages newer than the page, and unsent ones, are kept.
     pub fn set_history(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        self.refresh_authors(&newest_first);
         let has_older = newest_first.len() >= limit;
         self.note_message_threads(&newest_first);
         let newest = newest_first.first().map(|m| m.id);
@@ -891,6 +992,7 @@ impl Cache {
     /// `limit` means the channel's first message has been reached.
     pub fn prepend_older(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
         self.note_message_threads(&newest_first);
+        self.refresh_authors(&newest_first);
         let Some(buf) = self.messages.get_mut(&channel) else { return };
         let oldest = buf.items.front().map(|m| m.message.id);
         let reached_start = newest_first.len() < limit;
@@ -903,6 +1005,63 @@ impl Cache {
             buf.items.push_front(ChatMessage::new(message, SendState::Sent));
         }
         buf.has_older = !(reached_start && fits);
+    }
+
+    /// What Discord says about people now, from the messages it just sent. Their copy here
+    /// came from a list or READY, and without this stayed as it was for the whole session:
+    /// a changed name style, decoration or server profile never showed.
+    pub fn refresh_authors(&mut self, messages: &[Message]) {
+        for m in messages {
+            self.users.insert(m.author.id, m.author.clone());
+        }
+    }
+
+    /// Shows only a window of `channel` found by asking for the messages around one
+    /// (newest first, as Discord returns it): what's held now is dropped, since the two
+    /// wouldn't join up. Unsent messages stay.
+    pub fn set_around(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        self.refresh_authors(&newest_first);
+        let last = self.channels.get(&channel).and_then(|c| c.last_message_id);
+        let newest = newest_first.first().map(|m| m.id);
+        let full = newest_first.len() >= limit;
+        let old = self.messages.remove(&channel).unwrap_or_default();
+        let mut buf = ChannelMessages { cap: SCROLLBACK_CAP, ..Default::default() };
+        for m in newest_first.into_iter().rev() {
+            buf.items.push_back(ChatMessage::new(m, SendState::Sent));
+        }
+        buf.has_older = full;
+        buf.has_newer = full && newest.is_none_or(|n| last.is_none_or(|last| n < last));
+        buf.items.extend(old.items.into_iter().filter(|m| m.state != SendState::Sent));
+        self.messages.insert(channel, buf);
+    }
+
+    /// Adds a page of newer messages (newest first) below what's held. A short page, or
+    /// one reaching the channel's newest message, closes the gap to the present.
+    pub fn append_newer(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        self.refresh_authors(&newest_first);
+        let last = self.channels.get(&channel).and_then(|c| c.last_message_id);
+        let Some(buf) = self.messages.get_mut(&channel) else { return };
+        let held = buf.items.iter().rev().find(|m| m.state == SendState::Sent).map(|m| m.message.id);
+        let short = newest_first.len() < limit;
+        let mut fresh: Vec<Message> = newest_first.into_iter().filter(|m| held.is_none_or(|h| m.id > h)).collect();
+        fresh.reverse();
+        let reached = fresh.last().map(|m| m.id).or(held).zip(last).is_some_and(|(n, last)| n >= last);
+        // Before any unsent ones, which belong at the very end.
+        let at = buf.items.iter().rposition(|m| m.state == SendState::Sent).map_or(0, |i| i + 1);
+        for (offset, message) in fresh.into_iter().enumerate() {
+            buf.items.insert(at + offset, ChatMessage::new(message, SendState::Sent));
+        }
+        buf.has_newer = !(short || reached);
+    }
+
+    /// Whether `channel` is a window back in its history, with newer messages unloaded.
+    pub fn has_newer(&self, channel: Id) -> bool {
+        self.messages.get(&channel).is_some_and(|m| m.has_newer)
+    }
+
+    /// Newest message held for `channel` (not counting unsent ones).
+    pub fn newest(&self, channel: Id) -> Option<Id> {
+        self.messages.get(&channel)?.items.iter().rev().find(|m| m.state == SendState::Sent).map(|m| m.message.id)
     }
 
     /// Oldest message held for `channel`; older pages are fetched before it.
@@ -918,6 +1077,10 @@ impl Cache {
     /// Back at the bottom: drop scrollback beyond [`MESSAGE_CAP`].
     pub fn trim_to_tail(&mut self, channel: Id) {
         let Some(buf) = self.messages.get_mut(&channel) else { return };
+        // A window back in the channel isn't the bottom, and its newest are not the ones to keep.
+        if buf.has_newer {
+            return;
+        }
         buf.cap = MESSAGE_CAP;
         while buf.items.len() > MESSAGE_CAP {
             buf.items.pop_front();
@@ -1335,7 +1498,8 @@ impl Cache {
                     }
                 }
                 if let Some(buf) = self.messages.get_mut(&channel) {
-                    if buf.position(m.id).is_none() {
+                    // Not into a window back in history: it'd sit past a gap.
+                    if buf.position(m.id).is_none() && !buf.has_newer {
                         buf.push(ChatMessage::new(m, SendState::Sent));
                     }
                 }
@@ -1715,6 +1879,151 @@ mod tests {
         // Back to normal: a live message evicts the oldest again.
         c.apply(CoreEvent::MessageCreate(msg(1001, 311)));
         assert_eq!(c.messages(Id(311)).unwrap().len(), MESSAGE_CAP);
+    }
+
+    #[test]
+    fn a_window_around_a_message_replaces_what_was_held_and_leaves_the_present_out() {
+        let mut c = ready_cache();
+        c.open_messages(Id(311));
+        c.set_history(Id(311), page(951, 1000, 311), 50);
+        c.set_around(Id(311), page(401, 450, 311), 50);
+        let m = c.messages(Id(311)).unwrap();
+        assert_eq!((m.get(0).unwrap().message.id, m.get(m.len() - 1).unwrap().message.id), (Id(401), Id(450)));
+        assert!(m.has_older && m.has_newer);
+        // Live messages don't land past the gap.
+        c.apply(CoreEvent::MessageCreate(msg(1001, 311)));
+        assert_eq!(c.messages(Id(311)).unwrap().len(), 50);
+        assert_eq!(c.newest(Id(311)), Some(Id(450)));
+    }
+
+    #[test]
+    fn newer_pages_join_on_below_until_the_gap_closes() {
+        let mut c = ready_cache();
+        c.open_messages(Id(311));
+        c.set_around(Id(311), page(401, 450, 311), 50);
+        c.append_newer(Id(311), page(451, 500, 311), 50);
+        assert!(c.has_newer(Id(311)), "a full page: more may follow");
+        assert_eq!(c.newest(Id(311)), Some(Id(500)));
+        c.append_newer(Id(311), page(501, 520, 311), 50);
+        assert!(!c.has_newer(Id(311)), "a short page reaches the present");
+        let m = c.messages(Id(311)).unwrap();
+        assert_eq!(m.len(), 120);
+        assert!((0..m.len() - 1).all(|i| m.get(i).unwrap().message.id < m.get(i + 1).unwrap().message.id), "in order");
+        // And live messages are taken again.
+        c.apply(CoreEvent::MessageCreate(msg(521, 311)));
+        assert_eq!(c.messages(Id(311)).unwrap().len(), 121);
+    }
+
+    #[test]
+    fn a_window_is_not_trimmed_like_the_bottom() {
+        let mut c = ready_cache();
+        c.open_messages(Id(311));
+        c.set_around(Id(311), page(1, 250, 311), 250);
+        c.trim_to_tail(Id(311));
+        assert_eq!(c.messages(Id(311)).unwrap().len(), 250);
+    }
+
+    #[test]
+    fn fetched_pages_refresh_what_is_known_about_their_authors() {
+        let mut c = ready_cache();
+        c.open_messages(Id(311));
+        let mut old = user(7, "kai");
+        old.global_name = Some("Old Name".into());
+        c.users.insert(Id(7), old);
+        let mut m = msg(10, 311);
+        m.author = user(7, "kai");
+        m.author.global_name = Some("New Name".into());
+        c.set_history(Id(311), vec![m], 50);
+        assert_eq!(c.user(Id(7)).unwrap().display_name(), "New Name");
+    }
+
+    /// A server where we hold `base` for @everyone, with the channels given as
+    /// (id, kind, parent, overwrites).
+    fn server_with(base: u64, channels: Vec<Channel>) -> Cache {
+        use crate::model::Role;
+        let mut c = Cache::default();
+        c.me = Some(user(1, "me"));
+        let everyone = Role { id: Id(300), name: String::new(), color: 0, position: 0, permissions: base, hoist: false, icon: None, unicode_emoji: None, colors: None, mentionable: false };
+        c.guilds.insert(Id(300), Guild {
+            id: Id(300), name: "Rust Friends".into(), icon: None, unavailable: false, channels: vec![],
+            roles: vec![everyone], owner_id: None, voice_states: vec![], emojis: vec![], premium_tier: 0, banner: None, rules_channel: None,
+        });
+        c.guild_order.push(Id(300));
+        c.members.insert((Id(300), Id(1)), member(1, None, &[]));
+        for ch in channels {
+            c.channels.insert(ch.id, ch);
+        }
+        c
+    }
+
+    fn denying(id: u64, kind: ChannelKind, parent: Option<u64>, deny: u64) -> Channel {
+        let mut ch = channel(id, Some(300), kind, None);
+        ch.parent_id = parent.map(Id);
+        if deny != 0 {
+            ch.permission_overwrites = vec![crate::model::PermissionOverwrite { id: Id(300), kind: crate::model::OverwriteKind::Role, allow: 0, deny }];
+        }
+        ch
+    }
+
+    fn names(c: &Cache) -> Vec<u64> {
+        c.post_destinations().into_iter().map(|d| d.id.0).collect()
+    }
+
+    #[test]
+    fn only_channels_we_may_view_and_write_in_are_offered() {
+        use crate::permissions as p;
+        let base = p::VIEW_CHANNEL | p::SEND_MESSAGES;
+        let c = server_with(base, vec![
+            denying(1, ChannelKind::Text, None, 0),
+            denying(2, ChannelKind::Text, None, p::SEND_MESSAGES),
+            denying(3, ChannelKind::Text, None, p::VIEW_CHANNEL),
+            denying(4, ChannelKind::Announcement, None, 0),
+            denying(5, ChannelKind::Voice, None, 0),
+            denying(6, ChannelKind::Category, None, 0),
+        ]);
+        assert_eq!(names(&c), [1, 4], "no read-only, hidden, voice or category channels");
+    }
+
+    #[test]
+    fn a_thread_follows_its_parent_and_the_thread_rule() {
+        use crate::permissions as p;
+        let base = p::VIEW_CHANNEL | p::SEND_MESSAGES | p::SEND_MESSAGES_IN_THREADS;
+        let c = server_with(base, vec![
+            denying(1, ChannelKind::Text, None, 0),
+            denying(2, ChannelKind::Text, None, p::VIEW_CHANNEL),
+            denying(11, ChannelKind::Thread, Some(1), 0),
+            denying(12, ChannelKind::Thread, Some(2), 0),
+            denying(13, ChannelKind::Thread, Some(99), 0),
+        ]);
+        assert_eq!(names(&c), [1, 11], "a thread under a hidden or unknown parent isn't offered; threads come after channels");
+        // Without the right to write in threads, no thread, whatever its parent allows.
+        let c = server_with(p::VIEW_CHANNEL | p::SEND_MESSAGES, vec![denying(1, ChannelKind::Text, None, 0), denying(11, ChannelKind::Thread, Some(1), 0)]);
+        assert_eq!(names(&c), [1]);
+    }
+
+    #[test]
+    fn someone_in_timeout_and_a_server_whose_permissions_are_unknown_are_offered_nothing() {
+        use crate::permissions as p;
+        let base = p::VIEW_CHANNEL | p::SEND_MESSAGES;
+        let mut c = server_with(base, vec![denying(1, ChannelKind::Text, None, 0)]);
+        c.members.get_mut(&(Id(300), Id(1))).unwrap().communication_disabled_until = Some("2999-01-01T00:00:00Z".into());
+        assert!(names(&c).is_empty());
+        let mut c = server_with(base, vec![denying(1, ChannelKind::Text, None, 0)]);
+        c.members.clear();
+        assert!(names(&c).is_empty());
+    }
+
+    #[test]
+    fn destinations_say_which_server_they_are_in_and_keep_channel_order() {
+        use crate::permissions as p;
+        let mut b = denying(2, ChannelKind::Text, None, 0);
+        b.position = 5;
+        let mut a = denying(3, ChannelKind::Text, None, 0);
+        a.position = 1;
+        let c = server_with(p::VIEW_CHANNEL | p::SEND_MESSAGES, vec![b, a]);
+        let all = c.post_destinations();
+        assert_eq!(all.iter().map(|d| d.id.0).collect::<Vec<_>>(), [3, 2]);
+        assert_eq!((all[0].server.as_str(), all[0].guild), ("Rust Friends", Id(300)));
     }
 
     fn member(user: u64, nick: Option<&str>, roles: &[u64]) -> Member {

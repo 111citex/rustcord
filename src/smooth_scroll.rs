@@ -602,7 +602,7 @@ impl SmoothScroller {
                         return;
                     }
                     // The picture viewer or a full profile is over everything: the wheel is theirs.
-                    if crate::viewer::is_open(cx) || crate::confirm::is_open(cx) || ((crate::add_people::is_open(cx) || crate::profile_card::full_open()) && !this.in_modal) {
+                    if crate::viewer::is_open(cx) || crate::confirm::is_open(cx) || crate::panels::is_open(cx) || ((crate::add_people::is_open(cx) || crate::profile_card::full_open()) && !this.in_modal) {
                         return;
                     }
                     let ScrollDelta::Lines(lines) = event.delta else { return };

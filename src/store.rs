@@ -183,6 +183,7 @@ pub struct Store {
     send_chains: HashMap<Id, Task<()>>,
     /// The channel whose older page is being fetched, if any.
     loading_older: Option<Id>,
+    loading_newer: Option<Id>,
     members: Option<MemberSub>,
     /// When each channel was last acked to Discord.
     acked: HashMap<Id, std::time::Instant>,
@@ -214,7 +215,7 @@ impl EventEmitter<StoreEvent> for Store {}
 
 impl Store {
     pub fn new(core: Arc<Core>, toasts: Entity<Toasts>) -> Self {
-        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None, declined: Default::default(), ring: None, pins: HashMap::new(), pins_shown: None }
+        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None, declined: Default::default(), ring: None, pins: HashMap::new(), pins_shown: None, loading_newer: None }
     }
 
     pub fn core(&self) -> &Arc<Core> {
@@ -380,6 +381,7 @@ impl Store {
             self.history.remove(&gone);
         }
         self.loading_older = None;
+        self.loading_newer = None;
         // Remember where the unread part began, for the NEW line, before reading it.
         self.new_after = self.cache.unread_after(channel);
         self.cache.open_messages(channel);
@@ -410,6 +412,24 @@ impl Store {
         cx.spawn(async move |_, _| {
             if let Err(error) = core.ack(channel, last).await {
                 tracing::warn!(%error, "couldn't mark the channel read");
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// "Mark Unread": `message` becomes the first one unread.
+    pub fn mark_unread(&mut self, channel: Id, message: Id, cx: &mut Context<Self>) {
+        let before = Id(message.0.saturating_sub(1));
+        self.cache.mark_unread_after(channel, before);
+        self.acked.remove(&channel);
+        if self.open == Some(channel) {
+            self.new_after = Some(before);
+        }
+        let core = self.core.clone();
+        cx.spawn(async move |_, _| {
+            if let Err(error) = core.mark_unread_from(channel, before).await {
+                tracing::warn!(%error, "couldn't mark the message unread");
             }
         })
         .detach();
@@ -485,6 +505,74 @@ impl Store {
         .detach();
     }
 
+    /// Whether `channel` shows a window back in its history, not its end.
+    pub fn is_detached(&self, channel: Id) -> bool {
+        self.cache.has_newer(channel)
+    }
+
+    pub fn is_loading_newer(&self, channel: Id) -> bool {
+        self.loading_newer == Some(channel)
+    }
+
+    /// Shows the messages around `target`, which is too far back to page to: one request
+    /// instead of a page for every fifty in between. Done once it's replaced the view.
+    pub fn load_around(&mut self, channel: Id, target: Id, cx: &mut Context<Self>) {
+        if self.loading_older.is_some() || self.open != Some(channel) {
+            return;
+        }
+        self.loading_older = Some(channel);
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.messages_around(channel, target, HISTORY_PAGE).await;
+            let _ = this.update(cx, |store, cx| {
+                store.loading_older = None;
+                if store.open == Some(channel) {
+                    match result {
+                        Ok(messages) => store.cache.set_around(channel, messages, HISTORY_PAGE as usize),
+                        Err(HttpError::Unauthorized) => {} // AuthFailed signs out
+                        Err(error) => store.toasts.update(cx, |_, cx| cx.emit(Toast::error("Couldn't load that part of the channel", error.to_string()))),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fetches the page below the newest message held, in a window back in the history.
+    pub fn load_newer(&mut self, channel: Id, cx: &mut Context<Self>) {
+        if self.loading_newer.is_some() || self.loading_older.is_some() || self.open != Some(channel) || !self.cache.has_newer(channel) {
+            return;
+        }
+        let Some(after) = self.cache.newest(channel) else { return };
+        self.loading_newer = Some(channel);
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.messages_after(channel, after, HISTORY_PAGE).await;
+            let _ = this.update(cx, |store, cx| {
+                store.loading_newer = None;
+                if store.open == Some(channel) {
+                    match result {
+                        Ok(messages) => store.cache.append_newer(channel, messages, HISTORY_PAGE as usize),
+                        Err(HttpError::Unauthorized) => {}
+                        Err(error) => store.toasts.update(cx, |_, cx| cx.emit(Toast::error("Couldn't load newer messages", error.to_string()))),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Leaves a window back in the history for the newest messages again.
+    pub fn return_to_present(&mut self, channel: Id, cx: &mut Context<Self>) {
+        if self.open == Some(channel) && self.cache.has_newer(channel) {
+            self.load_history(channel, cx);
+        }
+    }
+
     /// Back at the bottom of `channel`: let go of the scrollback.
     pub fn trim_channel(&mut self, channel: Id, cx: &mut Context<Self>) {
         let over = self.cache.messages(channel).is_some_and(|m| m.len() > cord_core::cache::MESSAGE_CAP);
@@ -498,6 +586,8 @@ impl Store {
     /// stays in the chat marked failed (Retry/Delete arrive in plan 1b).
     pub fn send(&mut self, channel: Id, content: String, reply: Option<(Id, bool)>, files: Vec<cord_core::http::Upload>, cx: &mut Context<Self>) {
         let Some(me) = self.cache.me().cloned() else { return };
+        // Sending from a window back in the history goes to the end of the channel, as Discord's does.
+        self.return_to_present(channel, cx);
         // A snowflake for "now", made unique per send within the same millisecond.
         self.nonce_seq = self.nonce_seq.wrapping_add(1);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -972,6 +1062,108 @@ impl Store {
         cx.spawn(async move |this, cx| {
             let result = core.remove_friend(user).await;
             Self::report(this, result, "Couldn't remove them", cx);
+        })
+        .detach();
+    }
+
+    pub fn kick_member(&mut self, guild: Id, user: Id, reason: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.kick_member(guild, user, reason).await;
+            Self::report(this, result, "Couldn't kick them", cx);
+        })
+        .detach();
+    }
+
+    pub fn ban_member(&mut self, guild: Id, user: Id, delete_seconds: u32, reason: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.ban_member(guild, user, delete_seconds, reason).await;
+            Self::report(this, result, "Couldn't ban them", cx);
+        })
+        .detach();
+    }
+
+    pub fn timeout_member(&mut self, guild: Id, user: Id, until: Option<String>, reason: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.timeout_member(guild, user, until, reason).await;
+            Self::report(this, result, "Couldn't time them out", cx);
+        })
+        .detach();
+    }
+
+    pub fn set_nickname(&mut self, guild: Id, user: Id, me: bool, nick: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_nickname(guild, user, me, nick).await;
+            Self::report(this, result, "Couldn't change the nickname", cx);
+        })
+        .detach();
+    }
+
+    pub fn block_user(&mut self, user: Id, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.block_user(user).await;
+            Self::report(this, result, "Couldn't block them", cx);
+        })
+        .detach();
+    }
+
+    pub fn set_friend_nickname(&mut self, user: Id, nick: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_friend_nickname(user, nick).await;
+            Self::report(this, result, "Couldn't change the nickname", cx);
+        })
+        .detach();
+    }
+
+    pub fn set_note(&mut self, user: Id, note: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_note(user, note).await;
+            Self::report(this, result, "Couldn't save the note", cx);
+        })
+        .detach();
+    }
+
+    pub fn forward_message(&mut self, to: Id, from: Id, message: Id, guild: Option<Id>, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.forward_message(to, from, message, guild).await;
+            Self::report(this, result, "Couldn't forward the message", cx);
+        })
+        .detach();
+    }
+
+    /// "Mute Conversation": shown at once, then told to Discord.
+    pub fn set_conversation_muted(&mut self, channel: Id, muted: bool, cx: &mut Context<Self>) {
+        self.cache.set_muted(channel, muted);
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.mute_conversation(channel, muted).await;
+            Self::report(this, result, "Couldn't change the mute", cx);
+        })
+        .detach();
+    }
+
+    pub fn rename_group(&mut self, channel: Id, name: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.rename_group(channel, name).await;
+            Self::report(this, result, "Couldn't rename the group", cx);
+        })
+        .detach();
+    }
+
+    pub fn create_thread(&mut self, channel: Id, message: Id, name: String, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.create_thread(channel, message, name).await;
+            Self::report(this, result, "Couldn't start the thread", cx);
         })
         .detach();
     }

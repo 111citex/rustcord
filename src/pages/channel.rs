@@ -360,7 +360,7 @@ impl ChannelPage {
                             // Up in an empty box: edit our latest message.
                             let in_box = gpui_kit::Focusable::focus_handle(page.input.read(cx), cx).is_focused(window);
                             // Whatever's on top of the page gets Esc first, and handles it itself.
-                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx) || crate::switcher::is_open(cx) || crate::picker::is_open(cx)) {
+                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx) || crate::switcher::is_open(cx) || crate::picker::is_open(cx) || crate::panels::is_open(cx)) {
                                 return;
                             }
                             if key == "up" && in_box && page.editing.is_none() && page.input.read(cx).value().is_empty() && page.pending.is_empty() {
@@ -395,7 +395,7 @@ impl ChannelPage {
                                 page.keep_files(cx);
                                 cx.notify();
                                 cx.stop_propagation();
-                            } else if key == "escape" && !page.list.is_following_tail() {
+                            } else if key == "escape" && !in_box && !page.list.is_following_tail() {
                                 // Discord's Esc: back to the newest message, unread cleared.
                                 page.banner_closed = true;
                                 page.jump_to_present(cx);
@@ -1077,11 +1077,9 @@ impl ChannelPage {
         }
     }
 
-    /// Scrolls to the linked message once it's loaded, fetching older pages
-    /// (a few at most) until it turns up.
+    /// Scrolls to the linked message once it's loaded, asking for the part of the channel
+    /// around it when it isn't held.
     fn seek_jump_target(&mut self, cx: &mut Context<Self>) {
-        // One page at a time, each waiting for the last: quite far back, but not forever.
-        const MAX_PAGES: u16 = 400;
         let (Some((target, pages)), Some(channel)) = (self.jump_target, self.channel) else { return };
         if let Some(ix) = self.rendered.iter().position(|r| *r == target) {
             self.jump_target = None;
@@ -1117,16 +1115,16 @@ impl ChannelPage {
         if store.history(channel) != Some(&History::Loaded) || store.is_loading_older(channel) {
             return;
         }
-        let cache = store.cache();
-        let older = cache.messages(channel).is_some_and(|m| m.has_older) && !cache.scrollback_full(channel);
-        // Older than everything loaded, and still more to fetch.
-        let before_loaded = cache.oldest(channel).is_some_and(|oldest| target < oldest);
-        if older && before_loaded && pages < MAX_PAGES {
-            self.jump_target = Some((target, pages + 1));
-            self.ctx.services.store.update(cx, |store, cx| store.load_older(channel, cx));
+        if pages == 0 {
+            // Not held: one request for the stretch of the channel around it, and the view
+            // moves there, rather than a page for every fifty messages in between.
+            self.jump_target = Some((target, 1));
+            self.ctx.services.store.update(cx, |store, cx| store.load_around(channel, target, cx));
         } else {
+            // Asked for what's around it and it isn't there: it was deleted, or isn't in this channel.
             self.jump_target = None;
-            self.ctx.services.toast(Toast::warning("Couldn't find that message", "It may have been deleted, or is too far back."), cx);
+            self.ctx.services.store.update(cx, |store, cx| store.return_to_present(channel, cx));
+            self.ctx.services.toast(Toast::warning("Couldn't find that message", "It may have been deleted."), cx);
         }
     }
 
@@ -1163,16 +1161,41 @@ impl ChannelPage {
         self.seek_jump_target(cx);
     }
 
-    /// Right click on a person.
+    /// Right click on a person, in Discord's order: what to do with them, what to change
+    /// about them, what a moderator may do, then their ID. Only what we may do is listed.
     fn user_menu(&mut self, user: Id, name: String, position: Point<Pixels>, cx: &mut Context<Self>) {
         use crate::context_menu::{self as menu, Entry};
+        use crate::panels::{self, What};
         let page = cx.entity().downgrade();
-        let me = self.ctx.services.store.read(cx).cache().me().map(|u| u.id) == Some(user);
+        let store = self.ctx.services.store.clone();
+        let guild = self.guild;
+        let (is_me, friend, friend_nick, mods, owned_group, handle, bot, server_nick) = {
+            let cache = store.read(cx).cache();
+            let me = cache.me().map(|u| u.id);
+            let owned = self.channel.filter(|channel| {
+                cache.channel(*channel).is_some_and(|c| c.kind == ChannelKind::GroupDm && c.owner_id.is_some() && c.owner_id == me && c.recipient_ids.contains(&user))
+            });
+            let known = cache.user(user);
+            (
+                me == Some(user),
+                cache.is_friend(user),
+                cache.friend_nickname(user).map(str::to_string),
+                guild.map(|g| cache.moderation(g, user)).unwrap_or_default(),
+                owned,
+                known.map_or_else(|| name.clone(), |u| u.username.clone()),
+                known.is_some_and(|u| u.bot),
+                guild.and_then(|g| cache.member(g, user)).and_then(|m| m.nick.clone()).unwrap_or_default(),
+            )
+        };
         let with = |f: fn(&mut ChannelPage, Id, String, Point<Pixels>, &mut Window, &mut Context<ChannelPage>)| {
             let (page, name) = (page.clone(), name.clone());
             move |window: &mut Window, cx: &mut App| {
                 let _ = page.update(cx, |page, cx| f(page, user, name.clone(), position, window, cx));
             }
+        };
+        let panel = |what: What| {
+            let store = store.clone();
+            move |window: &mut Window, cx: &mut App| panels::open(store.clone(), what.clone(), window, cx)
         };
         let mut entries = vec![
             Entry::item("Profile", with(|p, u, _, at, w, cx| {
@@ -1181,61 +1204,87 @@ impl ChannelPage {
             })),
             Entry::item("Mention", with(|p, u, n, _, w, cx| p.mention(u, n, w, cx))),
         ];
-        if !me {
+        if !is_me {
             entries.push(Entry::item("Message", with(|p, u, _, _, _, cx| p.message(u, cx))));
-            if self.ctx.services.store.read(cx).cache().user(user).is_none_or(|u| !u.bot) {
-                let store = self.ctx.services.store.clone();
+            if !bot {
+                let store = store.clone();
                 entries.push(Entry::item("Start a Call", move |_, cx| store.update(cx, |store, cx| store.call_user(user, cx))));
             }
-            entries.push(Entry::later("Add Note"));
-            // A group's owner may remove people or hand it over. Both ask first.
-            let my_id = self.ctx.services.store.read(cx).cache().me().map(|u| u.id);
-            let owned_group = self.channel.filter(|channel| {
-                let cache = self.ctx.services.store.read(cx).cache();
-                cache.channel(*channel).is_some_and(|c| c.kind == cord_core::model::ChannelKind::GroupDm && c.owner_id.is_some() && c.owner_id == my_id && c.recipient_ids.contains(&user))
-            });
-            if let Some(channel) = owned_group {
-                entries.push(Entry::Separator);
-                let store = self.ctx.services.store.clone();
-                let who = name.clone();
-                entries.push(Entry::item("Remove From Group", move |_, cx| {
-                    let store = store.clone();
-                    crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from this group?"), "Remove", move |cx| {
-                        store.update(cx, |store, cx| store.remove_from_group(channel, user, cx));
-                    }, cx);
-                }).danger());
-                let store = self.ctx.services.store.clone();
-                let who = name.clone();
-                entries.push(Entry::item("Make Group Owner", move |_, cx| {
-                    let store = store.clone();
-                    crate::confirm::ask(format!("Make {who} the owner"), format!("Hand this group over to {who}? You won't own it anymore."), "Make Owner", move |cx| {
-                        store.update(cx, |store, cx| store.make_group_owner(channel, user, cx));
-                    }, cx);
-                }).danger());
+            entries.push(Entry::item("Add Note", panel(What::Note { user, name: name.clone() })).hint("Only visible to you"));
+            if friend {
+                let label = if friend_nick.is_some() { "Change Friend Nickname" } else { "Add Friend Nickname" };
+                entries.push(Entry::item(label, panel(What::FriendNickname { user, name: name.clone(), current: friend_nick.unwrap_or_default() })));
             }
+        }
+        entries.push(Entry::Separator);
+        // A group's owner may remove people or hand it over. Both ask first.
+        if let Some(channel) = owned_group {
+            let (remove, give) = (store.clone(), store.clone());
+            let (who, whom) = (name.clone(), name.clone());
+            entries.push(Entry::item("Remove From Group", move |_, cx| {
+                let store = remove.clone();
+                crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from this group?"), "Remove", move |cx| {
+                    store.update(cx, |store, cx| store.remove_from_group(channel, user, cx));
+                }, cx);
+            }).danger());
+            entries.push(Entry::item("Make Group Owner", move |_, cx| {
+                let store = give.clone();
+                crate::confirm::ask(format!("Make {whom} the owner"), format!("Hand this group over to {whom}? You won't own it anymore."), "Make Owner", move |cx| {
+                    store.update(cx, |store, cx| store.make_group_owner(channel, user, cx));
+                }, cx);
+            }).danger());
             entries.push(Entry::Separator);
-            entries.push(Entry::later("Ignore"));
-            entries.push(Entry::later("Block"));
-            // Only what we may do. All dimmed for now: each needs a confirm step when built.
-            if let Some(guild) = self.guild {
-                use cord_core::permissions as perm;
-                let held = self.ctx.services.store.read(cx).cache().guild_permissions(guild);
-                let can = |p: u64| held & (p | perm::ADMINISTRATOR) != 0;
-                let actions = [
-                    (perm::MANAGE_NICKNAMES, "Change Nickname".to_string(), false),
-                    (perm::MANAGE_ROLES, "Roles".to_string(), false),
-                    (perm::MODERATE_MEMBERS, format!("Timeout {name}"), true),
-                    (perm::KICK_MEMBERS, format!("Kick {name}"), true),
-                    (perm::BAN_MEMBERS, format!("Ban {name}"), true),
-                ];
-                if actions.iter().any(|(p, _, _)| can(*p)) {
-                    entries.push(Entry::Separator);
+        }
+        if let Some(guild) = guild.filter(|_| mods.nickname) {
+            entries.push(Entry::item("Change Nickname", panel(What::Nickname { guild, user, me: is_me, name: name.clone(), current: server_nick })));
+        }
+        if !is_me {
+            entries.push(Entry::later("Apps"));
+            if friend {
+                entries.push(Entry::later("Invite to Server"));
+                let (store, who) = (store.clone(), name.clone());
+                entries.push(Entry::item("Remove Friend", move |_, cx| {
+                    let store = store.clone();
+                    crate::confirm::ask(format!("Remove {who}"), format!("Remove {who} from your friends?"), "Remove Friend", move |cx| {
+                        store.update(cx, |store, cx| store.remove_friend(user, cx));
+                    }, cx);
+                }));
+            } else if !bot {
+                let store = store.clone();
+                entries.push(Entry::item("Add Friend", move |_, cx| store.update(cx, |store, cx| store.add_friend(user, cx))));
+            }
+            let ignored = crate::places::is_ignored(user);
+            entries.push(Entry::item(if ignored { "Unignore" } else { "Ignore" }, move |_, cx| {
+                crate::places::set_ignored(user, !ignored);
+                crate::ui::redraw_chat(cx);
+            }));
+            let (store, who) = (store.clone(), name.clone());
+            entries.push(Entry::item("Block", move |_, cx| {
+                let store = store.clone();
+                crate::confirm::ask(format!("Block {who}"), format!("Block {who}? They won't be able to message you, and you won't see them in your friends."), "Block", move |cx| {
+                    store.update(cx, |store, cx| store.block_user(user, cx));
+                }, cx);
+            }).danger());
+        }
+        // Server moderation: each opens its own panel, which is the confirmation.
+        if let Some(guild) = guild {
+            if mods.roles {
+                entries.push(Entry::Separator);
+                entries.push(Entry::later("Roles"));
+            }
+            if mods.mod_view || mods.timeout || mods.kick || mods.ban {
+                entries.push(Entry::Separator);
+                if mods.mod_view {
+                    entries.push(Entry::later("Open in Mod View"));
                 }
-                for (permission, label, danger) in actions {
-                    if can(permission) {
-                        let entry = Entry::later(label);
-                        entries.push(if danger { entry.danger() } else { entry });
-                    }
+                if mods.timeout {
+                    entries.push(Entry::item(format!("Timeout {name}"), panel(What::Timeout { guild, user, name: name.clone() })).danger());
+                }
+                if mods.kick {
+                    entries.push(Entry::item(format!("Kick {name}"), panel(What::Kick { guild, user, name: name.clone(), handle: handle.clone() })).danger());
+                }
+                if mods.ban {
+                    entries.push(Entry::item(format!("Ban {name}"), panel(What::Ban { guild, user, handle: name.clone() })).danger());
                 }
             }
         }
@@ -1299,7 +1348,15 @@ impl ChannelPage {
                 .icon(IconName::Reply),
             );
         }
-        entries.push(Entry::later("Forward"));
+        {
+            // Where to send it: the conversations we have open, then every channel we may write in.
+            let (store, guild) = (store.clone(), message.guild_id.or(self.guild));
+            let chats = cache.private_channels().into_iter().map(|c| (c.id, nav::channel_label(cache, c))).collect();
+            let to = crate::panels::forward_targets(chats, cache.post_destinations(), guild);
+            entries.push(Entry::item("Forward", move |window, cx| {
+                crate::panels::open(store.clone(), crate::panels::What::Forward { from: channel, message: id, guild, to: to.clone() }, window, cx);
+            }));
+        }
         if cache.can_start_thread(channel) && message.thread.is_none() && cache.thread(id).is_none() && matches!(message.kind, 0 | 19) {
             let page = page.clone();
             entries.push(
@@ -1329,7 +1386,10 @@ impl ChannelPage {
                 .picture(if pinned { "icons/pin-off.svg" } else { "icons/toolbar-pin.svg" }),
             );
         }
-        entries.push(Entry::later("Mark Unread"));
+        {
+            let store = store.clone();
+            entries.push(Entry::item("Mark Unread", move |_, cx| store.update(cx, |store, cx| store.mark_unread(channel, id, cx))));
+        }
         entries.push(Entry::copy("Copy Message Link", format!("https://discord.com/channels/{place}/{channel}/{id}")).icon(IconName::Link));
         // Only for who may; each still needs a confirm step when it's built.
         if !message.reactions.is_empty() && can_manage {
@@ -1361,7 +1421,8 @@ impl ChannelPage {
                 .danger(),
             );
         }
-        entries.push(Entry::later("Report Message").danger());
+        // Discord takes reports on its own pages: the message's link goes with it.
+        entries.push(Entry::item("Report Message", move |_, cx| cx.open_url(REPORT_PAGE)).danger());
         entries.push(Entry::Separator);
         entries.push(Entry::copy("Copy Message ID", id.to_string()).icon(IconName::Copy));
         menu::show(position, entries, cx);
@@ -1880,6 +1941,13 @@ impl ChannelPage {
     fn jump_to_present(&mut self, cx: &mut Context<Self>) {
         self.unseen = 0;
         self.banner_closed = true;
+        // Looking at a stretch back in the history: the present is a fetch away, not a scroll.
+        if let Some(channel) = self.channel.filter(|c| self.ctx.services.store.read(cx).is_detached(*c)) {
+            self.ctx.services.store.update(cx, |store, cx| store.return_to_present(channel, cx));
+            self.list.set_follow_mode(FollowMode::Tail);
+            cx.notify();
+            return;
+        }
         let last = self.rendered.len().saturating_sub(1);
         if !self.ctx.services.settings.read(cx).get().smooth_scrolling {
             self.list.set_follow_mode(FollowMode::Tail);
@@ -2981,6 +3049,14 @@ fn typing_line(store: &Entity<Store>, channel: Id, guild: Option<Id>, cx: &App) 
     )
 }
 
+/// Where Discord takes reports.
+const REPORT_PAGE: &str = "https://dis.gd/report";
+
+thread_local! {
+    /// Messages of ignored people that were clicked open.
+    static UNFOLDED: RefCell<HashSet<Id>> = RefCell::default();
+}
+
 /// Discord's quick reactions at the front of the hover toolbar.
 const QUICK_REACTIONS: [&str; 3] = ["😭", "❤️", "💀"];
 
@@ -3206,7 +3282,10 @@ fn message_row(
             .relative()
             // Avatar decorations are 1.2× the avatar, centred on it.
             .when_some(by.decoration.clone(), |this, url| {
-                this.child(img(url).absolute().top(u(-AVATAR * 0.1)).left(u(-AVATAR * 0.1)).size(u(AVATAR * 1.2)))
+                // Still, until the pointer is on the message.
+                let playing = !crate::smooth_scroll::list_scrolling() && (hovered.get() == Some(m.message.id) || hovered_tools.get() == Some(m.message.id));
+                let url = if playing { crate::decorations::animated(&url) } else { url };
+                this.child(div().absolute().top(u(-AVATAR * 0.1)).left(u(-AVATAR * 0.1)).size(u(AVATAR * 1.2)).child(crate::decorations::view(&url)))
             }))
             .into_any_element()
     };
@@ -3795,6 +3874,13 @@ fn locked_composer(reason: String, cx: &App) -> impl IntoElement {
 
 impl Render for ChannelPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // In a stretch back in the history, reaching its bottom fetches the messages below.
+        if let Some(channel) = self.channel.filter(|c| self.ctx.services.store.read(cx).is_detached(*c)) {
+            if !self.list.is_following_tail() && self.near_newest() {
+                let store = self.ctx.services.store.clone();
+                cx.defer(move |cx| store.update(cx, |store, cx| store.load_newer(channel, cx)));
+            }
+        }
         crate::ui::note_chat_view(cx.entity_id());
         crate::perf::count("page");
         crate::perf::tick();
@@ -4003,6 +4089,18 @@ impl Render for ChannelPage {
                             let _ = page.update(cx, |page, cx| page.open_profile(user, position, window, cx));
                         })
                     },
+                    open_user_menu: {
+                        let page = page.clone();
+                        Rc::new(move |user, position, cx| {
+                            let _ = page.update(cx, |page, cx| {
+                                let name = {
+                                    let cache = page.ctx.services.store.read(cx).cache();
+                                    cache.user(user).map_or_else(|| "this person".to_string(), |u| cache.display_name(page.guild, u).to_string())
+                                };
+                                page.user_menu(user, name, position, cx);
+                            });
+                        })
+                    },
                     who_reacted: {
                         let (core, store) = (self.ctx.services.core.clone(), self.ctx.services.store.clone());
                         Rc::new(move |pill, cx| match pill {
@@ -4113,6 +4211,28 @@ impl Render for ChannelPage {
                     } else {
                         message_row(i, m, stacked, !new_day, guild, cache, &shared, &page, &hovered_row, &hovered_tools, replying_to, cx)
                     };
+                    // Someone we ignore: a line to unfold, not their message.
+                    let row = if system.is_none() && !notice && crate::places::is_ignored(m.message.author.id) && !UNFOLDED.with_borrow(|set| set.contains(&m.message.id)) && cache.me().map(|u| u.id) != Some(m.message.author.id) {
+                        let (id, muted, remeasure) = (m.message.id, cx.theme().muted_foreground, shared.remeasure.clone());
+                        div()
+                            .id(("ignored", i))
+                            .w_full()
+                            .px_4()
+                            .py(u(6.))
+                            .text_size(u(14.))
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|d| d.underline())
+                            .on_click(move |_, _, cx| {
+                                UNFOLDED.with_borrow_mut(|set| set.insert(id));
+                                remeasure(id, cx);
+                                crate::ui::redraw_chat(cx);
+                            })
+                            .child("Ignored message. Click to show it.")
+                            .into_any_element()
+                    } else {
+                        row
+                    };
                     // Only the message lights up, not the date bar above it.
                     let row = if let Some((_, jump)) = highlight.get().filter(|(id, _)| *id == m.message.id) {
                         // The same look as a message being replied to, behind the row, fading.
@@ -4183,22 +4303,26 @@ impl Render for ChannelPage {
                         // Read from the list each frame: the smooth scroller moves it
                         // without firing the list's scroll events.
                         let older = !self.list.is_following_tail() && self.list.logical_scroll_top().item_ix + JUMP_PILL_AFTER < self.rendered.len();
+                        // A stretch back in the history: its end isn't the channel's, and reaching it
+                        // fetches the messages below.
+                        let detached = self.ctx.services.store.read(cx).is_detached(channel_id);
+
                         // The jump bar follows the scroll from outside the list, so the list
                         // moves as a layer only while the bar's place in that stays the same.
                         {
                             let (list, rows) = (self.list.clone(), self.rendered.len());
-                            let extra = unread.is_some() || self.unseen > 0;
+                            let extra = unread.is_some() || self.unseen > 0 || detached;
                             let wants_bar = move |list: &gpui_kit::ListState, top: f32| {
                                 const NEARLY: f32 = 200.;
                                 let following = list.is_following_tail();
                                 let near = following || f32::from(list.max_offset_for_scrollbar().y) - top <= NEARLY;
                                 let older = !following && list.logical_scroll_top().item_ix + JUMP_PILL_AFTER < rows;
-                                !near && (extra || older)
+                                (!near || detached) && (extra || older)
                             };
                             let now = wants_bar(&list, f32::from((-list.scroll_px_offset_for_scrollbar().y).min(list.max_offset_for_scrollbar().y)));
                             self.scroller.outside_stays_right(move |top| wants_bar(&list, top) == now);
                         }
-                        if !self.near_newest() && (unread.is_some() || older || self.unseen > 0) {
+                        if (!self.near_newest() || detached) && (unread.is_some() || older || self.unseen > 0 || detached) {
                             this.child(self.jump_bar(unread, cx))
                         } else {
                             this

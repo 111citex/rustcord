@@ -19,7 +19,7 @@ use crate::auth::{self, AuthError, CaptchaSolution, LoginOutcome, MfaMethod};
 use crate::build_number;
 use crate::event::CoreEvent;
 use crate::gateway::{self, GATEWAY_URL, GatewayConfig, GatewayHandle};
-use crate::http::{Http, HttpError};
+use crate::http::{Http, HttpError, audit_reason};
 use crate::identity::Identity;
 use crate::model::{Channel, Message, ReactionEmoji};
 use crate::profile::UserProfile;
@@ -209,6 +209,24 @@ impl Core {
         self.watch(result)
     }
 
+    /// The messages around `message`, newest first: half before it, half after.
+    pub async fn messages_around(&self, channel: Id, message: Id, limit: u8) -> Result<Vec<Message>, HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move { http.get(&format!("/channels/{channel}/messages?around={message}&limit={limit}")).await })
+            .await;
+        self.watch(result)
+    }
+
+    /// The page after `after`, newest first.
+    pub async fn messages_after(&self, channel: Id, after: Id, limit: u8) -> Result<Vec<Message>, HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move { http.get(&format!("/channels/{channel}/messages?after={after}&limit={limit}")).await })
+            .await;
+        self.watch(result)
+    }
+
     /// Sends a message, as a reply to `reply` when given.
     pub async fn send_message(
         &self,
@@ -266,11 +284,134 @@ impl Core {
         self.watch(result)
     }
 
-    pub async fn kick_member(&self, guild: Id, user: Id) -> Result<(), HttpError> {
+    /// Removes someone from a server. The reason goes in the audit log.
+    pub async fn kick_member(&self, guild: Id, user: Id, reason: String) -> Result<(), HttpError> {
         let http = self.http.clone();
         let result = self
             .on_rt(async move {
-                let _: Value = http.delete(&format!("/guilds/{guild}/members/{user}")).await?;
+                let _: Value = http.delete_with_headers(&format!("/guilds/{guild}/members/{user}"), audit_reason(&reason)).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Bans someone, deleting up to `delete_seconds` of what they posted.
+    pub async fn ban_member(&self, guild: Id, user: Id, delete_seconds: u32, reason: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let body = json!({ "delete_message_seconds": delete_seconds });
+                let _: Value = http.put_json_with_headers(&format!("/guilds/{guild}/bans/{user}"), &body, audit_reason(&reason)).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Times someone out until `until` (an ISO 8601 time); `None` lifts it.
+    pub async fn timeout_member(&self, guild: Id, user: Id, until: Option<String>, reason: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let body = json!({ "communication_disabled_until": until });
+                let _: Value = http.patch_with_headers(&format!("/guilds/{guild}/members/{user}"), &body, audit_reason(&reason)).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// A server nickname; empty clears it. `me`: it's our own, which has its own route.
+    pub async fn set_nickname(&self, guild: Id, user: Id, me: bool, nick: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let who = if me { "@me".to_string() } else { user.to_string() };
+                let nick = Some(nick.trim().to_string()).filter(|n| !n.is_empty());
+                let _: Value = http.patch(&format!("/guilds/{guild}/members/{who}"), &json!({ "nick": nick })).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Blocks someone. Unblocking is removing the relationship.
+    pub async fn block_user(&self, user: Id) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.put_json(&format!("/users/@me/relationships/{user}"), &json!({ "type": 2 })).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// The name we call a friend by; empty clears it.
+    pub async fn set_friend_nickname(&self, user: Id, nick: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let nick = Some(nick.trim().to_string()).filter(|n| !n.is_empty());
+                let _: Value = http.patch(&format!("/users/@me/relationships/{user}"), &json!({ "nickname": nick })).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// The private note we keep on someone. Empty when there is none.
+    pub async fn note(&self, user: Id) -> Result<String, HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                match http.get::<Value>(&format!("/users/@me/notes/{user}")).await {
+                    Ok(v) => Ok(v["note"].as_str().unwrap_or_default().to_string()),
+                    Err(HttpError::NotFound) => Ok(String::new()),
+                    Err(e) => Err(e),
+                }
+            })
+            .await;
+        self.watch(result)
+    }
+
+    pub async fn set_note(&self, user: Id, note: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.put_json(&format!("/users/@me/notes/{user}"), &json!({ "note": note })).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Marks a channel unread from `message` on: the ack is of the message before it,
+    /// which is what makes it the first one unread.
+    pub async fn mark_unread_from(&self, channel: Id, before: Id) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let body = json!({"manual": true, "mention_count": 0});
+                let _: Value = http.post(&format!("/channels/{channel}/messages/{before}/ack"), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Sends a copy of a message to another channel, shown as forwarded.
+    pub async fn forward_message(&self, to: Id, from: Id, message: Id, guild: Option<Id>) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let mut reference = json!({"type": 1, "message_id": message.to_string(), "channel_id": from.to_string()});
+                if let Some(guild) = guild {
+                    reference["guild_id"] = json!(guild.to_string());
+                }
+                let body = json!({"message_reference": reference, "flags": 0, "nonce": fastrand::u64(..).to_string()});
+                let _: Value = http.post(&format!("/channels/{to}/messages"), &body).await?;
                 Ok(())
             })
             .await;
@@ -704,6 +845,50 @@ impl Core {
     }
 
     /// Opens (or finds) the direct message channel with `user`.
+    /// Mutes or unmutes a conversation, until we say otherwise.
+    pub async fn mute_conversation(&self, channel: Id, muted: bool) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let over = if muted {
+                    json!({ "muted": true, "mute_config": { "selected_time_window": -1, "end_time": null } })
+                } else {
+                    json!({ "muted": false, "mute_config": null })
+                };
+                let body = json!({ "channel_overrides": { channel.to_string(): over } });
+                let _: Value = http.patch("/users/@me/guilds/@me/settings", &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Renames a group chat; empty goes back to naming it by who's in it.
+    pub async fn rename_group(&self, channel: Id, name: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
+                let _: Value = http.patch(&format!("/channels/{channel}"), &json!({ "name": name })).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Starts a thread on a message.
+    pub async fn create_thread(&self, channel: Id, message: Id, name: String) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let body = json!({ "name": name.trim(), "auto_archive_duration": 1440 });
+                let _: Value = http.post(&format!("/channels/{channel}/messages/{message}/threads"), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
     pub async fn open_dm(&self, user: Id) -> Result<Channel, HttpError> {
         let http = self.http.clone();
         let body = json!({"recipient_id": user.to_string()});

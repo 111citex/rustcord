@@ -42,6 +42,37 @@ pub fn take_scroll() -> (u64, u64, u64, u64) {
     )
 }
 
+/// Whether the render thread is the one that presents frames, and so reports them to the frame
+/// trace (see [`presented`]): a frame the main thread draws is not on screen until then, and
+/// the frames that only move a scroll layer are never drawn there at all.
+pub static PRESENTED_BY_RENDER_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The window whose presents those are, as its id plus one (0: none yet).
+static PRESENT_WINDOW: AtomicU64 = AtomicU64::new(0);
+
+/// Says which window the render thread's presents belong to.
+pub fn set_present_window(window_id: u64) {
+    PRESENT_WINDOW.store(window_id + 1, Relaxed);
+}
+
+/// The render thread put a frame on screen: it goes in the frame trace, which is what
+/// the FPS readout counts. Several windows aren't told apart: rustcord has one.
+pub fn presented(start: std::time::Instant, end: std::time::Instant) {
+    #[cfg(feature = "profiler")]
+    {
+        let id = PRESENT_WINDOW.load(Relaxed);
+        if id != 0 {
+            crate::profiler::record_frame_event(crate::profiler::FrameEvent::Present(crate::profiler::PresentTiming {
+                window_id: crate::WindowId::from(id - 1),
+                present_start: start,
+                present_end: end,
+                animation_interval: None,
+            }));
+        }
+    }
+    #[cfg(not(feature = "profiler"))]
+    let _ = (start, end);
+}
+
 pub fn add(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Relaxed);
 }

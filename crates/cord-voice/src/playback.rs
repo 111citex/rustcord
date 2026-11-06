@@ -91,6 +91,52 @@ impl Speakers {
 struct Voice {
     decoder: Decoder,
     heard: Instant,
+    /// Sound is coming from them right now (the last frame wasn't the end of it).
+    live: bool,
+    /// The last stereo sample played before their volume, to ease out of at the end.
+    last: [f32; 2],
+    /// The volume the last frame ended at, so the next one moves on from it.
+    gain: f32,
+}
+
+/// Fades in and out take this many sample frames: 5 ms. Short enough not to blunt a
+/// word's start, long enough that nothing steps from silence to sound in one sample.
+const FADE: usize = 240;
+
+/// Brings sound in from nothing over the first [`FADE`] frames of `samples` (stereo).
+fn fade_in(samples: &mut [f32]) {
+    for (i, frame) in samples.chunks_exact_mut(2).take(FADE).enumerate() {
+        let level = (i + 1) as f32 / FADE as f32;
+        frame[0] *= level;
+        frame[1] *= level;
+    }
+}
+
+/// Adds the last sound played, dying away over [`FADE`] frames: what goes on after
+/// someone stops, instead of cutting to silence from wherever the wave was.
+fn ease_out(last: [f32; 2], out: &mut [f32]) {
+    for (i, frame) in out.chunks_exact_mut(2).take(FADE).enumerate() {
+        let level = 1. - (i + 1) as f32 / FADE as f32;
+        frame[0] += last[0] * level;
+        frame[1] += last[1] * level;
+    }
+}
+
+/// Scales `samples` from volume `from` at the start to `to` at the end, so that changing
+/// it, by a slider or a mute, never steps.
+fn ramp(from: f32, to: f32, samples: &mut [f32]) {
+    if from == to {
+        if to != 1. {
+            samples.iter_mut().for_each(|s| *s *= to);
+        }
+        return;
+    }
+    let frames = (samples.len() / 2).max(1) as f32;
+    for (i, frame) in samples.chunks_exact_mut(2).enumerate() {
+        let level = from + (to - from) * (i + 1) as f32 / frames;
+        frame[0] *= level;
+        frame[1] *= level;
+    }
 }
 
 /// Keeps loud moments from clipping, leaving everything quieter alone.
@@ -107,7 +153,7 @@ fn limit(sample: f32) -> f32 {
 /// Mixes the next 20 ms into `out`. Whether anyone's in it.
 fn mix(speakers: &Mutex<Speakers>, voices: &mut HashMap<u32, Voice>, stats: &Stats, out: &mut [f32]) -> bool {
     out.fill(0.);
-    let mut plan: Vec<(u32, Next, f32)> = {
+    let plan: Vec<(u32, Next, f32, bool)> = {
         let Ok(mut speakers) = speakers.lock() else { return false };
         let ssrcs: Vec<u32> = speakers.queues.keys().copied().collect();
         ssrcs
@@ -117,21 +163,35 @@ fn mix(speakers: &Mutex<Speakers>, voices: &mut HashMap<u32, Voice>, stats: &Sta
                 let queue = speakers.queues.get_mut(&ssrc)?;
                 let next = queue.next();
                 stats.skipped.fetch_add(queue.take_skipped(), Relaxed);
-                Some((ssrc, next, gain))
+                Some((ssrc, next, gain, queue.take_restarted()))
             })
             .collect()
     };
-    plan.retain(|(_, next, _)| *next != Next::Nothing);
     let mut any = false;
     let mut one = [0f32; FRAME];
-    for (ssrc, next, gain) in plan {
+    for (ssrc, next, gain, restarted) in plan {
+        if next == Next::Nothing {
+            // They've stopped: what's left of the wave dies away rather than being cut.
+            if let Some(voice) = voices.get_mut(&ssrc).filter(|v| v.live) {
+                voice.live = false;
+                ease_out([voice.last[0] * voice.gain, voice.last[1] * voice.gain], out);
+                any = true;
+            }
+            continue;
+        }
         if let std::collections::hash_map::Entry::Vacant(slot) = voices.entry(ssrc)
             && let Ok(decoder) = Decoder::new(RATE, Channels::Stereo)
         {
-            slot.insert(Voice { decoder, heard: Instant::now() });
+            slot.insert(Voice { decoder, heard: Instant::now(), live: false, last: [0.; 2], gain });
         }
         let Some(voice) = voices.get_mut(&ssrc) else { continue };
         voice.heard = Instant::now();
+        // Starting from silence: the decoder is still as the last burst left it, which
+        // made the first frame click, so it starts afresh and the sound comes in.
+        let starting = !voice.live || restarted;
+        if starting {
+            let _ = voice.decoder.reset_state();
+        }
         let decoded = match &next {
             Next::Play(packet) => voice.decoder.decode_float(packet, &mut one, false),
             Next::Recover(packet) => voice.decoder.decode_float(packet, &mut one, true),
@@ -143,17 +203,25 @@ fn mix(speakers: &Mutex<Speakers>, voices: &mut HashMap<u32, Voice>, stats: &Sta
         }
         stats.played.fetch_add(1, Relaxed);
         let Ok(frames) = decoded else { continue };
-        for (mixed, sample) in out.iter_mut().zip(&one[..(frames * 2).min(FRAME)]) {
-            *mixed += sample * gain;
+        let len = (frames * 2).min(FRAME);
+        if len < 2 {
+            continue;
+        }
+        let heard = &mut one[..len];
+        if starting {
+            fade_in(heard);
+            voice.gain = gain;
+        }
+        voice.live = true;
+        voice.last = [heard[len - 2], heard[len - 1]];
+        ramp(voice.gain, gain, heard);
+        voice.gain = gain;
+        for (mixed, sample) in out.iter_mut().zip(heard.iter()) {
+            *mixed += sample;
         }
         any = true;
     }
     voices.retain(|_, voice| voice.heard.elapsed() < FORGET_AFTER);
-    if any {
-        for sample in out.iter_mut() {
-            *sample = limit(*sample);
-        }
-    }
     any
 }
 
@@ -307,17 +375,27 @@ fn play(speakers: &Mutex<Speakers>, stats: &Stats, deaf: &AtomicBool, stop: &Ato
 
     let mut voices = HashMap::new();
     let mut frame = vec![0f32; FRAME];
+    let mut heard_level = 1f32;
     while !stop.load(Relaxed) {
         if writer.buffer().capacity() - writer.slots() >= AHEAD {
             std::thread::sleep(Duration::from_millis(4));
             continue;
         }
         let any = mix(speakers, &mut voices, stats, &mut frame);
-        if deaf.load(Relaxed) || !any {
+        // Deafening fades the call out over the frame, and undeafening back in.
+        let wanted = if deaf.load(Relaxed) { 0. } else { 1. };
+        if any {
+            ramp(heard_level, wanted, &mut frame);
+        } else {
             frame.fill(0.);
         }
+        heard_level = wanted;
         if let Ok(mut speakers) = speakers.lock() {
             speakers.mix_sounds(&mut frame);
+        }
+        // Voices and sounds together may pass full scale: the limiter keeps them from clipping.
+        for sample in frame.iter_mut() {
+            *sample = limit(*sample);
         }
         for sample in &frame {
             if writer.push(*sample).is_err() {
@@ -345,5 +423,38 @@ mod tests {
     #[test]
     fn louder_stays_louder_through_the_limiter() {
         assert!(limit(2.) > limit(1.2));
+    }
+
+    #[test]
+    fn a_fade_in_starts_from_silence_and_reaches_full() {
+        let mut samples = vec![1f32; FADE * 2 + 40];
+        fade_in(&mut samples);
+        assert!(samples[0] < 0.01 && samples[1] < 0.01, "the first sample is nearly nothing");
+        assert!((samples[FADE * 2 - 1] - 1.).abs() < 1e-6, "full by the end of the fade");
+        assert_eq!(samples[FADE * 2 + 5], 1., "and untouched after it");
+        assert!(samples.windows(2).step_by(2).all(|w| w[0] <= w[1] + 1e-6), "rising");
+    }
+
+    #[test]
+    fn easing_out_goes_from_where_the_wave_was_to_nothing() {
+        let mut out = vec![0f32; FADE * 2 + 8];
+        ease_out([0.5, -0.5], &mut out);
+        assert!(out[0] > 0.49, "it carries on from the last sample");
+        assert!(out[FADE * 2 - 2].abs() < 1e-6 && out[FADE * 2 - 1].abs() < 1e-6, "and is gone by the end");
+        assert_eq!(out[FADE * 2 + 2], 0.);
+    }
+
+    #[test]
+    fn a_volume_change_moves_in_steps_no_bigger_than_its_share() {
+        let mut samples = vec![1f32; 960 * 2];
+        ramp(0., 1., &mut samples);
+        let steps: Vec<f32> = samples.chunks_exact(2).map(|f| f[0]).collect::<Vec<_>>().windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(steps.iter().all(|s| (s - 1. / 960.).abs() < 1e-5), "an even slope, not a jump");
+        assert!((samples[samples.len() - 1] - 1.).abs() < 1e-6);
+        let mut same = vec![0.5f32; 8];
+        ramp(1., 1., &mut same);
+        assert_eq!(same, vec![0.5; 8]);
+        ramp(0.5, 0.5, &mut same);
+        assert_eq!(same, vec![0.25; 8]);
     }
 }

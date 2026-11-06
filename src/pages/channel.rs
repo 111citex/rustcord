@@ -495,7 +495,7 @@ impl ChannelPage {
             forum: None,
             pins_at: None,
             pins_scroll: pins_scroll.clone(),
-            pins_scroller: SmoothScroller::new(ScrollTarget::Handle(pins_scroll)).in_popout(),
+            pins_scroller: SmoothScroller::new(ScrollTarget::Handle(pins_scroll)).owned_by("pins"),
             search,
             _subscriptions: subscriptions,
         };
@@ -1363,8 +1363,16 @@ impl ChannelPage {
         {
             // Where to send it: the conversations we have open, then every channel we may write in.
             let (store, guild) = (store.clone(), message.guild_id.or(self.guild));
-            let chats = cache.private_channels().into_iter().map(|c| (c.id, nav::channel_label(cache, c))).collect();
-            let to = crate::panels::forward_targets(chats, cache.post_destinations(), guild);
+            let chats = cache.private_channels().into_iter().map(|c| (c.id, nav::channel_label(cache, c), crate::panels::Picture::of_chat(cache, c))).collect();
+            let servers = cache
+                .post_destinations()
+                .into_iter()
+                .map(|d| {
+                    let picture = cache.guild(d.guild).map_or_else(|| crate::panels::Picture::Initials(String::new()), crate::panels::Picture::of_server);
+                    (d, picture)
+                })
+                .collect();
+            let to = crate::panels::forward_targets(chats, servers, guild);
             entries.push(Entry::item("Forward", move |window, cx| {
                 crate::panels::open(store.clone(), crate::panels::What::Forward { from: channel, message: id, guild, to: to.clone() }, window, cx);
             }));
@@ -3887,7 +3895,7 @@ fn locked_composer(reason: String, cx: &App) -> impl IntoElement {
 impl Render for ChannelPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Open, the pins popout has the wheel; the chat behind keeps still.
-        crate::smooth_scroll::set_popout_open(self.pins_at.is_some());
+        crate::smooth_scroll::set_popout_open("pins", self.pins_at.is_some());
         // In a stretch back in the history, reaching its bottom fetches the messages below.
         if let Some(channel) = self.channel.filter(|c| self.ctx.services.store.read(cx).is_detached(*c)) {
             if !self.list.is_following_tail() && self.near_newest() {

@@ -6,9 +6,83 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use gpui_kit::{IntoElement, SharedString, Styled, canvas};
+use gpui_kit::{AnimationElement, AnimationExt as _, App, Global, IntoElement, SharedString, Styled, canvas};
 
 const SECS: f32 = 0.256;
+
+/// How long a panel or popout takes to come and go: quick, as Discord's are.
+pub const POP: std::time::Duration = std::time::Duration::from_millis(160);
+/// How far a panel or popout rises as it comes in, in pixels.
+const RISE: f32 = 8.;
+
+/// One opening of a panel or popout: its animations are keyed by `number`, so each opening
+/// starts them fresh, and `closing` once it's on its way out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Showing {
+    pub number: usize,
+    pub closing: bool,
+}
+
+impl Showing {
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        Showing { number: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), closing: false }
+    }
+
+    fn key(self) -> usize {
+        self.number * 2 + usize::from(self.closing)
+    }
+}
+
+impl Default for Showing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How visible a panel is `t` of the way through its coming in or going out.
+pub fn shown(closing: bool, t: f32) -> f32 {
+    if closing { 1. - t } else { t }
+}
+
+/// A panel or popout card coming in or going: it fades as it rises into place, and sinks a
+/// little as it fades out. The element must be `relative`, for the rise.
+pub fn pop<E: IntoElement + Styled + 'static>(element: E, id: &'static str, showing: Showing) -> AnimationElement<E> {
+    element.with_animation((id, showing.key()), gpui_kit::Animation::new(POP).with_easing(gpui_kit::ease_out_quint()), move |d, t| {
+        let shown = shown(showing.closing, t);
+        d.opacity(shown).top(crate::ui::u((1. - shown) * RISE))
+    })
+}
+
+/// What's behind a panel, dimmed: it only fades.
+pub fn fade<E: IntoElement + Styled + 'static>(element: E, id: &'static str, showing: Showing) -> AnimationElement<E> {
+    element.with_animation((id, showing.key()), gpui_kit::Animation::new(POP).with_easing(gpui_kit::ease_out_quint()), move |d, t| d.opacity(shown(showing.closing, t)))
+}
+
+/// Starts `G`'s panel going, and drops it once it has faded out. `showing` finds the
+/// opening in it. A panel opened again meanwhile is a new opening, and stays.
+pub fn leave<G: Global>(cx: &mut App, showing: fn(&mut G) -> &mut Showing) {
+    if !cx.has_global::<G>() {
+        return;
+    }
+    let now = showing(cx.global_mut::<G>());
+    if now.closing {
+        return;
+    }
+    now.closing = true;
+    let number = now.number;
+    cx.refresh_windows();
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(POP).await;
+        cx.update(|cx| {
+            if cx.has_global::<G>() && showing(cx.global_mut::<G>()).number == number {
+                cx.remove_global::<G>();
+                cx.refresh_windows();
+            }
+        });
+    })
+    .detach();
+}
 
 #[derive(Clone, Copy)]
 struct Fade {
@@ -105,6 +179,15 @@ mod tests {
         assert!(halfway > 0.5 && halfway < 1.);
         // Leaving partway starts from there, with no jump.
         assert_eq!(amount(halfway, false, 0.), halfway);
+    }
+
+    #[test]
+    fn panels_fade_in_and_out_and_each_opening_is_its_own() {
+        assert_eq!((shown(false, 0.), shown(false, 1.)), (0., 1.));
+        assert_eq!((shown(true, 0.), shown(true, 1.)), (1., 0.));
+        let (one, two) = (Showing::new(), Showing::new());
+        assert_ne!(one.key(), two.key());
+        assert_ne!(one.key(), Showing { closing: true, ..one }.key(), "closing animates afresh");
     }
 
     #[test]

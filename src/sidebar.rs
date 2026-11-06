@@ -148,19 +148,24 @@ fn dm_alerts(cache: &Cache) -> Vec<RailDm> {
         .map(|channel| RailDm {
             id: channel.id,
             name: nav::channel_label(cache, channel),
-            picture: match &channel.icon {
-                Some(hash) => format!("{}/channel-icons/{}/{hash}.png?size=64", cdn::CDN, channel.id),
-                None => {
-                    let first = channel.recipient_ids.first().and_then(|id| cache.user(*id));
-                    let (id, hash) = first.map_or((channel.id, None), |u| (u.id, u.avatar.clone()));
-                    cdn::avatar_url(id, hash.as_deref(), 64)
-                }
-            },
+            picture: chat_picture(cache, channel),
             faces: group_faces(cache, channel),
             target: nav::channel_path(channel),
             mentions: cache.mentions(channel.id),
         })
         .collect()
+}
+
+/// A conversation's picture: the group's own, or the (first) other person's avatar.
+pub fn chat_picture(cache: &Cache, channel: &cord_core::model::Channel) -> String {
+    match &channel.icon {
+        Some(hash) => format!("{}/channel-icons/{}/{hash}.png?size=64", cdn::CDN, channel.id),
+        None => {
+            let first = channel.recipient_ids.first().and_then(|id| cache.user(*id));
+            let (id, hash) = first.map_or((channel.id, None), |u| (u.id, u.avatar.clone()));
+            cdn::avatar_url(id, hash.as_deref(), 64)
+        }
+    }
 }
 
 /// The first two people of a group without its own picture, which Discord shows overlapping.

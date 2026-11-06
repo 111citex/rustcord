@@ -2209,7 +2209,7 @@ const PILL_UNREAD: f32 = 8.;
 /// Channel rows: inset from the column's left, and from the right (scrollbar room).
 /// Two faces filling a `size` square, as Discord shows a group with no picture: one at the top
 /// left, the other over it at the bottom right, cut out of it by a ring of `ring`.
-fn stacked_faces(faces: &[String], size: f32, ring: gpui_kit::Hsla) -> AnyElement {
+pub(crate) fn stacked_faces(faces: &[String], size: f32, ring: gpui_kit::Hsla) -> AnyElement {
     let face = size * 0.625;
     let edge = (size / 16.).max(1.5);
     let picture = |url: &String| img(url.clone()).size_full().rounded_full().object_fit(ObjectFit::Cover);
@@ -2249,7 +2249,7 @@ fn panel(theme: &gpui_kit::component::Theme) -> Hsla {
 const PANEL_HEIGHT: f32 = 58.;
 
 /// "Rust Friends" → "RF", as Discord shows servers without an icon.
-fn initials(name: &str) -> String {
+pub(crate) fn initials(name: &str) -> String {
     name.split_whitespace().filter_map(|w| w.chars().next()).take(3).collect()
 }
 

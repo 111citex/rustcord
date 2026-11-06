@@ -8,9 +8,12 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{HighlightStyle, InteractiveText, StyledText, AnyElement, App, AppContext as _, Context, Entity, FontWeight, Global, InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, StatefulInteractiveElement as _, Subscription, WeakEntity, Window, anchored, deferred, div, point, px};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::{HighlightStyle, InteractiveText, StyledText, AnyElement, App, AppContext as _, Context, Entity, FontWeight, Global, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, ScrollHandle, Styled as _, StyledImage as _, StatefulInteractiveElement as _, Subscription, WeakEntity, Window, anchored, deferred, div, img, point, px};
 
+use crate::smooth_scroll::{ScrollTarget, SmoothScroller};
 use crate::store::Store;
+use crate::transition::Showing;
 use crate::ui::u;
 
 /// Discord's timeout lengths, in seconds.
@@ -34,6 +37,8 @@ pub const HISTORY: [(&str, u32); 7] = [
 const DEFAULT_HISTORY: usize = 1;
 
 const TIMEOUT_TEXT: &str = "Members who are in timeout are temporarily not allowed to chat or react in text channels. They are also not allowed to connect to voice or Stage channels. ";
+/// Discord's help for a friend nickname, shown in the empty box.
+const FRIEND_NICKNAME_HELP: &str = "Only you see this, outside of servers. Leave it empty to remove it.";
 const TIMEOUT_HELP: &str = "https://support.discord.com/hc/en-us/articles/4413305239191-Time-Out-FAQ";
 
 /// The reason a ban is sent with, or `None` while one is still missing: a choice, and
@@ -73,6 +78,56 @@ pub struct Target {
     pub id: Id,
     pub label: String,
     pub place: Option<String>,
+    pub picture: Picture,
+}
+
+/// What a row shows at its start, as Discord's lists do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Picture {
+    /// An avatar, a group's own picture or a server's icon.
+    Url(String),
+    /// A group with no picture: two of its people, overlapping.
+    Faces(Vec<String>),
+    /// A server with no icon: the first letters of its name.
+    Initials(String),
+}
+
+impl Picture {
+    /// A conversation's: the other person, the group's picture, or two of its people.
+    pub fn of_chat(cache: &cord_core::cache::Cache, channel: &cord_core::model::Channel) -> Picture {
+        let faces = crate::sidebar::group_faces(cache, channel);
+        if faces.len() == 2 { Picture::Faces(faces) } else { Picture::Url(crate::sidebar::chat_picture(cache, channel)) }
+    }
+
+    /// A server's icon, or its initials.
+    pub fn of_server(guild: &cord_core::model::Guild) -> Picture {
+        match &guild.icon {
+            Some(hash) => Picture::Url(cord_core::cdn::guild_icon_url(guild.id, hash, 64)),
+            None => Picture::Initials(crate::shell::initials(&guild.name)),
+        }
+    }
+
+    /// Drawn `size` across, with `ring` the colour behind it (for stacked faces).
+    pub fn view(&self, size: f32, ring: gpui_kit::Hsla, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        match self {
+            Picture::Url(url) => img(url.clone()).size(u(size)).flex_shrink_0().rounded_full().object_fit(ObjectFit::Cover).into_any_element(),
+            Picture::Faces(faces) => crate::shell::stacked_faces(faces, size, ring),
+            Picture::Initials(text) => div()
+                .size(u(size))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme.secondary)
+                .text_color(theme.foreground)
+                .text_size(u(size * 0.38))
+                .font_weight(FontWeight::MEDIUM)
+                .child(text.clone())
+                .into_any_element(),
+        }
+    }
 }
 
 impl Target {
@@ -84,11 +139,12 @@ impl Target {
 }
 
 /// Where a message may be forwarded from `guild`: the open chats first, then the channels
-/// of the server it's in, then every other server's. `chats` and `servers` are in the order to show.
-pub fn forward_targets(chats: Vec<(Id, String)>, servers: Vec<cord_core::cache::Destination>, guild: Option<Id>) -> Vec<Target> {
-    let (here, elsewhere): (Vec<_>, Vec<_>) = servers.into_iter().partition(|d| Some(d.guild) == guild);
-    let chats = chats.into_iter().map(|(id, label)| Target { id, label, place: None });
-    let channels = here.into_iter().chain(elsewhere).map(|d| Target { id: d.id, label: format!("#{}", d.name), place: Some(d.server) });
+/// of the server it's in, then every other server's. `chats` and `servers` are in the order
+/// to show, each with its picture: a server channel shows its server's.
+pub fn forward_targets(chats: Vec<(Id, String, Picture)>, servers: Vec<(cord_core::cache::Destination, Picture)>, guild: Option<Id>) -> Vec<Target> {
+    let (here, elsewhere): (Vec<_>, Vec<_>) = servers.into_iter().partition(|(d, _)| Some(d.guild) == guild);
+    let chats = chats.into_iter().map(|(id, label, picture)| Target { id, label, place: None, picture });
+    let channels = here.into_iter().chain(elsewhere).map(|(d, picture)| Target { id: d.id, label: format!("#{}", d.name), place: Some(d.server), picture });
     chats.chain(channels).collect()
 }
 
@@ -106,21 +162,22 @@ pub struct Panel {
     /// A note is being fetched: it can't be saved over what's already there.
     loading: bool,
     focus: gpui_kit::FocusHandle,
+    /// The Forward list, gliding with the wheel.
+    scroll: ScrollHandle,
+    scroller: SmoothScroller,
     _watching: Vec<Subscription>,
 }
 
-struct Open(Entity<Panel>);
+struct Open(Entity<Panel>, Showing);
 impl Global for Open {}
 
+/// Open, and not on its way out.
 pub fn is_open(cx: &App) -> bool {
-    cx.has_global::<Open>()
+    cx.try_global::<Open>().is_some_and(|open| !open.1.closing)
 }
 
 pub fn close(cx: &mut App) {
-    if is_open(cx) {
-        cx.remove_global::<Open>();
-        cx.refresh_windows();
-    }
+    crate::transition::leave::<Open>(cx, |open| &mut open.1);
 }
 
 pub fn open(store: Entity<Store>, what: What, window: &mut Window, cx: &mut App) {
@@ -129,7 +186,8 @@ pub fn open(store: Entity<Store>, what: What, window: &mut Window, cx: &mut App)
             What::Timeout { .. } => ("Enter a reason. This will only be visible in the Audit Log and will not be shown to the member.", 4, String::new()),
             What::Kick { .. } => ("", 3, String::new()),
             What::Ban { .. } => ("Why are they being banned?", 3, String::new()),
-            What::Nickname { current, .. } | What::FriendNickname { current, .. } => ("", 1, current.clone()),
+            What::Nickname { current, .. } => ("", 1, current.clone()),
+            What::FriendNickname { current, .. } => (FRIEND_NICKNAME_HELP, 1, current.clone()),
             What::Note { .. } => ("Click to add a note", 4, String::new()),
             What::Forward { .. } => ("Search", 1, String::new()),
             What::Thread { .. } => ("New Thread", 1, String::new()),
@@ -170,7 +228,9 @@ pub fn open(store: Entity<Store>, what: What, window: &mut Window, cx: &mut App)
             });
         });
         let note_for = if let What::Note { user, .. } = &what { Some(*user) } else { None };
-        let panel = Panel { store: store.clone(), what: what.clone(), text, duration: 0, ban_choice: None, chosen: Vec::new(), history: DEFAULT_HISTORY, dropdown_open: false, loading: note_for.is_some(), focus: cx.focus_handle(), _watching: vec![typed, keys] };
+        let scroll = ScrollHandle::new();
+        let scroller = SmoothScroller::new(ScrollTarget::Handle(scroll.clone())).owned_by("panel");
+        let panel = Panel { store: store.clone(), what: what.clone(), text, duration: 0, ban_choice: None, chosen: Vec::new(), history: DEFAULT_HISTORY, dropdown_open: false, loading: note_for.is_some(), focus: cx.focus_handle(), scroll, scroller, _watching: vec![typed, keys] };
         if let Some(user) = note_for {
             let core = store.read(cx).core().clone();
             cx.spawn_in(window, async move |this, cx| {
@@ -193,13 +253,15 @@ pub fn open(store: Entity<Store>, what: What, window: &mut Window, cx: &mut App)
         let focus = panel.read(cx).focus.clone();
         window.focus(&focus, cx);
     }
-    cx.set_global(Open(panel));
+    cx.set_global(Open(panel, Showing::new()));
     cx.refresh_windows();
 }
 
 pub fn overlay(window: &Window, cx: &App) -> Option<AnyElement> {
-    let panel = cx.try_global::<Open>()?.0.clone();
+    let open = cx.try_global::<Open>()?;
+    let (panel, showing) = (open.0.clone(), open.1);
     let viewport = window.viewport_size();
+    let card = crate::transition::pop(div().relative().max_w_full().child(panel), "panel-card", showing);
     let backdrop = div()
         .id("panel-backdrop")
         .occlude()
@@ -211,7 +273,8 @@ pub fn overlay(window: &Window, cx: &App) -> Option<AnyElement> {
         .bg(gpui_kit::black().opacity(0.6))
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         .on_click(|_, _, cx| close(cx))
-        .child(panel);
+        .child(card);
+    let backdrop = crate::transition::fade(backdrop, "panel-backdrop", showing);
     Some(deferred(anchored().position(point(px(0.), px(0.))).child(backdrop)).with_priority(5).into_any_element())
 }
 
@@ -271,8 +334,8 @@ impl Render for Panel {
         let ready = self.ready(cx);
         let this: WeakEntity<Self> = cx.entity().downgrade();
         let label = |text: &'static str| div().text_size(u(14.)).font_weight(FontWeight::MEDIUM).child(text);
-        let box_for = |content: AnyElement| div().w_full().px(u(12.)).py(u(10.)).rounded(u(8.)).border_1().border_color(border).bg(theme.background.opacity(0.5)).text_size(u(15.)).text_color(fg).child(content);
-        let text_box = || box_for(Textarea::new(&self.text).into_any_element());
+        // The input is its own box: nothing goes around it.
+        let text_box = || Textarea::new(&self.text).w_full().large().text_size(u(15.)).into_any_element();
 
         let (title, body, action, tone): (String, AnyElement, &'static str, gpui_kit::Hsla) = match &self.what {
             What::Timeout { name, .. } => (
@@ -288,6 +351,8 @@ impl Render for Panel {
                         v_flex().gap(u(8.)).child(label("Duration")).child(
                             h_flex().w_full().rounded(u(8.)).border_1().border_color(border).overflow_hidden().children(DURATIONS.iter().enumerate().map(|(i, (name, _))| {
                                 let chosen = self.duration == i;
+                                // Clipping is square: the end segments round themselves, inside the border.
+                                let (first, last) = (i == 0, i == DURATIONS.len() - 1);
                                 let this = this.clone();
                                 div()
                                     .id(("timeout-length", i))
@@ -300,6 +365,8 @@ impl Render for Panel {
                                     .text_size(u(14.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .when(i > 0, |d| d.border_l_1().border_color(border))
+                                    .when(first, |d| d.rounded_l(u(7.)))
+                                    .when(last, |d| d.rounded_r(u(7.)))
                                     .when(chosen, |d| d.bg(blurple).text_color(gpui_kit::white()))
                                     .when(!chosen, |d| d.hover(|d| d.bg(fg.opacity(0.06))))
                                     .on_click(move |_, _, cx| {
@@ -386,7 +453,6 @@ impl Render for Panel {
                 format!("Change Friend Nickname of {name}"),
                 v_flex()
                     .gap(u(16.))
-                    .child(div().text_size(u(14.)).text_color(muted).child("Only you see this, outside of servers. Leave it empty to remove it."))
                     .child(v_flex().gap(u(8.)).child(label("Friend Nickname")).child(text_box()))
                     .into_any_element(),
                 "Save",
@@ -402,18 +468,20 @@ impl Render for Panel {
                         .gap(u(12.))
                         .child(text_box())
                         .child(
+                            div().relative().h(u(280.)).child(self.scroller.layer()).child(
                             v_flex()
                                 .id("forward-list")
-                                .h(u(280.))
+                                .size_full()
                                 .overflow_y_scroll()
+                                .track_scroll(&self.scroll)
                                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                                 .children(shown.into_iter().map(|target| {
                                     let (id, ticked, this) = (target.id, self.chosen.contains(&target.id), this.clone());
                                     h_flex()
                                         .id(("forward-to", id.0 as usize))
-                                        .h(u(40.))
+                                        .h(u(44.))
                                         .px(u(8.))
-                                        .gap(u(10.))
+                                        .gap(u(12.))
                                         .items_center()
                                         .rounded(u(6.))
                                         .cursor_pointer()
@@ -430,6 +498,7 @@ impl Render for Panel {
                                                 cx.notify();
                                             });
                                         })
+                                        .child(target.picture.view(28., theme.popover, cx))
                                         .child(
                                             h_flex()
                                                 .flex_1()
@@ -452,6 +521,7 @@ impl Render for Panel {
                                                 .when(ticked, |d| d.bg(blurple).child(Icon::new(IconName::Check).size(u(16.)).text_color(gpui_kit::white()))),
                                         )
                                 })),
+                            ),
                         )
                         .into_any_element(),
                     "Send",
@@ -643,7 +713,7 @@ mod tests {
     }
 
     fn target(id: u64, label: &str, place: Option<&str>) -> Target {
-        Target { id: Id(id), label: label.into(), place: place.map(str::to_string) }
+        Target { id: Id(id), label: label.into(), place: place.map(str::to_string), picture: Picture::Initials(String::new()) }
     }
 
     #[test]
@@ -659,15 +729,16 @@ mod tests {
     #[test]
     fn forward_targets_list_chats_then_the_same_server_then_the_rest() {
         use cord_core::cache::Destination;
-        let dest = |id: u64, name: &str, guild: u64, server: &str| Destination { id: Id(id), name: name.into(), guild: Id(guild), server: server.into() };
+        let dest = |id: u64, name: &str, guild: u64, server: &str| (Destination { id: Id(id), name: name.into(), guild: Id(guild), server: server.into() }, Picture::Initials(server[..1].into()));
         let all = forward_targets(
-            vec![(Id(1), "Ada".into())],
+            vec![(Id(1), "Ada".into(), Picture::Url("https://example.com/ada.png".into()))],
             vec![dest(10, "a", 7, "Other"), dest(11, "b", 8, "Here"), dest(12, "c", 7, "Other"), dest(13, "d", 8, "Here")],
             Some(Id(8)),
         );
         assert_eq!(all.iter().map(|t| t.id.0).collect::<Vec<_>>(), [1, 11, 13, 10, 12]);
         assert_eq!((all[1].label.as_str(), all[1].place.as_deref()), ("#b", Some("Here")));
         assert_eq!(all[0].place, None);
+        assert_eq!(all[1].picture, Picture::Initials("H".into()), "a channel shows its server");
     }
 
     #[test]

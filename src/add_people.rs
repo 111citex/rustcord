@@ -87,7 +87,7 @@ pub fn open(store: Entity<Store>, channel: Id, inside: Vec<Id>, room: usize, win
             }
         });
         let rows = ListState::new(people.len(), ListAlignment::Top, px(300.));
-        let scroller = SmoothScroller::new(ScrollTarget::List(rows.clone())).in_modal();
+        let scroller = SmoothScroller::new(ScrollTarget::List(rows.clone())).owned_by("add-people");
         AddPeople { store, channel, room, people, search, chosen: Vec::new(), rows, scroller, shown_for: String::new(), _watching: vec![typed, escape] }
     });
     cx.set_global(Open(panel));

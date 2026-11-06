@@ -233,9 +233,9 @@ impl ProfileCard {
         static OPENINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let opening = OPENINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let left_scroll = gpui_kit::ScrollHandle::new();
-        let left_scroller = crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(left_scroll.clone())).in_modal();
+        let left_scroller = crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(left_scroll.clone())).owned_by("profile");
         let right_scroll = gpui_kit::ScrollHandle::new();
-        let right_scroller = crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(right_scroll.clone())).in_modal();
+        let right_scroller = crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(right_scroll.clone())).owned_by("profile");
         let card = cx.entity().downgrade();
         cx.set_global(CardWatch { card, notches: 0., last: std::time::Instant::now() });
         ProfileCard { toggled: false, roles_full: Rc::default(), roles_closed: None, closing: None, _closing: None, effect: None, effect_began: Rc::default(), left_scroll, left_scroller, right_scroll, right_scroller, opening, full: false, tab: None, services, user, guild, position, beside, load: cached.map_or(Load::Loading, Load::Loaded), bio_cache: Rc::default(), frame, roles_open: false, focus, _fetch: fetch }

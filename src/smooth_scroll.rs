@@ -271,10 +271,9 @@ pub struct SmoothScroller {
     target: ScrollTarget,
     motion: Arc<Motion>,
     state: Rc<RefCell<State>>,
-    /// Lives inside a full profile, so that being open doesn't silence it.
-    in_modal: bool,
-    /// Lives inside a popout, which takes the wheel from everything else while it's open.
-    in_popout: bool,
+    /// The modal or popout it lives in, which takes the wheel from everything else while
+    /// it's open. `None`: the app itself, under all of them.
+    owner: Option<&'static str>,
     /// A list whose rows do something when hovered: not while it's moving under the pointer.
     calm_hover: bool,
     /// Moves a layer of what's already painted, instead of rebuilding the list to move it.
@@ -320,13 +319,64 @@ const FOLLOW_EVERY: Duration = Duration::from_millis(4);
 type AfterScrolling = (gpui_kit::SharedString, Box<dyn FnOnce(&mut gpui_kit::App)>);
 
 thread_local! {
-    /// A popout like Pinned Messages is open: only its own list scrolls.
-    static POPOUT_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Popouts like Pinned Messages that are open, by owner: only their own lists scroll.
+    static POPOUTS_OPEN: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Says whether a popout is open, each render of whatever shows it.
-pub fn set_popout_open(open: bool) {
-    POPOUT_OPEN.set(open);
+/// Says whether `owner`'s popout is open. Kept per owner, so one closing can't free the
+/// wheel while another is still open.
+pub fn set_popout_open(owner: &'static str, open: bool) {
+    POPOUTS_OPEN.with_borrow_mut(|open_now| note_open(open_now, owner, open));
+}
+
+fn note_open(open_now: &mut Vec<&'static str>, owner: &'static str, open: bool) {
+    let at = open_now.iter().position(|o| *o == owner);
+    match (at, open) {
+        (None, true) => open_now.push(owner),
+        (Some(at), false) => {
+            open_now.remove(at);
+        }
+        _ => {}
+    }
+}
+
+/// Who the wheel belongs to right now, topmost first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelOwner {
+    /// Something with no list of ours is over everything, like the picture viewer.
+    Nobody,
+    /// This modal or popout's lists.
+    Owner(&'static str),
+    /// The app's own lists.
+    App,
+}
+
+/// The modals and popouts that are up, in order from the top: the first takes the wheel.
+fn wheel_owner(cx: &gpui_kit::App) -> WheelOwner {
+    if crate::viewer::is_open(cx) || crate::confirm::is_open(cx) {
+        return WheelOwner::Nobody;
+    }
+    let up = [
+        ("panel", crate::panels::is_open(cx)),
+        ("add-people", crate::add_people::is_open(cx)),
+        ("switcher", crate::switcher::is_open(cx)),
+        ("picker", crate::picker::is_open(cx)),
+        ("profile", crate::profile_card::full_open()),
+    ];
+    if let Some((owner, _)) = up.into_iter().find(|(_, open)| *open) {
+        return WheelOwner::Owner(owner);
+    }
+    POPOUTS_OPEN.with_borrow(|open| open.last().copied()).map_or(WheelOwner::App, WheelOwner::Owner)
+}
+
+/// Whether a list living in `owner` takes the wheel from `top`.
+fn takes_wheel(owner: Option<&'static str>, top: WheelOwner) -> bool {
+    match (top, owner) {
+        (WheelOwner::Nobody, _) => false,
+        (WheelOwner::App, owner) => owner.is_none(),
+        (WheelOwner::Owner(top), Some(owner)) => top == owner,
+        (WheelOwner::Owner(_), None) => false,
+    }
 }
 
 thread_local! {
@@ -356,7 +406,7 @@ pub fn cancel_after_scrolling(id: &gpui_kit::SharedString) {
 
 impl SmoothScroller {
     pub fn new(target: ScrollTarget) -> Self {
-        SmoothScroller { target, motion: Arc::default(), state: Rc::default(), in_modal: false, in_popout: false, calm_hover: false, layer: None }
+        SmoothScroller { target, motion: Arc::default(), state: Rc::default(), owner: None, calm_hover: false, layer: None }
     }
 
     /// Moves the list by moving a layer of what's painted, whenever that gives the same picture
@@ -522,13 +572,10 @@ impl SmoothScroller {
         self
     }
 
-    pub fn in_popout(mut self) -> Self {
-        self.in_popout = true;
-        self
-    }
-
-    pub fn in_modal(mut self) -> Self {
-        self.in_modal = true;
+    /// Lives in the modal or popout `owner`: it scrolls only while that's the topmost one,
+    /// and the app's lists behind keep still meanwhile.
+    pub fn owned_by(mut self, owner: &'static str) -> Self {
+        self.owner = Some(owner);
         self
     }
 
@@ -618,11 +665,8 @@ impl SmoothScroller {
                     if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
                         return;
                     }
-                    // The picture viewer or a full profile is over everything: the wheel is theirs.
-                    if crate::viewer::is_open(cx) || crate::confirm::is_open(cx) || crate::panels::is_open(cx) || ((crate::add_people::is_open(cx) || crate::profile_card::full_open()) && !this.in_modal) {
-                        return;
-                    }
-                    if POPOUT_OPEN.get() != this.in_popout {
+                    // Only the topmost modal or popout scrolls; nothing behind it does.
+                    if !takes_wheel(this.owner, wheel_owner(cx)) {
                         return;
                     }
                     let ScrollDelta::Lines(lines) = event.delta else { return };
@@ -681,6 +725,28 @@ mod tests {
         let settled = clock.period;
         // A missed refresh counts as two.
         assert!((clock.tick(settled * 2.1) - settled * 2.).abs() < settled * 0.01);
+    }
+
+    #[test]
+    fn the_topmost_owner_takes_the_wheel() {
+        assert!(takes_wheel(None, WheelOwner::App));
+        assert!(!takes_wheel(Some("pins"), WheelOwner::App), "a closed popout's list");
+        assert!(takes_wheel(Some("pins"), WheelOwner::Owner("pins")));
+        assert!(!takes_wheel(None, WheelOwner::Owner("pins")), "the chat behind an open popout");
+        assert!(!takes_wheel(Some("pins"), WheelOwner::Owner("picker")), "a popout under another");
+        assert!(!takes_wheel(Some("panel"), WheelOwner::Nobody));
+    }
+
+    #[test]
+    fn popouts_are_kept_per_owner() {
+        let mut open = Vec::new();
+        note_open(&mut open, "pins", true);
+        note_open(&mut open, "pins", true);
+        note_open(&mut open, "other", true);
+        note_open(&mut open, "pins", false);
+        assert_eq!(open, vec!["other"], "pins closing leaves the other open");
+        note_open(&mut open, "pins", false);
+        assert_eq!(open, vec!["other"]);
     }
 
     #[test]

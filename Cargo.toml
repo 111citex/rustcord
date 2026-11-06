@@ -73,3 +73,5 @@ cosmic-text = { path = "vendor/cosmic-text" }
 # One small addition to the input widget; see vendor/gpui-kit/README.md.
 [patch."https://github.com/longbridge/gpui-kit"]
 gpui-base = { path = "vendor/gpui-kit/crates/base" }
+# The FPS readout, counting frames shown rather than presents; see vendor/gpui-kit/README.md.
+gpui-fps = { path = "vendor/gpui-kit/crates/fps" }

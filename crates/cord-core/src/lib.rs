@@ -8,6 +8,7 @@ pub mod cdn;
 mod client;
 pub mod event;
 pub mod gateway;
+pub mod gifs;
 pub mod http;
 pub mod id;
 pub mod poll;

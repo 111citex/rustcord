@@ -15,6 +15,7 @@ mod emoji_card;
 mod font_pages;
 mod image_disk;
 mod places;
+mod picker;
 mod perf;
 mod captcha;
 mod chat_format;

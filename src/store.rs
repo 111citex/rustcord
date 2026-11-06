@@ -1001,6 +1001,11 @@ impl Store {
         .detach();
     }
 
+    /// Says something went wrong, unless it's the session ending (that signs out on its own).
+    pub fn toast_error(&self, title: &'static str, body: String, cx: &mut Context<Self>) {
+        self.toasts.update(cx, |_, cx| cx.emit(Toast::error(title, body)));
+    }
+
     /// A failed action says so; a rejected token signs out on its own.
     fn report(this: gpui_kit::WeakEntity<Self>, result: Result<(), HttpError>, title: &'static str, cx: &mut gpui_kit::AsyncApp) {
         let Err(error) = result else { return };

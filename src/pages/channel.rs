@@ -352,7 +352,7 @@ impl ChannelPage {
                             // Up in an empty box: edit our latest message.
                             let in_box = gpui_kit::Focusable::focus_handle(page.input.read(cx), cx).is_focused(window);
                             // Whatever's on top of the page gets Esc first, and handles it itself.
-                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx) || crate::switcher::is_open(cx)) {
+                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx) || crate::switcher::is_open(cx) || crate::picker::is_open(cx)) {
                                 return;
                             }
                             if key == "up" && in_box && page.editing.is_none() && page.input.read(cx).value().is_empty() && page.pending.is_empty() {
@@ -592,6 +592,51 @@ impl ChannelPage {
                 .child(controls)
                 .into_any_element(),
         )
+    }
+
+    /// Opens the GIF or emoji picker over the message box's button at `at`.
+    fn open_picker(&mut self, tab: crate::picker::Tab, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel else { return };
+        let page = cx.entity().downgrade();
+        let on_pick: crate::picker::OnPick = Rc::new(move |picked, window, cx| {
+            let _ = page.update(cx, |page, cx| page.take_pick(picked, window, cx));
+        });
+        crate::picker::open(self.ctx.services.store.clone(), channel, tab, at, true, on_pick, window, cx);
+    }
+
+    /// What the picker gave: an emoji into the message box where the cursor is, or a GIF sent.
+    fn take_pick(&mut self, picked: crate::picker::Picked, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::picker::Picked;
+        let Some(channel) = self.channel else { return };
+        let token = match picked {
+            Picked::Unicode(emoji) => emoji_token(emoji),
+            Picked::Custom { name, id, animated } => ping_token(self.ctx.services.store.read(cx).cache(), self.guild, ComposerPing::CustomEmoji { name, id, animated }),
+            // As in Discord: a GIF goes at once, as its own message.
+            Picked::Gif(url) => {
+                self.ctx.services.store.update(cx, |store, cx| store.send(channel, url, None, Vec::new(), cx));
+                return;
+            }
+        };
+        self.input.update(cx, |input, cx| {
+            let _ = input.replace_with_token(token, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Add Reaction: the emoji picker, and the pick goes on `message`.
+    fn react_picker(&mut self, message: Id, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel else { return };
+        let store = self.ctx.services.store.clone();
+        let on_pick: crate::picker::OnPick = Rc::new(move |picked, _, cx| {
+            let emoji = match picked {
+                crate::picker::Picked::Unicode(e) => ReactionEmoji { name: Some(e.to_string()), ..Default::default() },
+                crate::picker::Picked::Custom { name, id, animated } => ReactionEmoji { id: Some(id), name: Some(name), animated },
+                crate::picker::Picked::Gif(_) => return,
+            };
+            store.update(cx, |store, cx| store.set_reaction(channel, message, emoji, true, cx));
+        });
+        crate::picker::open(self.ctx.services.store.clone(), channel, crate::picker::Tab::Emoji, at, false, on_pick, window, cx);
     }
 
     /// Opens the pinned messages under `at`, or closes them (`None`, or a second click).
@@ -3006,7 +3051,12 @@ fn hover_actions(
         .when(can_react, |this| {
             this.children(quick)
                 .child(div().mx(u(4.)).w(u(1.)).h(u(20.)).bg(theme.border))
-                .child(button("act-react", IconName::FaceSlightlySmilingPlus, "Add Reaction"))
+                .child(button("act-react", IconName::FaceSlightlySmilingPlus, "Add Reaction").on_click({
+                    let page = page.clone();
+                    move |event, window, cx| {
+                        let _ = page.update(cx, |page, cx| page.react_picker(id, event.position(), window, cx));
+                    }
+                }))
         })
         .when(own, |this| {
             this.child(button("act-edit", IconName::Pencil, "Edit").on_click({
@@ -4305,9 +4355,9 @@ impl Render for ChannelPage {
                                     .child(
                                         div()
                                             .id("animated")
-                                            .tooltip(|window, cx| {
-                                                gpui_kit::component::tooltip::Tooltip::new("GIFs — arrives with the pickers").build(window, cx)
-                                            })
+                                            .cursor_pointer()
+                                            .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Open GIF picker").build(window, cx))
+                                            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| this.open_picker(crate::picker::Tab::Gifs, event.position(), window, cx)))
                                             .mx(u(4.))
                                             .w(u(24.))
                                             .h(u(20.))
@@ -4323,7 +4373,9 @@ impl Render for ChannelPage {
                                             .child("GIF"),
                                     )
                                     .child(tool_button("sticker", IconName::Sticker, "Stickers — arrives with the pickers", cx)))
-                                    .child(tool_button("emoji", IconName::FaceSlightlySmiling, "Emoji — arrives with the pickers", cx))
+                                    .child(tool_button("emoji", IconName::FaceSlightlySmiling, "Select emoji", cx).on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                        this.open_picker(crate::picker::Tab::Emoji, event.position(), window, cx)
+                                    })))
                                     .child(tool_button("apps", IconName::Blocks, "Apps", cx))
                                     .child(div().mx(u(6.)).w(u(1.)).h(u(24.)).bg(border))
                                     .child(

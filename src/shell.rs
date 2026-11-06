@@ -1734,6 +1734,7 @@ impl Render for Shell {
             .children(crate::confirm::overlay(window, cx))
             .children(crate::add_people::overlay(window, cx))
             .children(crate::switcher::overlay(window, cx))
+            .children(crate::picker::overlay(window, cx))
             .children(crate::emoji_card::overlay(cx))
             .children(crate::call_ring::overlay(&self.services.store.clone(), window, cx))
             .when_some(self.info.clone(), |this, monitor| {

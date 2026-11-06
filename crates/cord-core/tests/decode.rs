@@ -282,6 +282,7 @@ fn voice_state_update_decodes_guild_state_and_member() {
     assert_eq!(state.channel_id, None);
     assert!(state.is_deafened());
     assert_eq!(member.unwrap().nick.as_deref(), Some("K"));
-    // A private call has no server: nothing to track.
-    assert!(decode_dispatch("VOICE_STATE_UPDATE", json!({"user_id": "5", "channel_id": "9"})).is_none());
+    // A private call has no server: it comes as a DM or group call's voice state.
+    let private = decode_dispatch("VOICE_STATE_UPDATE", json!({"user_id": "5", "channel_id": "9"}));
+    assert!(matches!(private, Some(CoreEvent::PrivateVoiceState(v)) if v.channel_id == Some(Id(9))));
 }

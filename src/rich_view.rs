@@ -3,6 +3,7 @@
 //! Display only: link buttons and pictures open in the browser, nothing else
 //! reacts.
 
+use cord_core::Id;
 use cord_core::cache::Cache;
 use cord_core::cdn;
 use cord_core::model::{Message, Reaction};
@@ -914,6 +915,65 @@ pub fn call_lasted(message: &Message) -> Option<String> {
     let ended = message.call.as_ref()?.ended_timestamp.as_deref()?;
     let ended = chrono::DateTime::parse_from_rfc3339(ended).ok()?.timestamp_millis();
     Some(call_length((ended - message.id.timestamp_ms() as i64) / 1000))
+}
+
+/// Where a DM or group call stands, for its line in the chat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallNow {
+    /// Still going, and we're not in it.
+    Going,
+    /// Still going, with us in it.
+    InIt,
+    /// Over.
+    Ended,
+}
+
+/// Whose name a call line carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallName {
+    /// Who started it.
+    Caller,
+    /// Someone else in it with us: we started it.
+    Other,
+}
+
+/// A call's line: the words around the name, whose name, and whether it's red (missed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallLine {
+    pub before: &'static str,
+    pub after: String,
+    pub name: CallName,
+    pub missed: bool,
+}
+
+/// What a call's row says, as Discord does: "NAME is calling you." while it rings for us,
+/// "You are currently in a call with NAME." while we're in it, and once it's over either
+/// "You missed a call from NAME" or "NAME started a call that lasted …".
+pub fn call_line(now: CallNow, started_by_me: bool, we_were_in_it: bool, lasted: Option<String>) -> CallLine {
+    let line = |before, after: &str, name, missed| CallLine { before, after: after.to_string(), name, missed };
+    match now {
+        CallNow::InIt => line("You are currently in a call with", ".", if started_by_me { CallName::Other } else { CallName::Caller }, false),
+        CallNow::Going if !started_by_me => line("", " is calling you.", CallName::Caller, false),
+        CallNow::Going => line("", " started a call.", CallName::Caller, false),
+        CallNow::Ended if !started_by_me && !we_were_in_it => {
+            CallLine { before: "You missed a call from", after: lasted.map_or_else(|| ".".to_string(), |lasted| format!(" that lasted {lasted}.")), name: CallName::Caller, missed: true }
+        }
+        CallNow::Ended => CallLine {
+            before: "",
+            after: lasted.map_or_else(|| " started a call.".to_string(), |lasted| format!(" started a call that lasted {lasted}.")),
+            name: CallName::Caller,
+            missed: false,
+        },
+    }
+}
+
+/// Where the call of `message` stands: going while Discord says it's still on (it has no
+/// end yet, and the live call is this one), with us in it if we're connected to it.
+pub fn call_now(message: &Message, live: Option<&cord_core::call::Call>, me: Option<Id>, our_voice: Option<Id>) -> CallNow {
+    let unended = message.call.as_ref().is_some_and(|c| c.ended_timestamp.is_none());
+    let Some(live) = live.filter(|live| unended && live.message_id.is_none_or(|m| m == message.id)) else { return CallNow::Ended };
+    let inside = our_voice == Some(message.channel_id) || me.is_some_and(|me| live.participants().any(|p| p == me));
+    if inside { CallNow::InIt } else { CallNow::Going }
 }
 
 /// A system message, as what comes before and after the person's name.
@@ -1864,6 +1924,39 @@ pub fn reply_line(env: &Env, indent: f32, cx: &App) -> Option<AnyElement> {
 /// previous message.
 pub fn is_reply(message: &Message) -> bool {
     message.kind == KIND_REPLY || message.command_use().is_some()
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::*;
+
+    #[test]
+    fn a_call_reads_by_where_it_stands() {
+        let going = call_line(CallNow::Going, false, false, None);
+        assert_eq!((going.before, going.after.as_str(), going.missed), ("", " is calling you.", false));
+        let inside = call_line(CallNow::InIt, false, true, None);
+        assert_eq!((inside.before, inside.after.as_str(), inside.name), ("You are currently in a call with", ".", CallName::Caller));
+        assert_eq!(call_line(CallNow::InIt, true, true, None).name, CallName::Other, "ours: the name is whoever's with us");
+        let missed = call_line(CallNow::Ended, false, false, Some("a minute".into()));
+        assert_eq!((missed.before, missed.after.as_str(), missed.missed), ("You missed a call from", " that lasted a minute.", true));
+        let joined = call_line(CallNow::Ended, false, true, Some("5 minutes".into()));
+        assert_eq!((joined.after.as_str(), joined.missed), (" started a call that lasted 5 minutes.", false));
+        assert_eq!(call_line(CallNow::Ended, true, false, None).after, " started a call.");
+    }
+
+    #[test]
+    fn a_call_is_going_only_while_discord_says_so() {
+        let me = Id(1);
+        let mut message: Message = serde_json::from_value(serde_json::json!({"id": "50", "channel_id": "9", "type": 3, "content": "", "author": {"id": "2", "username": "caller"}, "call": {"participants": ["2"]}, "timestamp": "2026-11-06T05:54:00+00:00"})).unwrap();
+        let live = cord_core::call::Call { channel_id: Id(9), message_id: Some(Id(50)), ..Default::default() };
+        assert_eq!(call_now(&message, Some(&live), Some(me), None), CallNow::Going);
+        assert_eq!(call_now(&message, Some(&live), Some(me), Some(Id(9))), CallNow::InIt, "connected to it");
+        assert_eq!(call_now(&message, None, Some(me), None), CallNow::Ended, "no live call: it ended unseen");
+        let other = cord_core::call::Call { message_id: Some(Id(60)), ..live.clone() };
+        assert_eq!(call_now(&message, Some(&other), Some(me), None), CallNow::Ended, "a newer call, not this one");
+        message.call.as_mut().unwrap().ended_timestamp = Some("2026-11-06T05:55:00+00:00".into());
+        assert_eq!(call_now(&message, Some(&live), Some(me), None), CallNow::Ended);
+    }
 }
 
 #[cfg(test)]

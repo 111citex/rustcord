@@ -3500,25 +3500,35 @@ fn system_row(
     cache: &Cache,
     shared: &Shared,
     page: &WeakEntity<ChannelPage>,
+    voice: Option<Id>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
     // Ours to them reads the other way round: the name's theirs, either way.
     let me = cache.me().map(|u| u.id);
-    let other = (line.kind == rich_view::SystemKind::FriendAccepted && me == Some(m.message.author.id))
+    let author = cache.user(m.message.author.id).unwrap_or(&m.message.author);
+    let other = (line.kind == rich_view::SystemKind::FriendAccepted && me == Some(author.id))
         .then(|| cache.channel(m.message.channel_id)?.recipient_ids.first().and_then(|id| cache.user(*id)))
         .flatten();
-    let named = other.unwrap_or(&m.message.author);
-    let (before, after) = if other.is_some() { ("You accepted", "'s friend request.".to_string()) } else { (line.before, line.after.clone()) };
-    // Someone else's call we weren't in.
-    let missed = line.kind == rich_view::SystemKind::Call
-        && me != Some(m.message.author.id)
-        && m.message.call.as_ref().is_some_and(|call| !me.is_some_and(|me| call.participants.contains(&me)));
-    let (before, after) = if missed {
-        ("You missed a call from", rich_view::call_lasted(&m.message).map_or_else(|| ".".to_string(), |lasted| format!(" that lasted {lasted}.")))
-    } else {
-        (before, after)
-    };
+    let mut named = other.unwrap_or(author);
+    let (mut before, mut after) = if other.is_some() { ("You accepted", "'s friend request.".to_string()) } else { (line.before, line.after.clone()) };
+    // A call reads by where it stands now: ringing, with us in it, or over.
+    let mut missed = false;
+    if line.kind == rich_view::SystemKind::Call {
+        let channel = m.message.channel_id;
+        let now = rich_view::call_now(&m.message, cache.call(channel), me, voice);
+        let we_were_in_it = me.is_some_and(|me| m.message.call.as_ref().is_some_and(|call| call.participants.contains(&me)));
+        let call = rich_view::call_line(now, me == Some(author.id), we_were_in_it, rich_view::call_lasted(&m.message));
+        if call.name == rich_view::CallName::Other {
+            // Whoever's in it with us, else whoever we called.
+            let live = cache.call(channel).into_iter().flat_map(|c| c.participants().collect::<Vec<_>>());
+            let called = cache.channel(channel).into_iter().flat_map(|c| c.recipient_ids.clone());
+            if let Some(user) = live.chain(called).filter(|id| Some(*id) != me).find_map(|id| cache.user(id)) {
+                named = user;
+            }
+        }
+        (before, after, missed) = (call.before, call.after, call.missed);
+    }
     // The message it points at, to jump to.
     let pinned = (line.kind == rich_view::SystemKind::Pin).then(|| m.message.message_reference.as_ref().and_then(|r| r.message_id)).flatten();
     let by = byline(cache, guild, named);
@@ -4224,6 +4234,8 @@ impl Render for ChannelPage {
                     }
                     let store = store.read(cx);
                     let cache = store.cache();
+                    // The call we're connected to, for the call rows.
+                    let voice = store.voice_status().filter(|v| v.connected).map(|v| v.channel);
                     let Some(messages) = cache.messages(channel_id) else { return div().into_any_element() };
                     if ix == 0 {
                         let muted = cx.theme().muted_foreground;
@@ -4260,7 +4272,7 @@ impl Render for ChannelPage {
                     // Rows keep their gap to the group above as padding: the jump glow leaves it out.
                     let gap_above = !new_day && (notice || (!compact && !stacked));
                     let row = if let Some(line) = &system {
-                        system_row(i, m, line, !new_day, guild, cache, &shared, &page, cx)
+                        system_row(i, m, line, !new_day, guild, cache, &shared, &page, voice, cx)
                     } else if m.message.kind == THREAD_STARTER {
                         threads::starter_row(i, m, !new_day, guild, cache, &shared, &page, cx)
                     } else if let Some(outcome) = rich_view::poll_outcome(&m.message) {

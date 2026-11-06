@@ -115,6 +115,9 @@ pub struct ChannelPage {
     placeholder_named: bool,
     /// The pinned messages popout is open, hanging from this point (the pin button).
     pins_at: Option<Point<Pixels>>,
+    /// Where the pins popout was, while it fades out after closing.
+    pins_leaving: Option<Point<Pixels>>,
+    pins_showing: crate::transition::Showing,
     pins_scroll: gpui_kit::ScrollHandle,
     pins_scroller: SmoothScroller,
     /// The app's message search, which this page shows when it's for here.
@@ -494,6 +497,8 @@ impl ChannelPage {
             new_thread: None,
             forum: None,
             pins_at: None,
+            pins_leaving: None,
+            pins_showing: crate::transition::Showing::new(),
             pins_scroll: pins_scroll.clone(),
             pins_scroller: SmoothScroller::new(ScrollTarget::Handle(pins_scroll)).owned_by("pins"),
             search,
@@ -657,10 +662,36 @@ impl ChannelPage {
 
     /// Opens the pinned messages under `at`, or closes them (`None`, or a second click).
     fn toggle_pins(&mut self, at: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let was = self.pins_at;
         self.pins_at = if self.pins_at.is_some() { None } else { at };
+        match (was, self.pins_at) {
+            (Some(was), None) => self.pins_leave(was, cx),
+            (None, Some(_)) => {
+                self.pins_showing = crate::transition::Showing::new();
+                self.pins_leaving = None;
+            }
+            _ => {}
+        }
         let shown = self.pins_at.and(self.channel);
         self.ctx.services.store.update(cx, |store, cx| store.show_pins(shown, cx));
         cx.notify();
+    }
+
+    /// The pins popout fades out from `was`, then goes.
+    fn pins_leave(&mut self, was: Point<Pixels>, cx: &mut Context<Self>) {
+        self.pins_leaving = Some(was);
+        self.pins_showing.closing = true;
+        let number = self.pins_showing.number;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(crate::transition::POP).await;
+            let _ = this.update(cx, |page, cx| {
+                if page.pins_showing.number == number && page.pins_at.is_none() {
+                    page.pins_leaving = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Discord's pinned messages popout: newest pin first, each with Jump, and Unpin
@@ -746,9 +777,15 @@ impl ChannelPage {
                     .when(self.ctx.services.settings.read(cx).get().smooth_scrolling, |d| d.child(self.pins_scroller.layer()))
                     .child(div().id("pins-list").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.pins_scroll).child(body)),
             );
-        // A click anywhere else closes it, as Discord's popouts do.
+        let showing = self.pins_showing;
+        let panel = crate::transition::pop(div().relative().child(panel), "pins-card", showing);
+        let place = gpui_kit::anchored().anchor(gpui_kit::Anchor::TopRight).position(gpui_kit::point(at.x + gpui_kit::px(16.), at.y + gpui_kit::px(20.))).snap_to_window_with_margin(gpui_kit::px(8.)).child(panel);
+        // A click anywhere else closes it, as Discord's popouts do. On its way out it
+        // takes no clicks.
         gpui_kit::deferred(
-            gpui_kit::anchored().position(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.))).child(
+            gpui_kit::anchored().position(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.))).child(if showing.closing {
+                div().child(place).into_any_element()
+            } else {
                 div()
                     .id("pins-outside")
                     .w(viewport.width)
@@ -756,8 +793,9 @@ impl ChannelPage {
                     .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
                         let _ = page.update(cx, |page, cx| page.toggle_pins(None, cx));
                     })
-                    .child(gpui_kit::anchored().anchor(gpui_kit::Anchor::TopRight).position(gpui_kit::point(at.x + gpui_kit::px(16.), at.y + gpui_kit::px(20.))).snap_to_window_with_margin(gpui_kit::px(8.)).child(panel)),
-            ),
+                    .child(place)
+                    .into_any_element()
+            }),
         )
         .with_priority(3)
         .into_any_element()
@@ -3921,7 +3959,8 @@ impl Render for ChannelPage {
         }
         if let Some(target) = self.channel.and_then(|c| crate::links::take_jump(c, cx)) {
             // Jumping from the pins: they've done their job.
-            if self.pins_at.take().is_some() {
+            if let Some(was) = self.pins_at.take() {
+                self.pins_leave(was, cx);
                 self.ctx.services.store.update(cx, |store, cx| store.show_pins(None, cx));
             }
             self.jump_target = Some((target, 0));
@@ -4768,7 +4807,7 @@ impl Render for ChannelPage {
             .children(self.threads_panel.as_ref().map(|(panel, _)| panel.clone()))
             .children(self.new_thread_dialog(window, cx))
             .when_some(self.confirm_delete, |d, message| d.child(self.delete_dialog(message, window, cx)))
-            .when_some(self.pins_at, |d, at| d.child(self.pins_popout(channel_id, at, window, cx)))
+            .when_some(self.pins_at.or(self.pins_leaving), |d, at| d.child(self.pins_popout(channel_id, at, window, cx)))
             .into_any_element()
     }
 }

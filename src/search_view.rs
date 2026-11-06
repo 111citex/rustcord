@@ -338,7 +338,16 @@ pub fn results(search: &Entity<Search>, store: &Entity<Store>, parsed: Rc<RefCel
                 ),
         )
         .children(unknown)
-        .child(div().id("search-results").flex_1().min_h_0().overflow_y_scroll().track_scroll(&state.scroll).child(body))
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(state.scroller.layer())
+                .child(div().id("search-results").flex_1().min_h_0().overflow_y_scroll().track_scroll(&state.scroll).child(body)),
+        )
         .into_any_element()
 }
 

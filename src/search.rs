@@ -223,6 +223,8 @@ pub struct Search {
     /// Counts searches, so a late answer to an old one is dropped.
     asked: u64,
     pub scroll: gpui_kit::ScrollHandle,
+    /// Glides the results with the wheel.
+    pub scroller: crate::smooth_scroll::SmoothScroller,
     /// What the box's placeholder says now.
     pub placeholder: String,
     _watching: Vec<Subscription>,
@@ -267,7 +269,9 @@ pub fn get(core: &Arc<Core>, window: &mut Window, cx: &mut App) -> Entity<Search
                 cx.notify();
             }
         })];
-        Search { input, core, scope: None, query: Query::default(), unknown: Vec::new(), results: Results::Loading, sort: Sort::Newest, focused: false, asked: 0, scroll: gpui_kit::ScrollHandle::new(), placeholder: "Search".into(), _watching: watching }
+        let scroll = gpui_kit::ScrollHandle::new();
+        let scroller = crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(scroll.clone()));
+        Search { input, core, scope: None, query: Query::default(), unknown: Vec::new(), results: Results::Loading, sort: Sort::Newest, focused: false, asked: 0, scroll, scroller, placeholder: "Search".into(), _watching: watching }
     });
     cx.set_global(Shared(search.clone()));
     search
@@ -315,6 +319,7 @@ impl Search {
         self.asked += 1;
         let (asked, core, query) = (self.asked, self.core.clone(), self.query.clone());
         self.results = Results::Loading;
+        self.scroller.stop();
         self.scroll.set_offset(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)));
         cx.notify();
         cx.spawn(async move |this, cx| {

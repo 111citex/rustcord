@@ -352,7 +352,7 @@ impl ChannelPage {
                             // Up in an empty box: edit our latest message.
                             let in_box = gpui_kit::Focusable::focus_handle(page.input.read(cx), cx).is_focused(window);
                             // Whatever's on top of the page gets Esc first, and handles it itself.
-                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx)) {
+                            if key == "escape" && (page.profile.is_some() || crate::viewer::is_open(cx) || crate::context_menu::is_open(cx) || crate::confirm::is_open(cx) || crate::add_people::is_open(cx) || crate::switcher::is_open(cx)) {
                                 return;
                             }
                             if key == "up" && in_box && page.editing.is_none() && page.input.read(cx).value().is_empty() && page.pending.is_empty() {

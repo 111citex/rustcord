@@ -56,6 +56,7 @@ mod search_view;
 mod settings;
 mod shell;
 mod sidebar;
+mod switcher;
 mod slider;
 mod smooth_scroll;
 mod stickers;
@@ -149,6 +150,7 @@ fn run() -> anyhow::Result<()> {
         font_pages::start();
         cx.bind_keys([
             gpui_kit::KeyBinding::new("ctrl-i", shell::ToggleInfo, None),
+            gpui_kit::KeyBinding::new("ctrl-k", shell::OpenSwitcher, None),
             gpui_kit::KeyBinding::new("ctrl-,", shell::OpenSettings, None),
             gpui_kit::KeyBinding::new("escape", pages::settings::CloseSettings, Some("Settings")),
         ]);

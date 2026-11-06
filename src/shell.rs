@@ -27,7 +27,7 @@ use crate::sidebar::{self, Collapsed};
 use crate::store::{Services, StoreEvent};
 use crate::toasts::{Toast, ToastKind};
 
-gpui_kit::actions!(rustcord, [ToggleInfo, OpenSettings]);
+gpui_kit::actions!(rustcord, [ToggleInfo, OpenSettings, OpenSwitcher]);
 
 pub struct Shell {
     /// The channel column's edge is being dragged.
@@ -1077,8 +1077,12 @@ impl SidePane {
                     .when(in_guild, |this| this.child(div().min_w_0().truncate().child(title.clone())))
                     // Direct Messages: Discord's search pill (the list below has its own heading).
                     .when(!in_guild, |this| {
+                        let (store, here) = (self.services.store.clone(), location.channel);
                         this.child(
                             div()
+                                .id("find-conversation")
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| crate::switcher::toggle(store.clone(), here, window, cx))
                                 .flex_1()
                                 .h(u(28.))
                                 .px(u(8.))
@@ -1660,6 +1664,10 @@ impl Render for Shell {
             .image_cache(self.pictures.clone())
             .on_modifiers_changed(|event: &gpui_kit::ModifiersChangedEvent, _, cx: &mut gpui_kit::App| crate::ui::note_shift(event.modifiers.shift, cx))
             .on_action(cx.listener(|this, _: &ToggleInfo, window, cx| this.toggle_info(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSwitcher, window, cx| {
+                let here = nav::parse_location(this.router.read(cx).current_path()).and_then(|l| l.channel);
+                crate::switcher::toggle(this.services.store.clone(), here, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| navigate(&this.router, "/settings", cx)))
             .size_full()
             .bg(cx.theme().background)
@@ -1725,6 +1733,7 @@ impl Render for Shell {
             .child(self.mouse_side_buttons())
             .children(crate::confirm::overlay(window, cx))
             .children(crate::add_people::overlay(window, cx))
+            .children(crate::switcher::overlay(window, cx))
             .children(crate::emoji_card::overlay(cx))
             .children(crate::call_ring::overlay(&self.services.store.clone(), window, cx))
             .when_some(self.info.clone(), |this, monitor| {

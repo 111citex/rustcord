@@ -685,6 +685,24 @@ impl Store {
         .detach();
     }
 
+    /// Opens (or finds) the DM with `user` and goes to it.
+    pub fn message_user(&mut self, user: Id, cx: &mut Context<Self>) {
+        if let Some(dm) = self.cache.private_channels().into_iter().find(|c| c.kind == cord_core::model::ChannelKind::Dm && c.recipient_ids == [user]) {
+            crate::links::go(format!("/channels/@me/{}", dm.id), cx);
+            return;
+        }
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| match core.open_dm(user).await {
+            Ok(channel) => {
+                let id = channel.id;
+                let _ = this.update(cx, |store, cx| store.add_channel(channel, cx));
+                cx.update(|cx| crate::links::go(format!("/channels/@me/{id}"), cx));
+            }
+            Err(error) => Self::report(this, Err(error), "Couldn't open the conversation", cx),
+        })
+        .detach();
+    }
+
     /// Calls `user`: opens (or finds) the DM with them, starts the call there, and goes to it.
     pub fn call_user(&mut self, user: Id, cx: &mut Context<Self>) {
         let core = self.core.clone();

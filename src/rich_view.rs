@@ -917,6 +917,16 @@ pub fn call_lasted(message: &Message) -> Option<String> {
     Some(call_length((ended - message.id.timestamp_ms() as i64) / 1000))
 }
 
+/// Message types Discord won't let anyone delete: group changes, calls, thread starters and
+/// the like. Its client offers no reactions on these either, and every other type takes them
+/// (boosts, joins, pins, new threads).
+const UNDELETABLE: [u8; 11] = [1, 2, 3, 4, 5, 21, 35, 56, 57, 64, 68];
+
+/// Whether a message of `kind` can be reacted to.
+pub fn takes_reactions(kind: u8) -> bool {
+    !UNDELETABLE.contains(&kind)
+}
+
 /// Where a DM or group call stands, for its line in the chat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallNow {
@@ -1136,7 +1146,7 @@ pub fn poll_outcome_card(env: &Env, outcome: &PollOutcome, cx: &App) -> AnyEleme
 
 /// The row of reaction pills under a message. Clicking one toggles the
 /// viewer's own reaction.
-fn reactions(env: &Env, cx: &App) -> AnyElement {
+pub fn reactions(env: &Env, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let message = env.message.id;
     h_flex()
@@ -1929,6 +1939,16 @@ pub fn is_reply(message: &Message) -> bool {
 #[cfg(test)]
 mod call_tests {
     use super::*;
+
+    #[test]
+    fn boosts_and_joins_take_reactions_and_calls_do_not() {
+        for kind in [0, 6, 7, 8, 9, 10, 11, 18, 19] {
+            assert!(takes_reactions(kind), "{kind}");
+        }
+        for kind in [1, 2, 3, 4, 5, 21] {
+            assert!(!takes_reactions(kind), "{kind}");
+        }
+    }
 
     #[test]
     fn a_call_reads_by_where_it_stands() {

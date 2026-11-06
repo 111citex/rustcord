@@ -1365,7 +1365,7 @@ impl ChannelPage {
             })
             .collect();
         use cord_core::permissions as perms;
-        let can_react = cache.has_permission(channel, perms::ADD_REACTIONS);
+        let can_react = cache.has_permission(channel, perms::ADD_REACTIONS) && rich_view::takes_reactions(message.kind);
         // Nobody moderates a DM or a group, whatever permissions it nominally gives.
         let in_server = cache.channel(channel).is_some_and(|c| c.guild_id.is_some());
         let can_manage = in_server && cache.has_permission(channel, perms::MANAGE_MESSAGES);
@@ -3144,14 +3144,16 @@ fn hover_actions(
     };
     let (channel, id) = (message.channel_id, message.id);
     use cord_core::permissions as perms;
-    let can_react = cache.has_permission(channel, perms::ADD_REACTIONS);
+    let can_react = cache.has_permission(channel, perms::ADD_REACTIONS) && rich_view::takes_reactions(message.kind);
+    // A system line (a boost, a join) has nothing to edit, reply to, pin or thread.
+    let system = rich_view::system_line(message).is_some();
     // Nobody moderates a DM or a group, whatever permissions it nominally gives.
     let in_server = cache.channel(channel).is_some_and(|c| c.guild_id.is_some());
     let can_manage = in_server && cache.has_permission(channel, perms::MANAGE_MESSAGES);
-    let can_pin = !in_server || can_manage || cache.has_permission(channel, perms::PIN_MESSAGES);
-    let can_send = cache.can_send(channel);
+    let can_pin = !system && (!in_server || can_manage || cache.has_permission(channel, perms::PIN_MESSAGES));
+    let can_send = !system && cache.can_send(channel);
     let can_thread = cache.can_start_thread(channel) && message.thread.is_none() && cache.thread(id).is_none() && matches!(message.kind, 0 | 19);
-    let shift = crate::ui::shift_held();
+    let shift = crate::ui::shift_held() && !system;
     let pinned = message.pinned;
     let quick = QUICK_REACTIONS.iter().enumerate().map(|(i, emoji)| {
         let page = page.clone();
@@ -3489,6 +3491,9 @@ fn message_row(
     }
 }
 
+/// Which message the pointer's on, or on its toolbar.
+type HoverCell = Rc<std::cell::Cell<Option<Id>>>;
+
 /// "… just showed up!" and the like: an icon, a sentence with the name in it, the time.
 #[allow(clippy::too_many_arguments)]
 fn system_row(
@@ -3501,6 +3506,7 @@ fn system_row(
     shared: &Shared,
     page: &WeakEntity<ChannelPage>,
     voice: Option<Id>,
+    (hovered, hovered_tools): (&HoverCell, &HoverCell),
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -3546,12 +3552,8 @@ fn system_row(
         rich_view::SystemKind::Thread => (Icon::new(IconName::MessageSquareText), muted),
         rich_view::SystemKind::Call => (Icon::default().path("icons/phone.svg"), Hsla::from(gpui_kit::rgb(if missed { 0xf23f43 } else { 0x23a55a }))),
     };
-    let row = h_flex()
-        .id(("message", ix))
-        .on_mouse_down(gpui_kit::MouseButton::Right, on_row_menu(page, m.message.id))
+    let line_row = h_flex()
         .w_full()
-        .px_4()
-        .py(u(2.))
         .gap_4()
         .items_center()
         .child(div().w(u(AVATAR)).flex_shrink_0().flex().justify_center().text_color(tint).child(icon.size(u(20.))))
@@ -3630,6 +3632,36 @@ fn system_row(
                 })
                 .child(div().text_size(u(12.)).child(time)),
         );
+    // Boosts, joins and the like take reactions, as in Discord: shown under the line, and
+    // added from the toolbar that comes up on hover.
+    let reactable = rich_view::takes_reactions(m.message.kind);
+    let lit = reactable && !crate::smooth_scroll::list_scrolling() && (hovered.get() == Some(m.message.id) || hovered_tools.get() == Some(m.message.id));
+    let reactions = (reactable && !m.message.reactions.is_empty()).then(|| div().pl(u(AVATAR + 16.)).child(rich_view::reactions(&Env { shared, cache, message: &m.message, guild }, cx)));
+    let row = v_flex()
+        .id(("message", ix))
+        .on_mouse_down(gpui_kit::MouseButton::Right, on_row_menu(page, m.message.id))
+        .when(reactable, |d| {
+            d.on_hover({
+                let (page, cell, id) = (page.clone(), hovered.clone(), m.message.id);
+                move |over, _, cx| {
+                    let now = if *over { Some(id) } else if cell.get() == Some(id) { None } else { return };
+                    if cell.get() != now {
+                        cell.set(now);
+                        if !crate::smooth_scroll::list_scrolling() {
+                            let _ = page.update(cx, |_, cx| cx.notify());
+                        }
+                    }
+                }
+            })
+        })
+        .relative()
+        .w_full()
+        .px_4()
+        .py(u(2.))
+        .when(lit, |d| d.bg(theme.secondary))
+        .child(line_row)
+        .children(reactions)
+        .when(lit, |d| d.child(hover_actions(ix, false, cache, &m.message, by.name.clone(), page, hovered_tools, cx)));
     if margin {
         div().w_full().pt(u(17.)).child(row).into_any_element()
     } else {
@@ -4272,7 +4304,7 @@ impl Render for ChannelPage {
                     // Rows keep their gap to the group above as padding: the jump glow leaves it out.
                     let gap_above = !new_day && (notice || (!compact && !stacked));
                     let row = if let Some(line) = &system {
-                        system_row(i, m, line, !new_day, guild, cache, &shared, &page, voice, cx)
+                        system_row(i, m, line, !new_day, guild, cache, &shared, &page, voice, (&hovered_row, &hovered_tools), cx)
                     } else if m.message.kind == THREAD_STARTER {
                         threads::starter_row(i, m, !new_day, guild, cache, &shared, &page, cx)
                     } else if let Some(outcome) = rich_view::poll_outcome(&m.message) {

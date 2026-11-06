@@ -1150,6 +1150,54 @@ impl Store {
         .detach();
     }
 
+    /// Mute Channel and Mute Thread: shown at once, then told to Discord. `seconds` `None`
+    /// is until it's undone; `mute` false unmutes.
+    pub fn mute_channel(&mut self, channel: Id, mute: bool, seconds: Option<i64>, cx: &mut Context<Self>) {
+        let guild = self.cache.channel(channel).and_then(|c| c.guild_id);
+        let ends = cord_core::notify::mute_ends(seconds, chrono::Utc::now().timestamp_millis());
+        self.cache.set_channel_mute(channel, mute.then_some(ends));
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.mute_channel(guild, channel, mute, seconds).await;
+            Self::report(this, result, "Couldn't change the mute", cx);
+        })
+        .detach();
+    }
+
+    /// Notification Settings for a channel: shown at once, then told to Discord.
+    pub fn set_channel_notifications(&mut self, channel: Id, level: cord_core::model::Notify, cx: &mut Context<Self>) {
+        let guild = self.cache.channel(channel).and_then(|c| c.guild_id);
+        self.cache.set_notify(channel, level);
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_channel_notifications(guild, channel, level).await;
+            Self::report(this, result, "Couldn't change the notifications", cx);
+        })
+        .detach();
+    }
+
+    /// Deletes a channel or thread; the gateway's CHANNEL_DELETE takes it off the list.
+    pub fn delete_channel(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.delete_channel(channel).await;
+            Self::report(this, result, "Couldn't delete the channel", cx);
+        })
+        .detach();
+    }
+
+    /// Close Thread and Lock Thread; the gateway's THREAD_UPDATE shows the change.
+    pub fn set_thread_state(&mut self, thread: Id, change: cord_core::notify::ThreadChange, cx: &mut Context<Self>) {
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_thread_state(thread, change).await;
+            Self::report(this, result, "Couldn't change the thread", cx);
+        })
+        .detach();
+    }
+
     pub fn rename_group(&mut self, channel: Id, name: String, cx: &mut Context<Self>) {
         let core = self.core.clone();
         cx.spawn(async move |this, cx| {

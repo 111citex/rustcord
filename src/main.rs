@@ -9,6 +9,7 @@ static ALLOCATOR: perf::CountingAlloc = perf::CountingAlloc;
 mod animated;
 mod add_people;
 mod call_ring;
+mod channel_menu;
 mod confirm;
 mod decorations;
 mod panels;

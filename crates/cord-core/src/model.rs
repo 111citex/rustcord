@@ -1039,8 +1039,41 @@ pub struct GuildSettings {
     pub muted: bool,
     #[serde(default)]
     pub mute_config: Option<MuteConfig>,
+    /// The server's notifications for us, as [`Notify`] numbers.
+    #[serde(default)]
+    pub message_notifications: Option<u8>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub channel_overrides: Vec<ChannelOverride>,
+}
+
+/// Which messages notify, as Discord numbers them in notification settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notify {
+    All,
+    Mentions,
+    Nothing,
+    /// Whatever the category or the server says.
+    Inherit,
+}
+
+impl Notify {
+    pub fn from_number(n: u8) -> Notify {
+        match n {
+            0 => Notify::All,
+            1 => Notify::Mentions,
+            2 => Notify::Nothing,
+            _ => Notify::Inherit,
+        }
+    }
+
+    pub fn number(self) -> u8 {
+        match self {
+            Notify::All => 0,
+            Notify::Mentions => 1,
+            Notify::Nothing => 2,
+            Notify::Inherit => 3,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -1050,6 +1083,9 @@ pub struct ChannelOverride {
     pub muted: bool,
     #[serde(default)]
     pub mute_config: Option<MuteConfig>,
+    /// The channel's own notifications, as [`Notify`] numbers.
+    #[serde(default)]
+    pub message_notifications: Option<u8>,
 }
 
 /// How long a mute lasts. Discord leaves `muted` set after it's over: only the end says so.

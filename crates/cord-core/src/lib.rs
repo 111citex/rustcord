@@ -17,6 +17,7 @@ pub mod identity;
 pub mod invite;
 pub mod member_list;
 pub mod model;
+pub mod notify;
 pub mod paths;
 pub mod permissions;
 pub mod profile;

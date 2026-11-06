@@ -860,6 +860,57 @@ impl Core {
         self.watch(result)
     }
 
+    /// Mutes a channel for `seconds` (`None`: until undone), or unmutes it (`mute` false),
+    /// in its server's settings (`guild` `None`: a DM's). The body is Discord client's.
+    pub async fn mute_channel(&self, guild: Option<Id>, channel: Id, mute: bool, seconds: Option<i64>) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let body = json!({ "channel_overrides": { channel.to_string(): crate::notify::mute_body(mute, seconds, chrono::Utc::now()) } });
+                let _: Value = http.patch(&crate::notify::settings_path(guild), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Sets what notifies in a channel of `guild`.
+    pub async fn set_channel_notifications(&self, guild: Option<Id>, channel: Id, level: crate::model::Notify) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let body = json!({ "channel_overrides": { channel.to_string(): { "message_notifications": level.number() } } });
+                let _: Value = http.patch(&crate::notify::settings_path(guild), &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Deletes a channel or a thread for good.
+    pub async fn delete_channel(&self, channel: Id) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.delete(&format!("/channels/{channel}")).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
+    /// Closes (archives) or locks a thread, or undoes either.
+    pub async fn set_thread_state(&self, thread: Id, change: crate::notify::ThreadChange) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let _: Value = http.patch(&format!("/channels/{thread}"), &change.body()).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
     /// Renames a group chat; empty goes back to naming it by who's in it.
     pub async fn rename_group(&self, channel: Id, name: String) -> Result<(), HttpError> {
         let http = self.http.clone();

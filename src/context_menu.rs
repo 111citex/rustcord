@@ -2,15 +2,16 @@
 //! is up to whoever opens it; entries with no action yet are shown dimmed so
 //! the menu keeps Discord's shape without pretending they work.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, FontWeight, Global, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
-    SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div,
+    AnyElement, App, Bounds, ClipboardItem, FontWeight, Global, InteractiveElement, IntoElement, ParentElement, Pixels, Point,
+    SharedString, StatefulInteractiveElement, Styled, Window, anchored, canvas, deferred, div, point, px,
 };
 
 use crate::ui::u;
@@ -18,7 +19,9 @@ use crate::ui::u;
 pub type Action = Rc<dyn Fn(&mut Window, &mut App)>;
 
 pub enum Entry {
-    Item { label: SharedString, icon: Option<IconName>, picture: Option<&'static str>, danger: bool, action: Option<Action>, hint: Option<&'static str> },
+    Item { label: SharedString, icon: Option<IconName>, picture: Option<&'static str>, danger: bool, action: Option<Action>, hint: Option<SharedString> },
+    /// Opens more entries beside it while the pointer's on it, as Mute Channel does.
+    Submenu { label: SharedString, hint: Option<SharedString>, entries: Rc<Vec<Entry>> },
     Separator,
     /// Drags from silent to double, staying open.
     Slider { label: SharedString, value: Rc<Cell<f32>>, set: Rc<dyn Fn(f32, &mut App)> },
@@ -47,6 +50,12 @@ impl Entry {
         Entry::Item { label: label.into(), icon: None, picture: None, danger: false, action: None, hint: None }
     }
 
+    /// A row opening `entries` beside it.
+    pub fn submenu(label: impl Into<SharedString>, mut entries: Vec<Entry>) -> Self {
+        tidy(&mut entries);
+        Entry::Submenu { label: label.into(), hint: None, entries: Rc::new(entries) }
+    }
+
     pub fn copy(label: impl Into<SharedString>, text: String) -> Self {
         Self::item(label, move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
     }
@@ -67,9 +76,9 @@ impl Entry {
     }
 
     /// A line in small type under the label.
-    pub fn hint(mut self, text: &'static str) -> Self {
-        if let Entry::Item { hint, .. } = &mut self {
-            *hint = Some(text);
+    pub fn hint(mut self, text: impl Into<SharedString>) -> Self {
+        if let Entry::Item { hint, .. } | Entry::Submenu { hint, .. } = &mut self {
+            *hint = Some(text.into());
         }
         self
     }
@@ -85,6 +94,11 @@ impl Entry {
 struct Open {
     position: Point<Pixels>,
     entries: Rc<Vec<Entry>>,
+    /// The submenu row last pointed at, whose entries show beside it.
+    sub: Rc<Cell<Option<usize>>>,
+    /// Where each submenu row was painted, and where its open submenu is.
+    spots: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    sub_spot: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl Global for Open {}
@@ -108,7 +122,7 @@ fn tidy(entries: &mut Vec<Entry>) {
 
 pub fn show(position: Point<Pixels>, mut entries: Vec<Entry>, cx: &mut App) {
     tidy(&mut entries);
-    cx.set_global(Open { position, entries: Rc::new(entries) });
+    cx.set_global(Open { position, entries: Rc::new(entries), sub: Rc::default(), spots: Rc::default(), sub_spot: Rc::default() });
     cx.refresh_windows();
 }
 
@@ -136,12 +150,27 @@ pub fn is_open(cx: &App) -> bool {
     cx.has_global::<Open>()
 }
 
-/// The open menu, or nothing.
-pub fn overlay(cx: &App) -> Option<AnyElement> {
-    let open = cx.try_global::<Open>()?;
+/// Notes where `spot`'s element is each time it's painted. Takes up no room.
+fn note_spot(spot: impl Fn(Bounds<Pixels>) + 'static) -> impl IntoElement {
+    canvas(move |bounds, _, _| spot(bounds), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
+}
+
+/// What sits under the pointer's arrival on a row: `Some` for a submenu row, opening it.
+type OnRow = Option<Rc<dyn Fn(Option<usize>, &mut App)>>;
+
+/// The rows of `entries`, their ids from `base`. `on_row` hears which row the pointer's on.
+fn entry_rows(entries: &[Entry], base: usize, on_row: OnRow, spots: &Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>, cx: &App) -> Vec<AnyElement> {
     let theme = cx.theme();
     let (fg, muted, danger, hover) = (theme.popover_foreground, theme.muted_foreground, theme.danger, theme.foreground.opacity(0.08));
-    let rows = open.entries.iter().enumerate().map(|(i, entry)| match entry {
+    let pointed = |i: usize, opens: bool| {
+        let on_row = on_row.clone();
+        move |over: &bool, _: &mut Window, cx: &mut App| {
+            if let (true, Some(on_row)) = (*over, on_row.as_ref()) {
+                on_row(opens.then_some(i), cx);
+            }
+        }
+    };
+    entries.iter().enumerate().map(|(i, entry)| { let i = base + i; match entry {
         Entry::Separator => div().mx(u(8.)).my(u(4.)).h(u(1.)).bg(theme.border).into_any_element(),
         Entry::Slider { label, value, set } => {
             let level = value.get();
@@ -223,12 +252,43 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
                     .child(crate::badges::emoji_image(emoji, 24.))
             }))
             .into_any_element(),
+        Entry::Submenu { label, hint, entries: _ } => {
+            let spots = spots.clone();
+            h_flex()
+                .id(("menu-sub", i))
+                .relative()
+                .when(hint.is_none(), |d| d.h(u(32.)))
+                .when(hint.is_some(), |d| d.min_h(u(32.)).py(u(4.)))
+                .px(u(8.))
+                .gap(u(8.))
+                .items_center()
+                .rounded(u(4.))
+                .text_size(u(14.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(fg)
+                .cursor_pointer()
+                .hover(move |d| d.bg(hover))
+                .on_hover(pointed(i, true))
+                .child(note_spot(move |bounds| {
+                    spots.borrow_mut().insert(i, bounds);
+                }))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().child(label.clone()))
+                        .children(hint.clone().map(|hint| div().truncate().text_size(u(12.)).font_weight(FontWeight::NORMAL).text_color(muted).child(hint))),
+                )
+                .child(Icon::new(IconName::ChevronRight).size(u(16.)).flex_shrink_0().text_color(muted))
+                .into_any_element()
+        }
         Entry::Item { label, icon, picture, danger: red, action, hint } => {
             let enabled = action.is_some();
             let action = action.clone();
             let color = if *red { danger } else { fg };
             h_flex()
                 .id(("menu-item", i))
+                .on_hover(pointed(i, false))
                 .when(hint.is_none(), |d| d.h(u(32.)))
                 .when(hint.is_some(), |d| d.min_h(u(32.)).py(u(4.)))
                 .px(u(8.))
@@ -252,28 +312,58 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
                         .flex_1()
                         .min_w_0()
                         .child(div().truncate().child(label.clone()))
-                        .child(div().truncate().text_size(u(12.)).font_weight(FontWeight::NORMAL).text_color(muted).child(*hint))
+                        .child(div().truncate().text_size(u(12.)).font_weight(FontWeight::NORMAL).text_color(muted).child(hint.clone()))
                         .into_any_element(),
                     None => div().flex_1().min_w_0().truncate().child(label.clone()).into_any_element(),
                 })
                 .into_any_element()
         }
-    });
-    let menu = v_flex()
-        .id("context-menu")
-        .occlude()
-        .w(u(220.))
-        .p(u(8.))
-        .rounded(u(8.))
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.popover)
-        .shadow_lg()
-        .on_mouse_down_out(|_, _, cx| close(cx))
+    }})
+    .collect()
+}
+
+/// Where a submenu opens for a row at `row`: just right of it, its first entry level with it.
+fn submenu_at(row: Bounds<Pixels>) -> Point<Pixels> {
+    point(row.right() + px(12.), row.top() - px(8.))
+}
+
+/// The open menu, or nothing.
+pub fn overlay(cx: &App) -> Option<AnyElement> {
+    let open = cx.try_global::<Open>()?;
+    let theme = cx.theme();
+    let sub = open.sub.clone();
+    // Pointing at a row opens its submenu, or shuts the one open.
+    let on_row: OnRow = Some(Rc::new(move |row: Option<usize>, cx: &mut App| {
+        if sub.get() != row {
+            sub.set(row);
+            crate::ui::redraw_shell(cx);
+        }
+    }));
+    let rows = entry_rows(&open.entries, 0, on_row, &open.spots, cx);
+    let panel = |id: &'static str| v_flex().id(id).occlude().w(u(220.)).p(u(8.)).rounded(u(8.)).border_1().border_color(theme.border).bg(theme.popover).shadow_lg();
+    let sub_spot = open.sub_spot.clone();
+    let menu = panel("context-menu")
+        .on_mouse_down_out(move |event, _, cx| {
+            // A click in the submenu is still in the menu.
+            if !sub_spot.get().is_some_and(|b| b.contains(&event.position)) {
+                close(cx);
+            }
+        })
         .children(rows);
+    let submenu = open.sub.get().and_then(|i| {
+        let Entry::Submenu { entries, .. } = open.entries.get(i)? else { return None };
+        let row = *open.spots.borrow().get(&i)?;
+        let spot = open.sub_spot.clone();
+        let list = panel("context-submenu").relative().child(note_spot(move |bounds| spot.set(Some(bounds)))).children(entry_rows(entries, 1000, None, &open.spots, cx));
+        Some(deferred(anchored().position(submenu_at(row)).snap_to_window_with_margin(px(8.)).child(list)).with_priority(3))
+    });
+    if submenu.is_none() {
+        open.sub_spot.set(None);
+    }
     Some(
-        deferred(anchored().position(open.position).snap_to_window_with_margin(gpui_kit::px(8.)).child(menu))
-            .with_priority(2)
+        div()
+            .child(deferred(anchored().position(open.position).snap_to_window_with_margin(px(8.)).child(menu)).with_priority(2))
+            .children(submenu)
             .into_any_element(),
     )
 }
@@ -281,6 +371,15 @@ pub fn overlay(cx: &App) -> Option<AnyElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_submenu_opens_beside_its_row() {
+        let row = Bounds { origin: point(px(100.), px(50.)), size: gpui_kit::size(px(204.), px(32.)) };
+        assert_eq!(submenu_at(row), point(px(316.), px(42.)));
+        let Entry::Submenu { entries, hint, .. } = Entry::submenu("Mute", vec![Entry::Separator, Entry::later("a")]).hint("Muted") else { panic!() };
+        assert_eq!(entries.len(), 1, "tidied like the menu");
+        assert_eq!(hint.as_ref().map(|h| h.as_ref()), Some("Muted"));
+    }
 
     #[test]
     fn separators_only_stand_between_entries() {

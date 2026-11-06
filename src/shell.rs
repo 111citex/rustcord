@@ -638,6 +638,7 @@ impl SidePane {
                         .on_click(move |_, _, cx| store.update(cx, |store, cx| store.join_voice(Some(guild), id, cx)))
                 })
                 .when(voice && !can_join, |this| this.opacity(0.6))
+                .on_mouse_down(gpui_kit::MouseButton::Right, channel_menu_opener(&self.services.store, channel.id))
                 .group(group)
                 .relative()
                 .h(u(row_height))
@@ -710,6 +711,7 @@ impl SidePane {
         let thread_row = |t: &sidebar::ChannelRow| {
             let active = location.channel == Some(t.id);
             row_shell(SharedString::from(format!("thread-{}", t.id)), active, true, t.path.clone())
+                .on_mouse_down(gpui_kit::MouseButton::Right, channel_menu_opener(&self.services.store, t.id))
                 .h(u(32.))
                 .mb(u(3.5))
                 .pl(u(30.))
@@ -1976,6 +1978,18 @@ fn voice_person_menu(services: &Services, router: &Entity<Router>, guild: cord_c
     entries.push(Entry::Separator);
     entries.push(Entry::copy("Copy User ID", user.to_string()).icon(IconName::Copy));
     menu::show(position, entries, cx);
+}
+
+/// Right click on a channel or thread in the list: its menu.
+fn channel_menu_opener(store: &gpui_kit::Entity<crate::store::Store>, id: cord_core::Id) -> impl Fn(&gpui_kit::MouseDownEvent, &mut Window, &mut gpui_kit::App) + 'static {
+    let store = store.clone();
+    move |event, _, cx| {
+        cx.stop_propagation();
+        let entries = crate::channel_menu::entries(&store, id, cx);
+        if !entries.is_empty() {
+            crate::context_menu::show(event.position, entries, cx);
+        }
+    }
 }
 
 fn dm_menu(

@@ -174,6 +174,9 @@ pub struct Cache {
     /// What's muted and when that ends (`None`: when it's undone).
     muted_guilds: std::collections::HashMap<Id, Option<i64>>,
     muted_channels: std::collections::HashMap<Id, Option<i64>>,
+    /// Our notification settings: per server, and per channel where set.
+    notify_guilds: HashMap<Id, crate::model::Notify>,
+    notify_channels: HashMap<Id, crate::model::Notify>,
     /// The server rail's folders, in order (see `settings_proto`).
     folders: Vec<GuildFolder>,
     /// Voice channels' status text and when they started, ms since 1970.
@@ -292,6 +295,71 @@ impl Cache {
         if was.last != last || was.mentions != 0 {
             self.read.insert(channel, ReadMark { last, mentions: 0 });
             self.bump_sidebar();
+        }
+    }
+
+    /// Takes in our settings for one server (or our DMs): what's muted, until when, and what
+    /// notifies. Settings sent whole replace what we had for that server's channels.
+    fn apply_guild_settings(&mut self, g: crate::model::GuildSettings) {
+        use crate::model::{MuteConfig, Notify};
+        if let Some(guild) = g.guild_id {
+            if g.muted {
+                self.muted_guilds.insert(guild, MuteConfig::ends_at(g.mute_config.as_ref()));
+            } else {
+                self.muted_guilds.remove(&guild);
+            }
+            match g.message_notifications.map(Notify::from_number) {
+                Some(level) => self.notify_guilds.insert(guild, level),
+                None => self.notify_guilds.remove(&guild),
+            };
+        }
+        for o in g.channel_overrides {
+            if o.muted {
+                self.muted_channels.insert(o.channel_id, MuteConfig::ends_at(o.mute_config.as_ref()));
+            } else {
+                self.muted_channels.remove(&o.channel_id);
+            }
+            match o.message_notifications.map(Notify::from_number).filter(|n| *n != Notify::Inherit) {
+                Some(level) => self.notify_channels.insert(o.channel_id, level),
+                None => self.notify_channels.remove(&o.channel_id),
+            };
+        }
+    }
+
+    /// Mutes `channel` until `until` (ms since 1970; `None`: until it's undone), or unmutes it.
+    pub fn set_channel_mute(&mut self, channel: Id, mute: Option<Option<i64>>) {
+        match mute {
+            Some(until) => self.muted_channels.insert(channel, until),
+            None => self.muted_channels.remove(&channel),
+        };
+        self.bump_sidebar();
+    }
+
+    /// When `channel`'s own mute ends: `Some(None)` muted until undone, `None` not muted.
+    pub fn channel_muted_until(&self, channel: Id) -> Option<Option<i64>> {
+        still_muted(&self.muted_channels, channel).then(|| self.muted_channels.get(&channel).copied().flatten())
+    }
+
+    /// What notifies in `channel`: its own setting, else (a thread's) its parent's, else
+    /// the server's, else inherited from what we don't know.
+    pub fn notify_level(&self, channel: Id) -> crate::model::Notify {
+        use crate::model::Notify;
+        let place = self.channels.get(&channel);
+        let parent = place.and_then(|c| c.parent_id);
+        [Some(channel), parent]
+            .into_iter()
+            .flatten()
+            .find_map(|c| self.notify_channels.get(&c).copied())
+            .or_else(|| place.and_then(|c| c.guild_id).and_then(|g| self.notify_guilds.get(&g).copied()))
+            .unwrap_or(Notify::Inherit)
+    }
+
+    /// `channel`'s own notification setting, as chosen here.
+    pub fn set_notify(&mut self, channel: Id, level: crate::model::Notify) {
+        if level == crate::model::Notify::Inherit {
+            self.notify_channels.remove(&channel);
+        } else {
+            self.notify_channels.insert(channel, level);
         }
     }
 
@@ -1364,10 +1432,7 @@ impl Cache {
                     self.read.insert(r.id, ReadMark { last: r.last_message_id, mentions: r.mention_count });
                 }
                 for g in ready.user_guild_settings.entries {
-                    if let (Some(guild), true) = (g.guild_id, g.muted) {
-                        self.muted_guilds.insert(guild, crate::model::MuteConfig::ends_at(g.mute_config.as_ref()));
-                    }
-                    self.muted_channels.extend(g.channel_overrides.iter().filter(|o| o.muted).map(|o| (o.channel_id, crate::model::MuteConfig::ends_at(o.mute_config.as_ref()))));
+                    self.apply_guild_settings(g);
                 }
                 self.set_own_presence(&ready.sessions);
                 self.friends_since = ready.relationships.iter().filter(|r| r.kind == 1).filter_map(|r| Some((r.id, r.since.clone()?))).collect();
@@ -1454,6 +1519,10 @@ impl Cache {
             }
             CoreEvent::ChannelDelete { id } => {
                 self.remove_channel(id);
+                self.bump_sidebar();
+            }
+            CoreEvent::GuildSettingsUpdate(settings) => {
+                self.apply_guild_settings(settings);
                 self.bump_sidebar();
             }
             event @ (CoreEvent::ThreadUpsert { .. }
@@ -3010,5 +3079,33 @@ mod tests {
         assert_eq!(ids(&c, 20), [6]);
         c.apply(CoreEvent::GuildDelete { id: Id(301) });
         assert!(ids(&c, 20).is_empty());
+    }
+
+    #[test]
+    fn settings_updates_mute_unmute_and_say_what_notifies() {
+        use crate::model::{GuildSettings, Notify};
+        let mut c = Cache::default();
+        let settings: GuildSettings = serde_json::from_value(serde_json::json!({
+            "guild_id": "300",
+            "muted": false,
+            "message_notifications": 1,
+            "channel_overrides": [
+                {"channel_id": "31", "muted": true, "mute_config": {"end_time": null}, "message_notifications": 0},
+                {"channel_id": "32", "muted": false, "message_notifications": 3}
+            ]
+        }))
+        .unwrap();
+        c.apply(CoreEvent::GuildSettingsUpdate(settings));
+        assert_eq!(c.channel_muted_until(Id(31)), Some(None));
+        assert_eq!(c.notify_level(Id(31)), Notify::All);
+        assert_eq!(c.notify_level(Id(32)), Notify::Inherit, "unknown channel, so no server to fall back on");
+        let unmuted: GuildSettings = serde_json::from_value(serde_json::json!({"guild_id": "300", "channel_overrides": [{"channel_id": "31", "muted": false}]})).unwrap();
+        c.apply(CoreEvent::GuildSettingsUpdate(unmuted));
+        assert_eq!(c.channel_muted_until(Id(31)), None);
+        assert_eq!(c.notify_level(Id(31)), Notify::Inherit);
+        c.set_channel_mute(Id(33), Some(Some(i64::MAX)));
+        assert_eq!(c.channel_muted_until(Id(33)), Some(Some(i64::MAX)));
+        c.set_channel_mute(Id(33), Some(Some(0)));
+        assert_eq!(c.channel_muted_until(Id(33)), None, "a mute that's over");
     }
 }

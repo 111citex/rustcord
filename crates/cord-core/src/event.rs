@@ -61,6 +61,8 @@ pub enum CoreEvent {
     ReactionRemoveEmoji { channel_id: Id, message_id: Id, emoji: ReactionEmoji },
     ChannelUpsert(Channel),
     ChannelDelete { id: Id },
+    /// Our notification settings for a server (or our DMs) changed, here or elsewhere.
+    GuildSettingsUpdate(crate::model::GuildSettings),
     /// A thread appeared (`created`: just made) or changed (renamed, archived, locked...).
     ThreadUpsert { thread: Channel, created: bool },
     ThreadDelete { id: Id },
@@ -527,6 +529,7 @@ pub fn decode_dispatch(t: &str, d: Value) -> Option<CoreEvent> {
         "MESSAGE_ACK" => from_value::<AckEvent>(d)
             .map(|a| CoreEvent::MessageAck { channel_id: a.channel_id, message_id: a.message_id }),
         "CHANNEL_CREATE" | "CHANNEL_UPDATE" => from_value(d).map(CoreEvent::ChannelUpsert),
+        "USER_GUILD_SETTINGS_UPDATE" => from_value(d).map(CoreEvent::GuildSettingsUpdate),
         "CHANNEL_DELETE" => from_value::<ById>(d).map(|b| CoreEvent::ChannelDelete { id: b.id }),
         "THREAD_CREATE" => {
             let created = d["newly_created"].as_bool().unwrap_or(false);

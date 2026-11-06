@@ -16,7 +16,9 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, anchored, deferred, div, point, px,
 };
 
+use crate::smooth_scroll::{ScrollTarget, SmoothScroller};
 use crate::store::Store;
+use crate::transition::Showing;
 use crate::ui::u;
 
 /// Where a row goes.
@@ -47,6 +49,8 @@ struct Item {
     mentions: u32,
     /// The heading it sits under, when the box is empty.
     section: &'static str,
+    /// A server's channel: the server's picture, ahead of the channel's sign.
+    server: Option<crate::panels::Picture>,
 }
 
 /// What a leading `@`, `#`, `!` or `*` narrows the search to.
@@ -113,6 +117,7 @@ fn private_item(cache: &Cache, channel: &cord_core::model::Channel, section: &'s
         look: if group { Look::Group } else { Look::Person },
         mentions: cache.mentions(channel.id),
         section,
+        server: None,
     }
 }
 
@@ -128,6 +133,7 @@ fn channel_item(cache: &Cache, channel: Id, section: &'static str) -> Option<Ite
         look: if matches!(place.kind, ChannelKind::Voice | ChannelKind::Stage) { Look::Voice } else { Look::Text },
         mentions: cache.mentions(channel),
         section,
+        server: Some(crate::panels::Picture::of_server(server)),
     })
 }
 
@@ -197,12 +203,13 @@ fn matches(cache: &Cache, query: &str, recent: &[Id]) -> Vec<Item> {
             look: Look::Person,
             mentions: 0,
             section: "",
+            server: None,
         };
         add(item, &[&cache.display_name(None, user).to_string(), &user.username]);
     }
     for guild in cache.guilds() {
         let icon = guild.icon.as_ref().map(|hash| format!("{}/icons/{}/{hash}.png?size=64", cord_core::cdn::CDN, guild.id));
-        add(Item { target: Target::Guild(guild.id), label: guild.name.clone(), detail: "Server".into(), picture: icon, look: Look::Server, mentions: cache.guild_mentions(guild.id), section: "" }, &[&guild.name]);
+        add(Item { target: Target::Guild(guild.id), label: guild.name.clone(), detail: "Server".into(), picture: icon, look: Look::Server, mentions: cache.guild_mentions(guild.id), section: "", server: None }, &[&guild.name]);
         if mode == Narrow::Servers || mode == Narrow::People {
             continue;
         }
@@ -229,22 +236,21 @@ pub struct Switcher {
     /// What the list was last built for.
     built_for: Option<String>,
     scroll: ScrollHandle,
+    scroller: SmoothScroller,
     here: Option<Id>,
     _watching: Vec<Subscription>,
 }
 
-struct Open(Entity<Switcher>);
+struct Open(Entity<Switcher>, Showing);
 impl Global for Open {}
 
+/// Open, and not on its way out.
 pub fn is_open(cx: &App) -> bool {
-    cx.has_global::<Open>()
+    cx.try_global::<Open>().is_some_and(|open| !open.1.closing)
 }
 
 pub fn close(cx: &mut App) {
-    if is_open(cx) {
-        cx.remove_global::<Open>();
-        cx.refresh_windows();
-    }
+    crate::transition::leave::<Open>(cx, |open| &mut open.1);
 }
 
 /// Opens it, or closes it if it's open: Ctrl+K toggles, as in Discord.
@@ -261,7 +267,7 @@ pub fn toggle(store: Entity<Store>, here: Option<Id>, window: &mut Window, cx: &
             _ => cx.notify(),
         });
         let keys = cx.intercept_keystrokes(|event, _, cx| {
-            let Some(open) = cx.try_global::<Open>().map(|o| o.0.clone()) else { return };
+            let Some(open) = cx.try_global::<Open>().filter(|o| !o.1.closing).map(|o| o.0.clone()) else { return };
             let key = event.keystroke.key.as_str();
             match key {
                 "escape" => close(cx),
@@ -271,9 +277,11 @@ pub fn toggle(store: Entity<Store>, here: Option<Id>, window: &mut Window, cx: &
             }
             cx.stop_propagation();
         });
-        Switcher { store, input, items: Vec::new(), selected: 0, built_for: None, scroll: ScrollHandle::new(), here, _watching: vec![typed, keys] }
+        let scroll = ScrollHandle::new();
+        let scroller = SmoothScroller::new(ScrollTarget::Handle(scroll.clone())).owned_by("switcher");
+        Switcher { store, input, items: Vec::new(), selected: 0, built_for: None, scroll, scroller, here, _watching: vec![typed, keys] }
     });
-    cx.set_global(Open(switcher));
+    cx.set_global(Open(switcher, Showing::new()));
     cx.refresh_windows();
 }
 
@@ -284,6 +292,8 @@ impl Switcher {
         }
         let count = self.items.len() as i32;
         self.selected = (self.selected as i32 + by).rem_euclid(count) as usize;
+        // The keys put it somewhere: a glide under way would carry it off again.
+        self.scroller.stop();
         self.scroll.scroll_to_item(self.row_of(self.selected));
         cx.notify();
     }
@@ -313,8 +323,10 @@ impl Switcher {
 }
 
 pub fn overlay(window: &Window, cx: &App) -> Option<AnyElement> {
-    let switcher = cx.try_global::<Open>()?.0.clone();
+    let open = cx.try_global::<Open>()?;
+    let (switcher, showing) = (open.0.clone(), open.1);
     let viewport = window.viewport_size();
+    let switcher = crate::transition::pop(div().relative().max_w_full().child(switcher), "switcher-card", showing);
     let backdrop = div()
         .id("switcher-backdrop")
         .occlude()
@@ -324,8 +336,10 @@ pub fn overlay(window: &Window, cx: &App) -> Option<AnyElement> {
         .justify_center()
         .pt(viewport.height * 0.18)
         .bg(gpui_kit::black().opacity(0.6))
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         .on_click(|_, _, cx| close(cx))
         .child(switcher);
+    let backdrop = crate::transition::fade(backdrop, "switcher-backdrop", showing);
     Some(deferred(anchored().position(point(px(0.), px(0.))).child(backdrop)).with_priority(4).into_any_element())
 }
 
@@ -354,6 +368,7 @@ impl Render for Switcher {
             self.items = if text.trim().is_empty() { suggestions(store.cache(), &recent, &crate::drafts::waiting(), self.here) } else { matches(store.cache(), &text, &recent) };
             self.selected = 0;
             self.built_for = Some(text.clone());
+            self.scroller.stop();
             self.scroll.scroll_to_item(0);
         }
         let theme = cx.theme();
@@ -365,9 +380,18 @@ impl Render for Switcher {
                 rows.push(div().px(u(12.)).pt(u(12.)).pb(u(4.)).text_size(u(12.)).font_weight(FontWeight::BOLD).text_color(theme.muted_foreground).child(item.section.to_uppercase()).into_any_element());
             }
             let selected = ix == self.selected;
-            let picture: AnyElement = match &item.picture {
-                Some(url) => Avatar::new().border_0().src(url.clone()).name(item.label.clone()).size(u(20.)).into_any_element(),
-                None => Icon::new(look_icon(item.look)).size(u(18.)).text_color(theme.muted_foreground).into_any_element(),
+            let muted = theme.muted_foreground;
+            let picture: AnyElement = match (&item.server, &item.picture) {
+                // A server's channel: its server, a small chevron, then the channel's sign.
+                (Some(server), _) => h_flex()
+                    .gap(u(4.))
+                    .items_center()
+                    .child(server.view(20., theme.popover, cx))
+                    .child(Icon::new(IconName::ChevronRight).size(u(12.)).text_color(muted))
+                    .child(Icon::new(look_icon(item.look)).size(u(18.)).text_color(muted))
+                    .into_any_element(),
+                (None, Some(url)) => Avatar::new().border_0().src(url.clone()).name(item.label.clone()).size(u(20.)).into_any_element(),
+                (None, None) => Icon::new(look_icon(item.look)).size(u(18.)).text_color(muted).into_any_element(),
             };
             rows.push(
                 h_flex()
@@ -386,7 +410,7 @@ impl Render for Switcher {
                         }
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| this.go(ix, cx)))
-                    .child(div().size(u(20.)).flex_shrink_0().flex().items_center().justify_center().child(picture))
+                    .child(div().h(u(20.)).min_w(u(20.)).flex_shrink_0().flex().items_center().justify_center().child(picture))
                     .child(div().flex_shrink_0().max_w(u(300.)).truncate().text_size(u(16.)).font_weight(FontWeight::MEDIUM).child(SharedString::from(item.label.clone())))
                     .child(div().flex_1().min_w_0().truncate().text_size(u(13.)).text_color(theme.muted_foreground).child(SharedString::from(item.detail.clone())))
                     .when(item.mentions > 0, |d| {
@@ -425,14 +449,16 @@ impl Render for Switcher {
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(div().h(u(56.)).px(u(8.)).flex().items_center().rounded(u(6.)).bg(theme.background).text_size(u(20.)).child(Input::new(&self.input).appearance(false).large()))
             .child(
-                div()
-                    .id("switcher-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .when(empty, |d| d.child(div().py(u(24.)).text_center().text_size(u(14.)).text_color(theme.muted_foreground).child(if text.trim().is_empty() { "Nowhere to suggest yet." } else { "No results found." })))
-                    .children(rows),
+                div().relative().flex_1().min_h_0().flex().flex_col().child(self.scroller.layer()).child(
+                    div()
+                        .id("switcher-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll)
+                        .when(empty, |d| d.child(div().py(u(24.)).text_center().text_size(u(14.)).text_color(theme.muted_foreground).child(if text.trim().is_empty() { "Nowhere to suggest yet." } else { "No results found." })))
+                        .children(rows),
+                ),
             )
             .child(
                 div()
@@ -470,7 +496,7 @@ mod tests {
 
     #[test]
     fn row_numbers_count_the_headings() {
-        let item = |section| Item { target: Target::Guild(Id(1)), label: String::new(), detail: String::new(), picture: None, look: Look::Server, mentions: 0, section };
+        let item = |section| Item { target: Target::Guild(Id(1)), label: String::new(), detail: String::new(), picture: None, look: Look::Server, mentions: 0, section, server: None };
         let items = vec![item("Previous Channels"), item("Previous Channels"), item("Drafts")];
         assert_eq!((row_index(&items, 0), row_index(&items, 1), row_index(&items, 2)), (1, 2, 4));
     }

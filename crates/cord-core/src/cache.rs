@@ -885,6 +885,7 @@ impl Cache {
     /// Replaces the buffer with a REST page (newest first, as Discord returns
     /// it). Live messages newer than the page, and unsent ones, are kept.
     pub fn set_history(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        self.refresh_authors(&newest_first);
         let has_older = newest_first.len() >= limit;
         let newest = newest_first.first().map(|m| m.id);
         let old = self.messages.remove(&channel).unwrap_or_default();
@@ -906,6 +907,7 @@ impl Cache {
     /// above what's held, up to [`SCROLLBACK_CAP`]. A page shorter than
     /// `limit` means the channel's first message has been reached.
     pub fn prepend_older(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        self.refresh_authors(&newest_first);
         let Some(buf) = self.messages.get_mut(&channel) else { return };
         let oldest = buf.items.front().map(|m| m.message.id);
         let reached_start = newest_first.len() < limit;
@@ -920,10 +922,20 @@ impl Cache {
         buf.has_older = !(reached_start && fits);
     }
 
+    /// What Discord says about people now, from the messages it just sent. Their copy here
+    /// came from a list or READY, and without this stayed as it was for the whole session:
+    /// a changed name style, decoration or server profile never showed.
+    pub fn refresh_authors(&mut self, messages: &[Message]) {
+        for m in messages {
+            self.users.insert(m.author.id, m.author.clone());
+        }
+    }
+
     /// Shows only a window of `channel` found by asking for the messages around one
     /// (newest first, as Discord returns it): what's held now is dropped, since the two
     /// wouldn't join up. Unsent messages stay.
     pub fn set_around(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        self.refresh_authors(&newest_first);
         let last = self.channels.get(&channel).and_then(|c| c.last_message_id);
         let newest = newest_first.first().map(|m| m.id);
         let full = newest_first.len() >= limit;
@@ -941,6 +953,7 @@ impl Cache {
     /// Adds a page of newer messages (newest first) below what's held. A short page, or
     /// one reaching the channel's newest message, closes the gap to the present.
     pub fn append_newer(&mut self, channel: Id, newest_first: Vec<Message>, limit: usize) {
+        self.refresh_authors(&newest_first);
         let last = self.channels.get(&channel).and_then(|c| c.last_message_id);
         let Some(buf) = self.messages.get_mut(&channel) else { return };
         let held = buf.items.iter().rev().find(|m| m.state == SendState::Sent).map(|m| m.message.id);
@@ -1775,6 +1788,20 @@ mod tests {
         c.set_around(Id(311), page(1, 250, 311), 250);
         c.trim_to_tail(Id(311));
         assert_eq!(c.messages(Id(311)).unwrap().len(), 250);
+    }
+
+    #[test]
+    fn fetched_pages_refresh_what_is_known_about_their_authors() {
+        let mut c = ready_cache();
+        c.open_messages(Id(311));
+        let mut old = user(7, "kai");
+        old.global_name = Some("Old Name".into());
+        c.users.insert(Id(7), old);
+        let mut m = msg(10, 311);
+        m.author = user(7, "kai");
+        m.author.global_name = Some("New Name".into());
+        c.set_history(Id(311), vec![m], 50);
+        assert_eq!(c.user(Id(7)).unwrap().display_name(), "New Name");
     }
 
     fn member(user: u64, nick: Option<&str>, roles: &[u64]) -> Member {

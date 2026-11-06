@@ -10,7 +10,7 @@ use alhazen_gpui::{PlayerConfig, PlayerEvent, PlayerState, Source, VideoPlayer};
 use cord_core::model::Message;
 use gpui_kit::{App, AppContext, Entity, Global, Subscription};
 
-const POOL: usize = 6;
+const POOL: usize = 10;
 /// Off screen this long, a GIF stops decoding.
 const REST_AFTER: Duration = Duration::from_millis(1500);
 /// And this long, its player goes, with its threads and buffers.

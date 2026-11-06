@@ -726,7 +726,7 @@ impl Core {
     /// Trending GIF searches, and a GIF for the trending tile.
     pub async fn gif_trending(&self) -> Result<crate::gifs::Trending, HttpError> {
         let http = self.http.clone();
-        let path = format!("/gifs/trending?{}", crate::gifs::params("en-US"));
+        let path = crate::gifs::trending_path("en-US");
         let result = self.on_rt(async move { http.get(&path).await }).await;
         self.watch(result)
     }
@@ -735,11 +735,8 @@ impl Core {
     pub async fn gif_search(&self, query: Option<String>) -> Result<Vec<crate::gifs::Gif>, HttpError> {
         let http = self.http.clone();
         let path = match query {
-            Some(q) => {
-                let q: String = q.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
-                format!("/gifs/search?q={q}&{}", crate::gifs::params("en-US"))
-            }
-            None => format!("/gifs/trending-gifs?{}", crate::gifs::params("en-US")),
+            Some(q) => crate::gifs::search_path(&q, "en-US"),
+            None => crate::gifs::trending_gifs_path("en-US"),
         };
         let result = self.on_rt(async move { http.get::<Value>(&path).await }).await;
         self.watch(result).map(|v| crate::model::lenient_vec(v).unwrap_or_default())

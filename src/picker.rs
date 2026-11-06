@@ -1,8 +1,9 @@
 //! Discord's expression picker: the GIF and emoji tabs, from the message box or a
 //! message's Add Reaction. Emoji come in categories with a search and the servers'
 //! own; those Discord would only let Nitro use are shown locked, never usable here.
-//! GIFs come from Discord's GIF search, with stars kept in the account's settings
-//! so they're the same as in Discord's own client.
+//! GIFs come from Discord's GIF search (Klipy behind it), with stars kept in the
+//! account's settings so they're the same as in Discord's own client. Alt+click
+//! makes an emoji a favourite, kept on this computer like Frequently Used.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -10,7 +11,7 @@ use std::rc::Rc;
 
 use cord_core::Id;
 use cord_core::cache::Cache;
-use cord_core::gifs::{Gif, Trending};
+use cord_core::gifs::{Gif, Kind, Trending, absolute, kind, unproxied};
 use cord_core::settings_proto::FavoriteGif;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -22,7 +23,9 @@ use gpui_kit::{
     anchored, deferred, div, img, point, px, uniform_list,
 };
 
+use crate::smooth_scroll::{ScrollTarget, SmoothScroller};
 use crate::store::Store;
+use crate::transition::Showing;
 use crate::ui::u;
 
 /// Emoji to a row, and a cell's size, as in Discord's picker.
@@ -143,9 +146,18 @@ fn server_sections(cache: &Cache, channel: Id) -> Vec<Section> {
                 Some(hash) => Mark::Picture(format!("{}/icons/{}/{hash}.png?size=64", cord_core::cdn::CDN, g.id)),
                 None => Mark::Icon(IconName::Compass),
             },
-            cells: g.emojis.iter().filter(|e| e.available).map(|e| Cell::Custom { id: e.id, name: e.name.clone(), animated: e.animated, locked: !usable.contains(&e.id) }).collect(),
+            cells: server_order(g.emojis.iter().filter(|e| e.available).map(|e| Cell::Custom { id: e.id, name: e.name.clone(), animated: e.animated, locked: !usable.contains(&e.id) }).collect()),
         })
         .collect()
+}
+
+/// A server's emoji as Discord lists them: still ones A to Z, then animated ones A to Z.
+fn server_order(mut cells: Vec<Cell>) -> Vec<Cell> {
+    cells.sort_by_cached_key(|cell| match cell {
+        Cell::Custom { name, animated, .. } => (*animated, name.to_lowercase()),
+        Cell::Unicode(e) => (false, e.name().to_lowercase()),
+    });
+    cells
 }
 
 /// Cells whose name holds `query`, usable first.
@@ -189,25 +201,70 @@ fn note_used(cell: &Cell) {
     let _ = std::fs::write(used_path(), body);
 }
 
+// Favourites: picked with Alt+click, kept here, on this computer, in the order added.
+thread_local! {
+    static FAVORITES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+fn favorites_path() -> std::path::PathBuf {
+    cord_core::paths::config_dir().join("emoji_favorites.json")
+}
+
+fn with_favorites<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
+    FAVORITES.with_borrow_mut(|held| f(held.get_or_insert_with(|| std::fs::read(favorites_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default())))
+}
+
+/// `keys` with `key` added at the end, or taken out if it was there.
+fn toggled_key(mut keys: Vec<String>, key: String) -> Vec<String> {
+    match keys.iter().position(|k| *k == key) {
+        Some(at) => {
+            keys.remove(at);
+        }
+        None => keys.push(key),
+    }
+    keys
+}
+
+fn toggle_favorite(cell: &Cell) {
+    let body = with_favorites(|keys| {
+        *keys = toggled_key(std::mem::take(keys), cell.key());
+        serde_json::to_vec(keys).unwrap_or_default()
+    });
+    let _ = std::fs::write(favorites_path(), body);
+}
+
+/// A key as written by [`Cell::key`] back as a cell; a server's emoji only where it's usable.
+fn cell_of_key(key: &str, usable: &std::collections::HashSet<Id>) -> Option<Cell> {
+    match key.strip_prefix("custom:") {
+        Some(rest) => {
+            let mut parts = rest.splitn(3, ':');
+            let id = Id(parts.next()?.parse().ok()?);
+            let name = parts.next()?.to_string();
+            let animated = parts.next()? == "true";
+            usable.contains(&id).then_some(Cell::Custom { id, name, animated, locked: false })
+        }
+        None => emojis::get(key).map(Cell::Unicode),
+    }
+}
+
+/// The favourites usable here, in the order they were added.
+fn favorites(cache: &Cache, channel: Id) -> Vec<Cell> {
+    let usable: std::collections::HashSet<Id> = cache.usable_emojis(channel).into_iter().map(|e| e.id).collect();
+    with_favorites(|keys| keys.iter().filter_map(|key| cell_of_key(key, &usable)).collect())
+}
+
+fn is_favorite(cell: &Cell) -> bool {
+    let key = cell.key();
+    with_favorites(|keys| keys.contains(&key))
+}
+
 /// The most used, most first, as cells: unicode by itself, server emoji by their key.
 fn frequent(cache: &Cache, channel: Id, limit: usize) -> Vec<Cell> {
     let usable: std::collections::HashSet<Id> = cache.usable_emojis(channel).into_iter().map(|e| e.id).collect();
     let mut used: Vec<(String, u32)> = with_used(|u| u.iter().map(|(k, n)| (k.clone(), *n)).collect());
     used.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    used.into_iter()
-        .filter_map(|(key, _)| match key.strip_prefix("custom:") {
-            Some(rest) => {
-                let mut parts = rest.splitn(3, ':');
-                let id = Id(parts.next()?.parse().ok()?);
-                let name = parts.next()?.to_string();
-                let animated = parts.next()? == "true";
-                // Only where it can be used now.
-                usable.contains(&id).then_some(Cell::Custom { id, name, animated, locked: false })
-            }
-            None => emojis::get(&key).map(Cell::Unicode),
-        })
-        .take(limit)
-        .collect()
+    // Only where it can be used now.
+    used.into_iter().filter_map(|(key, _)| cell_of_key(&key, &usable)).take(limit).collect()
 }
 
 /// The starred GIFs, once fetched: shared by every picker opened.
@@ -237,8 +294,12 @@ pub struct Picker {
     sections: Vec<Section>,
     rows: Rc<Vec<Row>>,
     starts: Vec<usize>,
+    /// The rail's mark for each of `starts`.
+    marks: Vec<Mark>,
     built_for: Option<String>,
     scroll: UniformListScrollHandle,
+    emoji_scroller: SmoothScroller,
+    gif_scroller: SmoothScroller,
     hovered: Option<Cell>,
     trending: Option<Trending>,
     gif_view: GifView,
@@ -252,24 +313,23 @@ struct Open {
     at: Point<Pixels>,
     /// From the message box: it opens up from the button.
     above: bool,
+    showing: Showing,
 }
 
 impl Global for Open {}
 
+/// Open, and not on its way out.
 pub fn is_open(cx: &App) -> bool {
-    cx.has_global::<Open>()
+    cx.try_global::<Open>().is_some_and(|open| !open.showing.closing)
 }
 
 pub fn close(cx: &mut App) {
-    if is_open(cx) {
-        cx.remove_global::<Open>();
-        cx.refresh_windows();
-    }
+    crate::transition::leave::<Open>(cx, |open| &mut open.showing);
 }
 
 /// Opens the picker on `tab` at `at`. `above`: it hangs above that point rather than below.
 pub fn open(store: Entity<Store>, channel: Id, tab: Tab, at: Point<Pixels>, above: bool, on_pick: OnPick, window: &mut Window, cx: &mut App) {
-    if cx.try_global::<Open>().is_some_and(|o| o.picker.read(cx).tab == tab && o.picker.read(cx).channel == channel) {
+    if cx.try_global::<Open>().is_some_and(|o| !o.showing.closing && o.picker.read(cx).tab == tab && o.picker.read(cx).channel == channel) {
         close(cx);
         return;
     }
@@ -299,6 +359,10 @@ pub fn open(store: Entity<Store>, channel: Id, tab: Tab, at: Point<Pixels>, abov
                 cx.stop_propagation();
             }
         });
+        let scroll = UniformListScrollHandle::new();
+        let emoji_scroller = SmoothScroller::new(ScrollTarget::Handle(scroll.0.borrow().base_handle.clone())).owned_by("picker");
+        let gif_scroll = gpui_kit::ScrollHandle::new();
+        let gif_scroller = SmoothScroller::new(ScrollTarget::Handle(gif_scroll.clone())).owned_by("picker");
         let mut picker = Picker {
             store,
             channel,
@@ -308,19 +372,22 @@ pub fn open(store: Entity<Store>, channel: Id, tab: Tab, at: Point<Pixels>, abov
             sections: Vec::new(),
             rows: Rc::default(),
             starts: Vec::new(),
+            marks: Vec::new(),
             built_for: None,
-            scroll: UniformListScrollHandle::new(),
+            scroll,
+            emoji_scroller,
+            gif_scroller,
             hovered: None,
             trending: None,
             gif_view: GifView::Home,
             gifs: None,
-            gif_scroll: gpui_kit::ScrollHandle::new(),
+            gif_scroll,
             _watching: vec![typed, keys],
         };
         picker.set_tab(tab, window, cx);
         picker
     });
-    cx.set_global(Open { picker, at, above });
+    cx.set_global(Open { picker, at, above, showing: Showing::new() });
     cx.refresh_windows();
 }
 
@@ -335,14 +402,14 @@ pub fn overlay(window: &Window, cx: &App) -> Option<AnyElement> {
         .w(viewport.width)
         .h(viewport.height)
         .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| close(cx))
-        .child(anchored().anchor(corner).position(at).snap_to_window_with_margin(px(8.)).child(open.picker.clone()));
+        .child(anchored().anchor(corner).position(at).snap_to_window_with_margin(px(8.)).child(crate::transition::pop(div().relative().child(open.picker.clone()), "picker-card", open.showing)));
     Some(deferred(anchored().position(point(px(0.), px(0.))).child(outside)).with_priority(4).into_any_element())
 }
 
 impl Picker {
     fn set_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         self.tab = tab;
-        let placeholder = if tab == Tab::Gifs { "Search Tenor" } else { "Find the perfect emoji" };
+        let placeholder = if tab == Tab::Gifs { GIF_SEARCH_PLACEHOLDER } else { "Find the perfect emoji" };
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.set_placeholder(placeholder, window, cx);
@@ -364,15 +431,29 @@ impl Picker {
             self.sections = sections;
         }
         let shown: Vec<Section> = if query.trim().is_empty() {
+            let liked = Section { title: "Favorites".into(), mark: Mark::Icon(IconName::StarFill), cells: favorites(cache, self.channel) };
             let recent = Section { title: "Frequently Used".into(), mark: Mark::Icon(IconName::Clock), cells: frequent(cache, self.channel, PER_ROW * 2) };
-            std::iter::once(recent).chain(self.sections.iter().cloned()).collect()
+            [liked, recent].into_iter().chain(self.sections.iter().cloned()).collect()
         } else {
             vec![Section { title: "Search Results".into(), mark: Mark::Icon(IconName::Search), cells: search(&self.sections, query) }]
         };
         let (rows, starts) = rows_of(&shown);
         self.rows = Rc::new(rows);
         self.starts = starts;
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        // The same sections `rows_of` kept: those with anything in them.
+        self.marks = shown.into_iter().filter(|s| !s.cells.is_empty()).map(|s| s.mark).collect();
+    }
+
+    /// Alt+click: in Favorites, or out again. A locked emoji can't be favourited either.
+    fn toggle_favorite(&mut self, cell: Cell, cx: &mut Context<Self>) {
+        if matches!(cell, Cell::Custom { locked: true, .. }) {
+            return;
+        }
+        toggle_favorite(&cell);
+        // Rebuilt where it is: the list doesn't jump back to the top.
+        let query = self.input.read(cx).value().to_string();
+        self.rebuild_emoji(&query, cx);
+        cx.notify();
     }
 
     fn pick_cell(&mut self, cell: Cell, keep_open: bool, cx: &mut Context<Self>) {
@@ -438,6 +519,7 @@ impl Picker {
     fn show_gifs(&mut self, view: GifView, cx: &mut Context<Self>) {
         self.gif_view = view.clone();
         self.gifs = None;
+        self.gif_scroller.stop();
         self.gif_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
         let query = match &view {
@@ -504,11 +586,61 @@ impl Picker {
     }
 }
 
-/// What a GIF's tile shows: Tenor's small GIF of the video when its address says
-/// which that is (light enough to fill a grid, and it moves), else the still.
-fn tile_picture(video: &str, still: &str) -> String {
-    tenor_tiny(video).unwrap_or_else(|| still.to_string())
+/// Discord's wording for the GIF search box.
+const GIF_SEARCH_PLACEHOLDER: &str = "Search KLIPY";
+
+/// What a GIF's tile shows.
+#[derive(Clone, Debug, PartialEq)]
+enum Tile {
+    /// A picture, moving or still: drawn as it is.
+    Picture(String),
+    /// A video, played muted and looping.
+    Video(String),
+    Blank,
 }
+
+/// A search result's tile: the moving picture Discord sent for it (what's asked for), else
+/// Tenor's small GIF of its video, else the GIF itself, else a still, else the video.
+fn result_tile(gif: &Gif) -> Tile {
+    let (src, gif_src, still) = (absolute(&gif.src), absolute(&gif.gif_src), absolute(&gif.preview));
+    if kind(&src) == Kind::Picture {
+        return Tile::Picture(src);
+    }
+    if let Some(tiny) = tenor_tiny(&src) {
+        return Tile::Picture(tiny);
+    }
+    if let Some(picture) = [gif_src, still].into_iter().find(|u| !u.is_empty()) {
+        return Tile::Picture(picture);
+    }
+    if src.is_empty() { Tile::Blank } else { Tile::Video(src) }
+}
+
+/// A starred GIF's tile, from what the account keeps of it: Discord keeps pictures now, and
+/// kept videos (Tenor's, perhaps behind Discord's media proxy) in older stars.
+fn favorite_tile(src: &str, format: u32) -> Tile {
+    let src = absolute(src);
+    if src.is_empty() {
+        return Tile::Blank;
+    }
+    match kind(&src) {
+        Kind::Picture => Tile::Picture(src),
+        Kind::Video => tenor_tiny(&unproxied(&src)).map_or(Tile::Video(src), Tile::Picture),
+        Kind::Unknown if format == 2 => Tile::Video(src),
+        Kind::Unknown => Tile::Picture(src),
+    }
+}
+
+/// What starring a result keeps, as Discord's client does: the GIF picture rather than
+/// the video when there is one, and the format of what's kept.
+fn star_for(gif: &Gif) -> FavoriteGif {
+    let (src, gif_src) = (absolute(&gif.src), absolute(&gif.gif_src));
+    let kept = if kind(&src) == Kind::Video && !gif_src.is_empty() { gif_src } else { src };
+    let format = if kind(&kept) == Kind::Picture { 1 } else { 2 };
+    FavoriteGif { url: gif.url.clone(), src: kept, format, width: gif.width, height: gif.height, order: 0 }
+}
+
+/// How many video tiles play at once: each is a decoder.
+const MOST_PLAYING: usize = 4;
 
 /// `https://media.tenor.com/<id>AAAPo/<name>.mp4` → the same `<id>AAAAM/<name>.gif`.
 fn tenor_tiny(video: &str) -> Option<String> {
@@ -581,6 +713,8 @@ impl Picker {
         if self.built_for.as_deref() != Some(query.as_str()) {
             self.rebuild_emoji(&query, cx);
             self.built_for = Some(query.clone());
+            self.emoji_scroller.stop();
+            self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         }
         let theme = cx.theme();
         let rows = self.rows.clone();
@@ -632,9 +766,9 @@ impl Picker {
                                     }
                                 })
                                 .on_click(move |event, _, cx| {
-                                    let keep = event.modifiers().shift;
+                                    let (keep, favorite) = (event.modifiers().shift, event.modifiers().alt);
                                     let cell = chosen.clone();
-                                    let _ = picker.update(cx, |this, cx| this.pick_cell(cell, keep, cx));
+                                    let _ = picker.update(cx, |this, cx| if favorite { this.toggle_favorite(cell, cx) } else { this.pick_cell(cell, keep, cx) });
                                 })
                                 .child(picture)
                         }))
@@ -646,15 +780,7 @@ impl Picker {
         .flex_1()
         .h_full();
         // The rail: one mark per section, jumping to it.
-        let marks: Vec<(usize, Mark)> = if query.trim().is_empty() {
-            let mut sections = vec![Mark::Icon(IconName::Clock)];
-            sections.extend(self.sections.iter().filter(|s| !s.cells.is_empty()).map(|s| s.mark.clone()));
-            // The Frequently Used row is only there once something's been used.
-            let offset = usize::from(self.starts.len() < sections.len());
-            sections.into_iter().skip(offset).zip(self.starts.iter().copied()).map(|(m, s)| (s, m)).collect()
-        } else {
-            Vec::new()
-        };
+        let marks: Vec<(usize, Mark)> = if query.trim().is_empty() { self.starts.iter().copied().zip(self.marks.iter().cloned()).collect() } else { Vec::new() };
         let rail = v_flex()
             .id("emoji-rail")
             .w(u(48.))
@@ -666,7 +792,7 @@ impl Picker {
             .overflow_y_scroll()
             .bg(theme.background.opacity(0.5))
             .children(marks.into_iter().enumerate().map(|(i, (start, mark))| {
-                let scroll = self.scroll.clone();
+                let (scroll, scroller) = (self.scroll.clone(), self.emoji_scroller.clone());
                 div()
                     .id(("emoji-mark", i))
                     .size(u(32.))
@@ -678,7 +804,10 @@ impl Picker {
                     .cursor_pointer()
                     .text_color(muted)
                     .hover(move |d| d.bg(hover_bg).text_color(foreground))
-                    .on_click(move |_, _, _| scroll.scroll_to_item(start, ScrollStrategy::Top))
+                    .on_click(move |_, _, _| {
+                        scroller.stop();
+                        scroll.scroll_to_item(start, ScrollStrategy::Top);
+                    })
                     .child(match mark {
                         Mark::Icon(icon) => Icon::new(icon).size(u(20.)).into_any_element(),
                         Mark::Picture(url) => img(url).size(u(24.)).rounded_full().into_any_element(),
@@ -702,6 +831,7 @@ impl Picker {
                 .child(picture)
                 .child(div().text_size(u(15.)).font_weight(FontWeight::SEMIBOLD).text_color(foreground).child(format!(":{}:", cell.name())))
                 .when(locked, |d| d.child(div().text_size(u(13.)).text_color(muted).child("Not usable here without Nitro")))
+                .when(!locked, |d| d.child(div().flex_1()).child(div().text_size(u(12.)).text_color(muted).child(if is_favorite(&cell) { "Alt+click to unfavorite" } else { "Alt+click to favorite" })))
         });
         let empty = self.rows.is_empty();
         h_flex()
@@ -712,13 +842,13 @@ impl Picker {
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .child(div().flex_1().min_h_0().px(u(4.)).flex().when(empty, |d| d.items_center().justify_center().child("No emoji match that.")).when(!empty, |d| d.child(list)))
+                    .child(div().relative().flex_1().min_h_0().px(u(4.)).flex().when(empty, |d| d.items_center().justify_center().child("No emoji match that.")).when(!empty, |d| d.child(self.emoji_scroller.layer()).child(list)))
                     .children(preview),
             )
             .into_any_element()
     }
 
-    fn gif_body(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn gif_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let stars: Option<Vec<FavoriteGif>> = cx.try_global::<Stars>().and_then(|s| s.gifs.clone());
         let starred: std::collections::HashSet<String> = stars.iter().flatten().map(|s| s.url.clone()).collect();
@@ -746,12 +876,16 @@ impl Picker {
         let content: AnyElement = match &self.gif_view {
             GifView::Home => {
                 let Some(trending) = &self.trending else { return note("Loading…") };
-                let first_star = stars.as_ref().and_then(|s| s.first()).map(|s| s.src.clone());
+                let picture = |tile: Tile| match tile {
+                    Tile::Picture(url) => Some(url),
+                    Tile::Video(_) | Tile::Blank => None,
+                };
+                let first_star = stars.as_ref().and_then(|s| s.first()).and_then(|s| picture(favorite_tile(&s.src, s.format)));
                 let mut tiles: Vec<(String, Option<String>, GifView)> = vec![
-                    ("Favorites".into(), first_star.map(|s| tile_picture(&s, "")), GifView::Favorites),
-                    ("Trending GIFs".into(), trending.gifs.first().map(|g| g.preview.clone()), GifView::Trending),
+                    ("Favorites".into(), first_star, GifView::Favorites),
+                    ("Trending GIFs".into(), trending.gifs.first().and_then(|g| picture(result_tile(g))), GifView::Trending),
                 ];
-                tiles.extend(trending.categories.iter().map(|c| (c.name.clone(), None, GifView::Search(c.name.clone()))));
+                tiles.extend(trending.categories.iter().map(|c| (c.name.clone(), picture(favorite_tile(&c.src, 0)), GifView::Search(c.name.clone()))));
                 let rows = tiles.chunks(2).enumerate().map(|(r, pair)| {
                     h_flex().gap(u(8.)).children(pair.iter().enumerate().map(|(i, (label, still, view))| {
                         let view = view.clone();
@@ -787,38 +921,46 @@ impl Picker {
             GifView::Favorites => match &stars {
                 None => note("Loading…"),
                 Some(list) if list.is_empty() => note("Star a GIF to keep it here."),
-                Some(list) => self.gif_grid(list.iter().map(|s| (s.url.clone(), tile_picture(&s.src, ""), s.width, s.height, s.clone())).collect(), &starred, cx),
+                Some(list) => self.gif_grid(list.iter().map(|s| (s.url.clone(), favorite_tile(&s.src, s.format), s.width, s.height, s.clone())).collect(), &starred, window, cx),
             },
             GifView::Trending | GifView::Search(_) => match &self.gifs {
                 None => note("Loading…"),
                 Some(Err(error)) => note(&format!("Couldn't load GIFs: {error}")),
                 Some(Ok(list)) if list.is_empty() => note("No GIFs found."),
                 Some(Ok(list)) => {
-                    let items = list
-                        .iter()
-                        .map(|g| {
-                            let star = FavoriteGif { url: g.url.clone(), src: g.src.clone(), format: 2, width: g.width, height: g.height, order: 0 };
-                            (g.url.clone(), tile_picture(&g.src, &g.preview), g.width, g.height, star)
-                        })
-                        .collect();
-                    self.gif_grid(items, &starred, cx)
+                    let items = list.iter().map(|g| (g.url.clone(), result_tile(g), g.width, g.height, star_for(g))).collect();
+                    self.gif_grid(items, &starred, window, cx)
                 }
             },
         };
         v_flex()
             .size_full()
             .children(back)
-            .child(div().id("gif-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.gif_scroll).child(content))
+            .child(div().relative().flex_1().min_h_0().flex().flex_col().child(self.gif_scroller.layer()).child(div().id("gif-scroll").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.gif_scroll).child(content)))
             .into_any_element()
     }
 
     /// Two columns, each GIF its own shape, each with its star.
-    fn gif_grid(&self, items: Vec<(String, String, u32, u32, FavoriteGif)>, starred: &std::collections::HashSet<String>, cx: &mut Context<Self>) -> AnyElement {
+    fn gif_grid(&self, items: Vec<(String, Tile, u32, u32, FavoriteGif)>, starred: &std::collections::HashSet<String>, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         const COLUMN: f32 = (WIDTH - 12. * 2. - 8.) / 2.;
-        let theme = cx.theme();
+        let tile_bg = cx.theme().foreground.opacity(0.08);
         let mut columns: [Vec<AnyElement>; 2] = [Vec::new(), Vec::new()];
         let mut heights = [0f32; 2];
+        let mut playing = 0;
         for (ix, (url, shown, width, height, star)) in items.into_iter().enumerate() {
+            // A video plays in a player of its own, for the first few: the rest wait as blanks.
+            let player = match &shown {
+                Tile::Video(video) if playing < MOST_PLAYING => {
+                    playing += 1;
+                    crate::gifs::warm_url(video, cx);
+                    crate::gifs::player(video, cx)
+                }
+                _ => None,
+            };
+            if player.as_ref().is_some_and(|p| !p.read(cx).is_playing()) {
+                // Its first frames come in after this: look again then.
+                window.request_animation_frame();
+            }
             let tall = if width > 0 && height > 0 { COLUMN * height as f32 / width as f32 } else { COLUMN * 0.6 };
             let column = usize::from(heights[1] < heights[0]);
             heights[column] += tall + 8.;
@@ -833,10 +975,14 @@ impl Picker {
                     .h(u(tall))
                     .rounded(u(6.))
                     .overflow_hidden()
-                    .bg(theme.foreground.opacity(0.08))
+                    .bg(tile_bg)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.pick_gif(send_url.clone(), cx)))
-                    .when(!shown.is_empty(), |d| d.child(img(shown).size_full().object_fit(ObjectFit::Cover)))
+                    .map(|d| match (shown, player) {
+                        (Tile::Picture(url), _) => d.child(img(url).size_full().object_fit(ObjectFit::Cover)),
+                        (Tile::Video(_), Some(player)) => d.child(alhazen_gpui::video_view(player).object_fit(ObjectFit::Cover).size_full()),
+                        _ => d,
+                    })
                     .child(
                         div()
                             .id(("gif-star", ix))
@@ -924,7 +1070,66 @@ mod tests {
     fn tiles_use_tenors_small_gif() {
         assert_eq!(tenor_tiny("https://media.tenor.com/abcAAAPo/cat-dance.mp4").as_deref(), Some("https://media.tenor.com/abcAAAAM/cat-dance.gif"));
         assert_eq!(tenor_tiny("https://example.com/x.mp4"), None);
-        assert_eq!(tile_picture("https://example.com/x.mp4", "still.png"), "still.png");
+    }
+
+    fn gif(src: &str, gif_src: &str, preview: &str) -> Gif {
+        Gif { url: "https://example.com/view/1".into(), src: src.into(), gif_src: gif_src.into(), preview: preview.into(), width: 200, height: 100, ..Default::default() }
+    }
+
+    #[test]
+    fn a_result_shows_the_moving_picture_discord_sent() {
+        assert_eq!(result_tile(&gif("//static.example.com/a.webp", "", "")), Tile::Picture("https://static.example.com/a.webp".into()));
+        assert_eq!(result_tile(&gif("https://example.com/a.webm", "https://example.com/a.gif", "still.png")), Tile::Picture("https://example.com/a.gif".into()));
+        assert_eq!(result_tile(&gif("https://example.com/a.mp4", "", "")), Tile::Video("https://example.com/a.mp4".into()));
+        assert_eq!(result_tile(&gif("", "", "")), Tile::Blank);
+    }
+
+    #[test]
+    fn every_kind_of_star_has_a_picture() {
+        // What blanked them before: no scheme, or not one of Tenor's videos.
+        assert_eq!(favorite_tile("//media.example.com/a.gif?format=webp&animated=true", 1), Tile::Picture("https://media.example.com/a.gif?format=webp&animated=true".into()));
+        assert_eq!(
+            favorite_tile("https://media.discordapp.net/external/sig/https/media.tenor.com/abcAAAPo/cat.mp4", 2),
+            Tile::Picture("https://media.tenor.com/abcAAAAM/cat.gif".into()),
+            "Tenor behind the media proxy"
+        );
+        assert_eq!(favorite_tile("https://static.example.com/b.webm", 2), Tile::Video("https://static.example.com/b.webm".into()));
+        assert_eq!(favorite_tile("https://example.com/no-ending", 2), Tile::Video("https://example.com/no-ending".into()));
+        assert_eq!(favorite_tile("https://example.com/no-ending", 1), Tile::Picture("https://example.com/no-ending".into()));
+        assert_eq!(favorite_tile("", 1), Tile::Blank);
+    }
+
+    #[test]
+    fn a_star_keeps_a_picture_like_discords() {
+        let video = star_for(&gif("https://example.com/a.mp4", "//example.com/a.gif", ""));
+        assert_eq!((video.src.as_str(), video.format), ("https://example.com/a.gif", 1));
+        let picture = star_for(&gif("https://example.com/a.webp", "https://example.com/a.gif", ""));
+        assert_eq!((picture.src.as_str(), picture.format), ("https://example.com/a.webp", 1));
+        let only_video = star_for(&gif("https://example.com/a.mp4", "", ""));
+        assert_eq!((only_video.src.as_str(), only_video.format), ("https://example.com/a.mp4", 2));
+    }
+
+    #[test]
+    fn server_emoji_go_still_then_animated_each_a_to_z() {
+        let custom = |id, name: &str, animated| Cell::Custom { id: Id(id), name: name.into(), animated, locked: false };
+        let ordered = server_order(vec![custom(1, "zed", false), custom(2, "Bop", true), custom(3, "apple", true), custom(4, "Mango", false)]);
+        assert_eq!(ordered.iter().map(Cell::name).collect::<Vec<_>>(), ["Mango", "zed", "apple", "Bop"]);
+    }
+
+    #[test]
+    fn favourites_toggle_and_keep_their_order() {
+        let keys = toggled_key(Vec::new(), "a".into());
+        let keys = toggled_key(keys, "b".into());
+        assert_eq!(keys, ["a", "b"]);
+        assert_eq!(toggled_key(keys, "a".into()), ["b"]);
+    }
+
+    #[test]
+    fn keys_come_back_as_cells_only_where_usable() {
+        let usable: std::collections::HashSet<Id> = [Id(7)].into();
+        assert_eq!(cell_of_key("custom:7:wave:false", &usable), Some(Cell::Custom { id: Id(7), name: "wave".into(), animated: false, locked: false }));
+        assert_eq!(cell_of_key("custom:8:other:true", &usable), None, "another server's, without Nitro");
+        assert_eq!(cell_of_key("😀", &usable), Some(unicode("😀")));
     }
 
     #[test]

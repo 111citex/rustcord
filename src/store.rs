@@ -966,6 +966,18 @@ impl Store {
         .detach();
     }
 
+    /// "Mute Conversation": shown at once, then told to Discord.
+    pub fn set_conversation_muted(&mut self, channel: Id, muted: bool, cx: &mut Context<Self>) {
+        self.cache.set_muted(channel, muted);
+        cx.notify();
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.mute_conversation(channel, muted).await;
+            Self::report(this, result, "Couldn't change the mute", cx);
+        })
+        .detach();
+    }
+
     pub fn rename_group(&mut self, channel: Id, name: String, cx: &mut Context<Self>) {
         let core = self.core.clone();
         cx.spawn(async move |this, cx| {

@@ -753,6 +753,24 @@ impl Core {
     }
 
     /// Opens (or finds) the direct message channel with `user`.
+    /// Mutes or unmutes a conversation, until we say otherwise.
+    pub async fn mute_conversation(&self, channel: Id, muted: bool) -> Result<(), HttpError> {
+        let http = self.http.clone();
+        let result = self
+            .on_rt(async move {
+                let over = if muted {
+                    json!({ "muted": true, "mute_config": { "selected_time_window": -1, "end_time": null } })
+                } else {
+                    json!({ "muted": false, "mute_config": null })
+                };
+                let body = json!({ "channel_overrides": { channel.to_string(): over } });
+                let _: Value = http.patch("/users/@me/guilds/@me/settings", &body).await?;
+                Ok(())
+            })
+            .await;
+        self.watch(result)
+    }
+
     /// Renames a group chat; empty goes back to naming it by who's in it.
     pub async fn rename_group(&self, channel: Id, name: String) -> Result<(), HttpError> {
         let http = self.http.clone();

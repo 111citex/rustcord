@@ -368,7 +368,7 @@ impl ChannelPage {
                                 page.keep_files(cx);
                                 cx.notify();
                                 cx.stop_propagation();
-                            } else if key == "escape" && !page.list.is_following_tail() {
+                            } else if key == "escape" && !in_box && !page.list.is_following_tail() {
                                 // Discord's Esc: back to the newest message, unread cleared.
                                 page.banner_closed = true;
                                 page.jump_to_present(cx);

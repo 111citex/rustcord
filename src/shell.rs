@@ -2023,15 +2023,15 @@ fn dm_menu(
                 crate::places::set_ignored(user, !ignored);
                 crate::ui::redraw_chat(cx);
             }));
-            let (store, who) = (store.clone(), name.clone());
+            let (blocker, who) = (store.clone(), name.clone());
             entries.push(Entry::item("Block", move |_, cx| {
-                let store = store.clone();
+                let store = blocker.clone();
                 crate::confirm::ask(format!("Block {who}"), format!("Block {who}? They won't be able to message you, and you won't see them in your friends."), "Block", move |cx| {
                     store.update(cx, |store, cx| store.block_user(user, cx));
                 }, cx);
             }).danger());
             entries.push(Entry::Separator);
-            entries.push(Entry::later(format!("Mute @{}", dm.label)));
+            entries.push(mute_entry(&store, channel, format!("@{}", dm.label), cx));
             entries.push(Entry::Separator);
             entries.push(Entry::copy("Copy User ID", user.to_string()).icon(IconName::Copy));
         }
@@ -2044,7 +2044,7 @@ fn dm_menu(
                 }));
             }
             entries.push(Entry::Separator);
-            entries.push(Entry::later("Mute Conversation"));
+            entries.push(mute_entry(store, channel, "Conversation".to_string(), cx));
             entries.push(Entry::Separator);
             let (store, label) = (store.clone(), dm.label.clone());
             entries.push(Entry::item("Leave Group", move |_, cx| {
@@ -2058,6 +2058,15 @@ fn dm_menu(
     }
     entries.push(Entry::copy("Copy Channel ID", channel.to_string()).icon(IconName::Copy));
     entries
+}
+
+/// "Mute …" or "Unmute …", whichever the conversation needs.
+fn mute_entry(store: &gpui_kit::Entity<crate::store::Store>, channel: cord_core::Id, what: String, cx: &gpui_kit::App) -> crate::context_menu::Entry {
+    let muted = store.read(cx).cache().is_muted(channel);
+    let store = store.clone();
+    crate::context_menu::Entry::item(format!("{} {what}", if muted { "Unmute" } else { "Mute" }), move |_, cx| {
+        store.update(cx, |store, cx| store.set_conversation_muted(channel, !muted, cx));
+    })
 }
 
 /// How far to scroll for item `ix` to be in view, clear of the panel over the

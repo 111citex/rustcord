@@ -282,6 +282,16 @@ impl Cache {
         }
     }
 
+    /// A conversation muted, or not, until we say otherwise.
+    pub fn set_muted(&mut self, channel: Id, muted: bool) {
+        if muted {
+            self.muted_channels.insert(channel, None);
+        } else {
+            self.muted_channels.remove(&channel);
+        }
+        self.bump_sidebar();
+    }
+
     /// Marks `channel` unread from the message after `before` on.
     pub fn mark_unread_after(&mut self, channel: Id, before: Id) {
         self.read.insert(channel, ReadMark { last: Some(before), mentions: 0 });

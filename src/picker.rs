@@ -300,6 +300,9 @@ pub struct Picker {
     scroll: UniformListScrollHandle,
     emoji_scroller: SmoothScroller,
     gif_scroller: SmoothScroller,
+    /// The emoji tab's rail of sections.
+    rail_scroll: gpui_kit::ScrollHandle,
+    rail_scroller: SmoothScroller,
     hovered: Option<Cell>,
     trending: Option<Trending>,
     gif_view: GifView,
@@ -363,6 +366,8 @@ pub fn open(store: Entity<Store>, channel: Id, tab: Tab, at: Point<Pixels>, abov
         let emoji_scroller = SmoothScroller::new(ScrollTarget::Handle(scroll.0.borrow().base_handle.clone())).owned_by("picker");
         let gif_scroll = gpui_kit::ScrollHandle::new();
         let gif_scroller = SmoothScroller::new(ScrollTarget::Handle(gif_scroll.clone())).owned_by("picker");
+        let rail_scroll = gpui_kit::ScrollHandle::new();
+        let rail_scroller = SmoothScroller::new(ScrollTarget::Handle(rail_scroll.clone())).owned_by("picker");
         let mut picker = Picker {
             store,
             channel,
@@ -377,6 +382,8 @@ pub fn open(store: Entity<Store>, channel: Id, tab: Tab, at: Point<Pixels>, abov
             scroll,
             emoji_scroller,
             gif_scroller,
+            rail_scroll,
+            rail_scroller,
             hovered: None,
             trending: None,
             gif_view: GifView::Home,
@@ -790,6 +797,7 @@ impl Picker {
             .gap(u(4.))
             .items_center()
             .overflow_y_scroll()
+            .track_scroll(&self.rail_scroll)
             .bg(theme.background.opacity(0.5))
             .children(marks.into_iter().enumerate().map(|(i, (start, mark))| {
                 let (scroll, scroller) = (self.scroll.clone(), self.emoji_scroller.clone());
@@ -836,7 +844,7 @@ impl Picker {
         let empty = self.rows.is_empty();
         h_flex()
             .size_full()
-            .child(rail)
+            .child(div().relative().h_full().flex_shrink_0().child(self.rail_scroller.layer()).child(rail))
             .child(
                 v_flex()
                     .flex_1()

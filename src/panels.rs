@@ -165,6 +165,9 @@ pub struct Panel {
     /// The Forward list, gliding with the wheel.
     scroll: ScrollHandle,
     scroller: SmoothScroller,
+    /// The ban's Delete Message History choices.
+    history_scroll: ScrollHandle,
+    history_scroller: SmoothScroller,
     _watching: Vec<Subscription>,
 }
 
@@ -230,7 +233,9 @@ pub fn open(store: Entity<Store>, what: What, window: &mut Window, cx: &mut App)
         let note_for = if let What::Note { user, .. } = &what { Some(*user) } else { None };
         let scroll = ScrollHandle::new();
         let scroller = SmoothScroller::new(ScrollTarget::Handle(scroll.clone())).owned_by("panel");
-        let panel = Panel { store: store.clone(), what: what.clone(), text, duration: 0, ban_choice: None, chosen: Vec::new(), history: DEFAULT_HISTORY, dropdown_open: false, loading: note_for.is_some(), focus: cx.focus_handle(), scroll, scroller, _watching: vec![typed, keys] };
+        let history_scroll = ScrollHandle::new();
+        let history_scroller = SmoothScroller::new(ScrollTarget::Handle(history_scroll.clone())).owned_by("panel");
+        let panel = Panel { store: store.clone(), what: what.clone(), text, duration: 0, ban_choice: None, chosen: Vec::new(), history: DEFAULT_HISTORY, dropdown_open: false, loading: note_for.is_some(), focus: cx.focus_handle(), scroll, scroller, history_scroll, history_scroller, _watching: vec![typed, keys] };
         if let Some(user) = note_for {
             let core = store.read(cx).core().clone();
             cx.spawn_in(window, async move |this, cx| {
@@ -648,21 +653,27 @@ impl Panel {
             .child(HISTORY[self.history].0)
             .child(Icon::new(if open { IconName::ChevronUp } else { IconName::ChevronDown }).size(u(20.)));
         let options = open.then(|| {
-            v_flex()
-                .id("ban-history-options")
+            div()
+                .id("ban-history-dropdown")
                 .occlude()
                 .absolute()
                 .top(u(48.))
                 .left_0()
                 .right_0()
-                .max_h(u(260.))
-                .overflow_y_scroll()
-                .p(u(6.))
+                .h(u(260.))
                 .rounded(u(8.))
                 .border_1()
                 .border_color(border)
                 .bg(theme.popover)
                 .shadow_lg()
+                .child(self.history_scroller.layer())
+                .child(
+            v_flex()
+                .id("ban-history-options")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.history_scroll)
+                .p(u(6.))
                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .children(HISTORY.iter().enumerate().map(|(i, (name, _))| {
                     let this = this.clone();
@@ -686,7 +697,8 @@ impl Panel {
                         })
                         .child(*name)
                         .when(self.history == i, |d| d.child(Icon::new(IconName::Check).size(u(18.)).text_color(muted)))
-                }))
+                })),
+                )
         });
         div().relative().w_full().child(field).children(options).into_any_element()
     }

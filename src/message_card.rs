@@ -63,6 +63,9 @@ pub fn link(message: &Message, guild: Option<Id>) -> String {
 /// One message card. `extra` sits beside Jump at the top right while hovered (Unpin, say).
 pub fn card(key: SharedString, message: &Message, guild: Option<Id>, cache: &Cache, shared: &Shared, extra: Option<AnyElement>, cx: &App) -> AnyElement {
     let theme = cx.theme();
+    // Rows pass under the pointer too fast while the list scrolls for hover to mean anything,
+    // and each change of it would stop a layered list from just moving.
+    let calm = !crate::smooth_scroll::list_scrolling();
     let author = &message.author;
     let styled = cache.styled_user(author);
     let colors = guild.map(|g| cache.member_colors(g, author.id)).unwrap_or_default();
@@ -81,7 +84,7 @@ pub fn card(key: SharedString, message: &Message, guild: Option<Id>, cache: &Cac
         .text_size(u(12.))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .hover(|d| d.bg(theme.foreground.opacity(0.12)))
+        .when(calm, |d| d.hover(|d| d.bg(theme.foreground.opacity(0.12))))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             crate::links::open(&url, cx);
@@ -98,7 +101,7 @@ pub fn card(key: SharedString, message: &Message, guild: Option<Id>, cache: &Cac
         .bg(theme.foreground.opacity(0.04))
         .border_1()
         .border_color(theme.border)
-        .hover(|d| d.bg(theme.foreground.opacity(0.07)))
+        .when(calm, |d| d.hover(|d| d.bg(theme.foreground.opacity(0.07))))
         .child(
             h_flex()
                 .gap(u(8.))
@@ -124,7 +127,7 @@ pub fn card(key: SharedString, message: &Message, guild: Option<Id>, cache: &Cac
                 .right(u(8.))
                 .gap(u(4.))
                 .opacity(0.)
-                .group_hover(group, |d| d.opacity(1.))
+                .when(calm, |d| d.group_hover(group, |d| d.opacity(1.)))
                 .children(extra)
                 .child(jump),
         )

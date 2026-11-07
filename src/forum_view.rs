@@ -12,7 +12,7 @@ use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, ScrollHandle, SharedString,
+    AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img,
 };
 
@@ -426,7 +426,8 @@ impl Render for ForumView {
 
         let failed = matches!(self.fetch, Fetch::Failed(_));
         let status = match &self.fetch {
-            Fetch::Loading => Some("Loading posts\u{2026}".to_string()),
+            // Skeleton cards show instead.
+            Fetch::Loading => None,
             Fetch::Failed(error) => Some(format!("Couldn't load posts: {error}")),
             _ if cards.is_empty() => Some(if self.tags.is_empty() { "No posts yet. Be the first." } else { "No posts with these tags." }.to_string()),
             _ => None,
@@ -452,6 +453,7 @@ impl Render for ForumView {
                 } else {
                     v_flex().w_full().gap(u(8.)).children(card_views).into_any_element()
                 })
+                .when(matches!(self.fetch, Fetch::Loading), |d| d.child(post_skeletons(gallery, cx)))
                 .when_some(status, |d, text| d.child(div().p(u(24.)).text_center().text_size(u(14.)).text_color(muted).child(text)))
                 .when(failed, |d| {
                     d.child(
@@ -693,4 +695,37 @@ impl ForumView {
             )
             .into_any_element()
     }
+}
+
+/// Grey stand-ins for posts while they load, shaped like the cards they become.
+fn post_skeletons(gallery: bool, cx: &App) -> AnyElement {
+    const TITLES: [f32; 6] = [220., 160., 260., 190., 140., 240.];
+    let theme = cx.theme();
+    let (strong, faint) = (theme.foreground.opacity(0.14), theme.foreground.opacity(0.07));
+    let bar = |w: f32, h: f32, color: Hsla| div().w(u(w)).max_w_full().h(u(h)).flex_shrink_0().rounded_full().bg(color);
+    let card = |i: usize| {
+        let text = v_flex()
+            .gap(u(8.))
+            .child(bar(TITLES[i % TITLES.len()], 16., strong))
+            .child(bar(TITLES[(i + 2) % TITLES.len()] + 60., 12., faint))
+            .child(h_flex().gap(u(8.)).items_center().child(div().size(u(18.)).rounded_full().bg(faint)).child(bar(70., 12., faint)).child(bar(40., 12., faint)));
+        let base = v_flex().p(u(12.)).rounded(u(8.)).border_1().border_color(theme.border).bg(theme.popover);
+        if gallery {
+            base.w(u(300.)).flex_shrink_0().gap(u(8.)).child(div().w_full().h(u(170.)).rounded(u(6.)).bg(faint)).child(text).into_any_element()
+        } else {
+            base.w_full().child(text).into_any_element()
+        }
+    };
+    let cards = (0..6).map(card);
+    let list = if gallery {
+        h_flex().w_full().gap(u(12.)).flex_wrap().items_start().children(cards)
+    } else {
+        v_flex().w_full().gap(u(8.)).children(cards)
+    };
+    list.with_animation(
+        "post-skeleton",
+        gpui_kit::Animation::new(std::time::Duration::from_millis(1600)).repeat().with_easing(gpui_kit::bounce(gpui_kit::ease_in_out)),
+        |this, t| this.opacity(1. - t * 0.4),
+    )
+    .into_any_element()
 }

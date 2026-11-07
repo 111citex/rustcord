@@ -42,6 +42,9 @@ pub struct Rtp {
     pub seq: u16,
     pub ssrc: u32,
     pub payload: Vec<u8>,
+    pub payload_type: u8,
+    pub marker: bool,
+    pub timestamp: u32,
 }
 
 /// How long the part of the header that's readable is.
@@ -91,17 +94,100 @@ pub fn open_packet(mode: Mode, key: &[u8; 32], packet: &[u8]) -> Option<Rtp> {
         }
         opened.drain(..skip);
     }
+    // Padding: filler at the end, its own length in its last byte. Video's often padded,
+    // and left on it ends up inside the frame, which then fails DAVE's check.
+    if packet[0] & 0x20 != 0 {
+        let pad = usize::from(*opened.last()?);
+        if pad == 0 || pad > opened.len() {
+            return None;
+        }
+        opened.truncate(opened.len() - pad);
+    }
     Some(Rtp {
         seq: u16::from_be_bytes([packet[2], packet[3]]),
         ssrc: u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),
         payload: opened,
+        payload_type: packet[1] & 0x7f,
+        marker: packet[1] & 0x80 != 0,
+        timestamp: u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
     })
 }
 
-/// Seals a packet of ours.
+/// Seals an RTCP packet of ours: its first 8 bytes stay readable, as with RTP's header.
+pub fn seal_rtcp(mode: Mode, key: &[u8; 32], counter: u32, packet: &[u8]) -> Option<Vec<u8>> {
+    const CLEAR: usize = 8;
+    let (clear, body) = packet.split_at_checked(CLEAR)?;
+    let counter = counter.to_be_bytes();
+    let plain = Payload { msg: body, aad: clear };
+    let sealed = match mode {
+        Mode::Aes => {
+            let mut nonce = [0u8; 12];
+            nonce[..COUNTER].copy_from_slice(&counter);
+            Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key)).encrypt(Nonce::from_slice(&nonce), plain).ok()?
+        }
+        Mode::XChaCha => {
+            let mut nonce = [0u8; 24];
+            nonce[..COUNTER].copy_from_slice(&counter);
+            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key)).encrypt(XNonce::from_slice(&nonce), plain).ok()?
+        }
+    };
+    let mut out = clear.to_vec();
+    out.extend_from_slice(&sealed);
+    out.extend_from_slice(&counter);
+    Some(out)
+}
+
+/// Opens an RTCP packet: its first 8 bytes are readable, the rest sealed. `None` if it isn't
+/// RTCP or doesn't open. Returns the whole packet, header and all, opened.
+pub fn open_rtcp(mode: Mode, key: &[u8; 32], packet: &[u8]) -> Option<Vec<u8>> {
+    const CLEAR: usize = 8;
+    if packet.len() < CLEAR + TAG + COUNTER || packet[0] >> 6 != 2 || !(200..=206).contains(&packet[1]) {
+        return None;
+    }
+    let (body, counter) = packet.split_at(packet.len() - COUNTER);
+    let opened = open(mode, key, counter, &body[CLEAR..], &body[..CLEAR])?;
+    let mut whole = body[..CLEAR].to_vec();
+    whole.extend_from_slice(&opened);
+    Some(whole)
+}
+
+/// Whether an opened RTCP packet asks for a keyframe, and of which SSRC: a picture loss
+/// indication (payload-specific feedback, format 1), or a full intra request (format 4).
+pub fn keyframe_request(rtcp: &[u8]) -> Option<u32> {
+    let mut at = 0;
+    // A packet can hold several reports, one after another.
+    while at + 12 <= rtcp.len() {
+        let (first, kind) = (rtcp[at], rtcp[at + 1]);
+        let words = u16::from_be_bytes([rtcp[at + 2], rtcp[at + 3]]) as usize;
+        if kind == 206 && matches!(first & 0x1f, 1 | 4) {
+            return Some(u32::from_be_bytes([rtcp[at + 8], rtcp[at + 9], rtcp[at + 10], rtcp[at + 11]]));
+        }
+        at += (words + 1) * 4;
+    }
+    None
+}
+
+/// A request for a keyframe (RTCP picture loss indication), from `ours` about `theirs`.
+pub fn pli(ours: u32, theirs: u32) -> [u8; 12] {
+    let mut packet = [0u8; 12];
+    packet[0] = 0x81; // version 2, format 1: PLI
+    packet[1] = 206; // payload-specific feedback
+    packet[2..4].copy_from_slice(&2u16.to_be_bytes()); // length in words, minus one
+    packet[4..8].copy_from_slice(&ours.to_be_bytes());
+    packet[8..12].copy_from_slice(&theirs.to_be_bytes());
+    packet
+}
+
+/// Seals an audio packet of ours (Opus, payload type 120).
 pub fn seal_packet(mode: Mode, key: &[u8; 32], seq: u16, timestamp: u32, ssrc: u32, counter: u32, payload: &[u8]) -> Option<Vec<u8>> {
+    seal_rtp(mode, key, 0x78, false, seq, timestamp, ssrc, counter, payload)
+}
+
+/// Seals an RTP packet of ours with `payload_type`, `marker` set on a frame's last packet.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_rtp(mode: Mode, key: &[u8; 32], payload_type: u8, marker: bool, seq: u16, timestamp: u32, ssrc: u32, counter: u32, payload: &[u8]) -> Option<Vec<u8>> {
     let mut packet = Vec::with_capacity(RTP_HEADER + payload.len() + TAG + COUNTER);
-    packet.extend_from_slice(&[0x80, 0x78]);
+    packet.extend_from_slice(&[0x80, (payload_type & 0x7f) | if marker { 0x80 } else { 0 }]);
     packet.extend_from_slice(&seq.to_be_bytes());
     packet.extend_from_slice(&timestamp.to_be_bytes());
     packet.extend_from_slice(&ssrc.to_be_bytes());
@@ -135,7 +221,7 @@ mod tests {
         for mode in [Mode::Aes, Mode::XChaCha] {
             let packet = seal_packet(mode, &KEY, 5, 960, 42, 1, b"hello").unwrap();
             let opened = open_packet(mode, &KEY, &packet).unwrap();
-            assert_eq!(opened, Rtp { seq: 5, ssrc: 42, payload: b"hello".to_vec() });
+            assert_eq!((opened.seq, opened.ssrc, opened.payload, opened.payload_type, opened.timestamp), (5, 42, b"hello".to_vec(), 0x78, 960));
         }
     }
 
@@ -145,6 +231,37 @@ mod tests {
         assert!(open_packet(Mode::Aes, &[8; 32], &packet).is_none());
         packet[2] ^= 1;
         assert!(open_packet(Mode::Aes, &KEY, &packet).is_none(), "the header is covered too");
+    }
+
+    #[test]
+    fn padding_comes_off() {
+        let key = KEY;
+        // Three bytes of audio, then three of padding ending in its length.
+        let mut packet = seal_packet(Mode::Aes, &key, 1, 0, 9, 1, &[1, 2, 3, 0, 0, 3]).unwrap();
+        packet[0] |= 0x20;
+        // The header's covered by the seal: seal again with the flag set.
+        let sealed = {
+            let mut header = packet[..RTP_HEADER].to_vec();
+            header[0] |= 0x20;
+            let counter = 1u32.to_be_bytes();
+            let mut nonce = [0u8; 12];
+            nonce[..4].copy_from_slice(&counter);
+            let body = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key))
+                .encrypt(Nonce::from_slice(&nonce), Payload { msg: &[1, 2, 3, 0, 0, 3], aad: &header })
+                .unwrap();
+            [header, body, counter.to_vec()].concat()
+        };
+        assert_eq!(open_packet(Mode::Aes, &key, &sealed).unwrap().payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn keyframe_requests_are_read() {
+        let pli = pli(7, 42);
+        let sealed = seal_rtcp(Mode::Aes, &KEY, 3, &pli).unwrap();
+        let opened = open_rtcp(Mode::Aes, &KEY, &sealed).unwrap();
+        assert_eq!(keyframe_request(&opened), Some(42));
+        let marked = seal_rtp(Mode::Aes, &KEY, 101, true, 1, 2, 3, 4, b"x").unwrap();
+        assert_eq!(marked[1], 0x80 | 101, "marker and payload type");
     }
 
     #[test]

@@ -82,6 +82,8 @@ pub struct Participant {
     pub server_muted: bool,
     pub server_deafened: bool,
     pub streaming: bool,
+    /// Their camera's on.
+    pub video: bool,
     /// Their display name style's font, and their server tag's badge.
     pub font: Option<&'static str>,
     pub tag_badge: Option<String>,
@@ -107,6 +109,7 @@ pub fn participants(cache: &Cache, guild: Id, channel: Id) -> Vec<Participant> {
                 server_muted: state.mute,
                 server_deafened: state.deaf,
                 streaming: state.self_stream,
+                video: state.self_video,
                 font: user.and_then(|u| crate::name_fonts::family(u.extras.display_name_styles.as_ref()?.font_id)),
                 tag_badge: user.and_then(|u| u.server_tag()?.1),
                 decoration: user.and_then(|u| u.decoration_url()),

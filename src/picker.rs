@@ -194,11 +194,34 @@ fn with_used<R>(f: impl FnOnce(&mut HashMap<String, u32>) -> R) -> R {
 }
 
 fn note_used(cell: &Cell) {
+    note_used_key(cell.key());
+}
+
+fn note_used_key(key: String) {
     let body = with_used(|used| {
-        *used.entry(cell.key()).or_default() += 1;
+        *used.entry(key).or_default() += 1;
         serde_json::to_vec(used).unwrap_or_default()
     });
     let _ = std::fs::write(used_path(), body);
+}
+
+/// The key a standard emoji or a server's is counted under, as Frequently Used counts.
+pub fn use_key(emoji: Option<&str>, custom: Option<(&str, cord_core::Id, bool)>) -> Option<String> {
+    match (custom, emoji) {
+        (Some((name, id, animated)), _) => Some(format!("custom:{id}:{name}:{animated}")),
+        (None, Some(emoji)) => Some(emoji.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// How often the emoji under `key` has been used here.
+pub fn uses(key: &str) -> u32 {
+    with_used(|used| used.get(key).copied().unwrap_or(0))
+}
+
+/// Counts a use of the emoji under `key`: autocomplete counts as the picker does.
+pub fn count_use(key: String) {
+    note_used_key(key);
 }
 
 // Favourites: picked with Alt+click, kept here, on this computer, in the order added.
@@ -646,6 +669,24 @@ fn star_for(gif: &Gif) -> FavoriteGif {
     FavoriteGif { url: gif.url.clone(), src: kept, format, width: gif.width, height: gif.height, order: 0 }
 }
 
+/// `url` asked for at `width` device pixels wide: Discord's media proxy makes it that
+/// small, and the decoder shrinks its frames to cover `width` × `fit_height` either way.
+fn sized(url: &str, width: u32, fit_height: u32, w: u32, h: u32) -> String {
+    let mut url = url.to_string();
+    if url.contains("://media.discordapp.net/") && !url.contains("width=") {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str(&format!("width={width}"));
+        if w > 0 && h > 0 {
+            url.push_str(&format!("&height={}", (width as u64 * h as u64 / w as u64).max(1)));
+        }
+    }
+    if !url.contains("#fit=") {
+        // Frames shrink to cover this: a height of 1 lets the width alone decide.
+        url.push_str(&format!("#fit={width}x{}", fit_height.max(1)));
+    }
+    url
+}
+
 /// How many video tiles play at once: each is a decoder.
 const MOST_PLAYING: usize = 4;
 
@@ -908,7 +949,10 @@ impl Picker {
                             .cursor_pointer()
                             .hover(|d| d.opacity(0.85))
                             .on_click(cx.listener(move |this, _, _, cx| this.show_gifs(view.clone(), cx)))
-                            .when_some(still.clone().filter(|s| !s.is_empty()), |d, url| d.child(img(url).absolute().size_full().object_fit(ObjectFit::Cover)))
+                            .when_some(still.clone().filter(|s| !s.is_empty()), |d, url| {
+                                let url = sized(&url, (WIDTH / 2. * window.scale_factor()).ceil() as u32, (110. * window.scale_factor()).ceil() as u32, 0, 0);
+                                d.child(crate::anim::image_still_unless(url, ObjectFit::Cover, 0., false).absolute().size_full())
+                            })
                             .child(
                                 div()
                                     .absolute()
@@ -955,10 +999,33 @@ impl Picker {
         let mut columns: [Vec<AnyElement>; 2] = [Vec::new(), Vec::new()];
         let mut heights = [0f32; 2];
         let mut playing = 0;
+        // Only tiles within a screen of what's showing load: the rest are their shape in grey.
+        let (top, seen) = (-f32::from(self.gif_scroll.offset().y), f32::from(self.gif_scroll.bounds().size.height));
+        let seen = if seen > 0. { seen } else { 600. };
+        let near = |y: f32, tall: f32| y + tall >= top - seen && y <= top + seen * 2.;
+        let scale = window.scale_factor();
+        let device = |px: f32| (px * scale).ceil() as u32;
         for (ix, (url, shown, width, height, star)) in items.into_iter().enumerate() {
+            let column = usize::from(heights[1] < heights[0]);
+            let y = heights[column];
+            let guess = if width > 0 && height > 0 { COLUMN * height as f32 / width as f32 } else { COLUMN * 0.6 };
+            let close = near(y, guess);
+            // The picture's own shape once it's here: what Discord stores can be missing or off.
+            let shown = match shown {
+                Tile::Picture(url) if close => Tile::Picture(sized(&url, device(COLUMN), 1, width, height)),
+                other => other,
+            };
+            let real = match &shown {
+                Tile::Picture(url) if close => crate::anim::loaded_size(url, window, cx),
+                _ => None,
+            };
+            let tall = real.map_or(guess, |(w, h)| COLUMN * h / w).clamp(40., COLUMN * 2.5);
+            heights[column] += tall + 8.;
+            let hover_key = SharedString::from(format!("gif-tile-{ix}"));
+            let moving = crate::transition::pointer_on(&hover_key);
             // A video plays in a player of its own, for the first few: the rest wait as blanks.
             let player = match &shown {
-                Tile::Video(video) if playing < MOST_PLAYING => {
+                Tile::Video(video) if close && playing < MOST_PLAYING => {
                     playing += 1;
                     crate::gifs::warm_url(video, cx);
                     crate::gifs::player(video, cx)
@@ -969,9 +1036,6 @@ impl Picker {
                 // Its first frames come in after this: look again then.
                 window.request_animation_frame();
             }
-            let tall = if width > 0 && height > 0 { COLUMN * height as f32 / width as f32 } else { COLUMN * 0.6 };
-            let column = usize::from(heights[1] < heights[0]);
-            heights[column] += tall + 8.;
             let is_starred = starred.contains(&url);
             let send_url = url.clone();
             columns[column].push(
@@ -985,9 +1049,11 @@ impl Picker {
                     .overflow_hidden()
                     .bg(tile_bg)
                     .cursor_pointer()
+                    .on_hover(crate::transition::track_pointer(hover_key))
                     .on_click(cx.listener(move |this, _, _, cx| this.pick_gif(send_url.clone(), cx)))
                     .map(|d| match (shown, player) {
-                        (Tile::Picture(url), _) => d.child(img(url).size_full().object_fit(ObjectFit::Cover)),
+                        // Still until the pointer's on it, as Discord does with reduced motion.
+                        (Tile::Picture(url), _) if close => d.child(crate::anim::image_still_unless(url, ObjectFit::Contain, 0., moving).size_full()),
                         (Tile::Video(_), Some(player)) => d.child(alhazen_gpui::video_view(player).object_fit(ObjectFit::Cover).size_full()),
                         _ => d,
                     })

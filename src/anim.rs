@@ -32,6 +32,9 @@ const CHECK_ANYWAY: Duration = Duration::from_secs(30);
 const OVER_BUDGET_CHECK: Duration = Duration::from_secs(6);
 /// Rows remembered with their pictures, for preparing them when near the screen again.
 const ROWS_REMEMBERED: usize = 4000;
+/// A picture asked for but not drawn since, still loading or loaded after its row left
+/// the screen, goes after this. Untracked, it stayed decoded, every frame, for good.
+const ASKED_FOR: Duration = Duration::from_secs(10);
 
 struct Decoded {
     image: Arc<RenderImage>,
@@ -183,6 +186,8 @@ pub fn note_view(top: usize, screens: u8, window: &mut Window, cx: &mut App) {
 struct Pictures {
     started: Instant,
     held: HashMap<Resource, Decoded>,
+    /// Pictures still loading, and when they were last asked for.
+    asked: HashMap<Resource, Instant>,
     total: usize,
     /// A full redraw was asked for at this moment, to see what's really on screen.
     sweeping: Option<Instant>,
@@ -193,7 +198,7 @@ impl Global for Pictures {}
 
 fn pictures(cx: &mut App) -> &mut Pictures {
     if !cx.has_global::<Pictures>() {
-        cx.set_global(Pictures { started: Instant::now(), held: HashMap::new(), total: 0, sweeping: None, resets: 0 });
+        cx.set_global(Pictures { started: Instant::now(), held: HashMap::new(), asked: HashMap::new(), total: 0, sweeping: None, resets: 0 });
     }
     cx.global_mut::<Pictures>()
 }
@@ -214,6 +219,7 @@ fn touch(resource: &Resource, image: &Arc<RenderImage>, cx: &mut App) {
         });
     }
     let list = pictures(cx);
+    list.asked.remove(resource);
     match list.held.get_mut(resource) {
         Some(known) => {
             known.used = now;
@@ -244,6 +250,42 @@ fn forget(resource: &Resource, cx: &mut App) {
     note_size(list);
     cx.remove_asset::<ImgResourceLoader>(resource);
     cx.drop_image(dropped.image, None);
+}
+
+/// Notes a picture still loading, so it's let go if it's never drawn.
+fn note_asked(resource: &Resource, cx: &mut App) {
+    pictures(cx).asked.insert(resource.clone(), Instant::now());
+}
+
+/// The size of the picture at `url` once it's loaded, starting it loading if it isn't.
+pub fn loaded_size(url: &str, window: &mut Window, cx: &mut App) -> Option<(f32, f32)> {
+    let ImageSource::Resource(resource) = ImageSource::from(url.to_string()) else { return None };
+    match window.use_asset::<ImgResourceLoader>(&resource, cx) {
+        Some(Ok(image)) => {
+            let size = image.size(0);
+            (size.width.0 > 0 && size.height.0 > 0).then_some((size.width.0 as f32, size.height.0 as f32))
+        }
+        None => {
+            note_asked(&resource, cx);
+            None
+        }
+        Some(Err(_)) => None,
+    }
+}
+
+/// Lets go of pictures asked for once and never drawn: the row went before they loaded.
+fn forget_unasked(now: Instant, cx: &mut App) {
+    let list = pictures(cx);
+    let stale: Vec<Resource> = list.asked.iter().filter(|(_, at)| now.duration_since(**at) > ASKED_FOR).map(|(r, _)| r.clone()).collect();
+    if stale.is_empty() {
+        return;
+    }
+    for resource in &stale {
+        pictures(cx).asked.remove(resource);
+        // A load still running is dropped with it; asked for again, it starts over.
+        cx.remove_asset::<ImgResourceLoader>(resource);
+    }
+    crate::perf::give_back_freed_memory();
 }
 
 /// A picture, as `to_drop` sees it.
@@ -289,6 +331,7 @@ fn to_drop<K: Clone>(mut pictures: Vec<Candidate<K>>, redraw: Instant, now: Inst
 /// to stop moving, since a redraw of the whole window is a frame that could be missed.
 fn sweep(cx: &mut App) {
     let now = Instant::now();
+    forget_unasked(now, cx);
     let resets = gpui_kit::frame_stats::ATLAS_RESETS.load(std::sync::atomic::Ordering::Relaxed);
     if pictures(cx).resets != resets {
         // Their pixels are gone with the atlas: they have to be loaded again.
@@ -369,8 +412,12 @@ impl PictureCache {
 impl gpui_kit::ImageCache for PictureCache {
     fn load(&mut self, resource: &Resource, window: &mut Window, cx: &mut App) -> Option<Result<Arc<RenderImage>, gpui_kit::ImageCacheError>> {
         let loaded = window.use_asset::<ImgResourceLoader>(resource, cx);
-        if let Some(Ok(image)) = &loaded {
-            touch(resource, image, cx);
+        match &loaded {
+            Some(Ok(image)) => touch(resource, image, cx),
+            None => {
+                pictures(cx).asked.insert(resource.clone(), Instant::now());
+            }
+            Some(Err(_)) => {}
         }
         loaded
     }
@@ -419,6 +466,8 @@ pub fn image_top(source: impl Into<ImageSource>, fit: ObjectFit, radius: f32) ->
 }
 
 thread_local! {
+    /// The frame each picture last drew, to keep up while its next isn't ready.
+    static SHOWN: std::cell::RefCell<HashMap<gpui_kit::ImageId, (std::sync::Weak<RenderImage>, usize)>> = std::cell::RefCell::default();
     /// Pictures that weren't ready when first drawn: `None` while they load, then
     /// when they arrived, while they fade in.
     static ARRIVING: std::cell::RefCell<std::collections::HashMap<String, Option<std::time::Instant>>> = std::cell::RefCell::default();
@@ -444,6 +493,9 @@ pub fn image_fading(url: String, fallback: Option<String>, fit: ObjectFit, radiu
             if let (Some(Err(_)), Some(ImageSource::Resource(other))) = (&loaded, fallback.map(ImageSource::from)) {
                 loaded = window.use_asset::<ImgResourceLoader>(&other, cx);
                 held = other;
+            }
+            if loaded.is_none() {
+                note_asked(&held, cx);
             }
             ARRIVING.with_borrow_mut(|a| match &loaded {
                 None => {
@@ -505,7 +557,16 @@ fn image_with(source: ImageSource, fallback: Option<String>, fit: ObjectFit, rad
     image_with_corners(source, fallback, fit, radius, false)
 }
 
+/// `image`, held on its first frame unless `moving`.
+pub fn image_still_unless(source: impl Into<ImageSource>, fit: ObjectFit, radius: f32, moving: bool) -> impl IntoElement + Styled {
+    image_painted(source.into(), None, fit, radius, false, moving)
+}
+
 fn image_with_corners(source: ImageSource, fallback: Option<String>, fit: ObjectFit, radius: f32, top_only: bool) -> impl IntoElement + Styled {
+    image_painted(source, fallback, fit, radius, top_only, true)
+}
+
+fn image_painted(source: ImageSource, fallback: Option<String>, fit: ObjectFit, radius: f32, top_only: bool, moving: bool) -> impl IntoElement + Styled {
     canvas(
         move |_, window, cx| match source {
             ImageSource::Resource(resource) => {
@@ -518,6 +579,9 @@ fn image_with_corners(source: ImageSource, fallback: Option<String>, fit: Object
                     }
                     (loaded, _) => (resource, loaded),
                 };
+                if loaded.is_none() {
+                    note_asked(&resource, cx);
+                }
                 let image = loaded.and_then(Result::ok)?;
                 touch(&resource, &image, cx);
                 Some(image)
@@ -526,9 +590,9 @@ fn image_with_corners(source: ImageSource, fallback: Option<String>, fit: Object
             _ => None,
         },
         move |bounds, image: Option<Arc<RenderImage>>, window, cx| {
-            let Some(image) = image else { return };
-            let image = crate::animated::frame(&image, window, cx);
-            let count = image.frame_count();
+            let Some(original) = image else { return };
+            let image = if moving { crate::animated::frame(&original, window, cx) } else { original.clone() };
+            let count = if moving { image.frame_count() } else { 1 };
             let frame = if count > 1 {
                 let delays: Vec<Duration> = (0..count).map(|i| Duration::from(image.delay(i))).collect();
                 let (frame, wait) = frame_at(&delays, pictures(cx).started.elapsed());
@@ -539,6 +603,21 @@ fn image_with_corners(source: ImageSource, fallback: Option<String>, fit: Object
                 frame
             } else {
                 0
+            };
+            // A frame that can't be drawn yet leaves the last one that could up, rather than nothing.
+            let (image, frame) = if window.image_frame_ready(&image, frame) {
+                SHOWN.with_borrow_mut(|shown| {
+                    if shown.len() > 4000 {
+                        shown.clear();
+                    }
+                    shown.insert(original.id, (Arc::downgrade(&image), frame));
+                });
+                (image, frame)
+            } else {
+                // Held weakly: a picture let go of isn't kept by this.
+                SHOWN.with_borrow(|shown| shown.get(&original.id).and_then(|(last, f)| Some((last.upgrade()?, *f))))
+                    .filter(|(last, f)| window.image_frame_ready(last, *f))
+                    .unwrap_or((image, frame))
             };
             let round = window.rem_size() * (radius / 16.);
             let corners = Corners { top_left: round, top_right: round, bottom_left: if top_only { gpui_kit::px(0.) } else { round }, bottom_right: if top_only { gpui_kit::px(0.) } else { round } };

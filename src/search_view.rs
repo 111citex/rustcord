@@ -166,9 +166,19 @@ pub fn search_box(search: &Entity<Search>, store: &Entity<Store>, scope: Scope, 
                 .child(div().text_size(u(14.)).font_weight(FontWeight::MEDIUM).child(SharedString::from(choice.label)))
                 .child(div().min_w_0().truncate().text_size(u(13.)).text_color(theme.muted_foreground).child(SharedString::from(choice.detail)))
         });
+        let outside = search.clone();
         v_flex()
             .id("search-menu")
             .occlude()
+            // The box keeps focus when something else is clicked, so it can't say so itself.
+            .on_mouse_down_out(move |_, _, cx| {
+                outside.update(cx, |search, cx| {
+                    if search.focused {
+                        search.focused = false;
+                        cx.notify();
+                    }
+                });
+            })
             .absolute()
             .top(u(36.))
             .right_0()
@@ -208,7 +218,7 @@ pub fn search_box(search: &Entity<Search>, store: &Entity<Store>, scope: Scope, 
 }
 
 /// The results, in the member list's place.
-pub fn results(search: &Entity<Search>, store: &Entity<Store>, parsed: Rc<RefCell<ParseCache>>, revealed: Rc<RefCell<HashSet<(Id, u16)>>>, text_size: f32, cx: &App) -> AnyElement {
+pub fn results(search: &Entity<Search>, store: &Entity<Store>, parsed: Rc<RefCell<ParseCache>>, revealed: Rc<RefCell<HashSet<(Id, u16)>>>, text_size: f32, smooth: bool, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let state = search.read(cx);
     let Some(scope) = state.scope else { return div().into_any_element() };
@@ -345,7 +355,7 @@ pub fn results(search: &Entity<Search>, store: &Entity<Store>, parsed: Rc<RefCel
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(state.scroller.layer())
+                .when(smooth, |d| d.child(state.scroller.layer()))
                 .child(div().id("search-results").flex_1().min_h_0().overflow_y_scroll().track_scroll(&state.scroll).child(body)),
         )
         .into_any_element()

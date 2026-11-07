@@ -17,8 +17,8 @@ use gpui_kit::component::{ActiveTheme, Icon, Selectable, Sizable, h_flex, v_flex
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     AnimationExt, AnyElement, AnyView, App, AppContext, ClickEvent, Context, Entity, FollowMode, FontWeight, InteractiveElement,
-    IntoElement, Hsla, ListAlignment, ListState, ParentElement, Pixels, Point, Render, StatefulInteractiveElement, Styled,
-    SharedString, StyledImage, Subscription, WeakEntity, Window, div, img, list,
+    IntoElement, Hsla, InteractiveText, ListAlignment, ListState, ParentElement, Pixels, Point, Render, StatefulInteractiveElement, Styled,
+    SharedString, StyledImage, StyledText, Subscription, WeakEntity, Window, div, img, list,
 };
 
 mod threads;
@@ -85,6 +85,8 @@ pub struct ChannelPage {
     /// In a voice channel: whether its chat panel is open, how wide, and
     /// whether its edge is being dragged.
     vc_chat_open: bool,
+    /// The Go Live shown big in the voice channel, everyone else in a strip under it.
+    vc_focus: Option<Id>,
     vc_scroll: (gpui_kit::ScrollHandle, crate::smooth_scroll::SmoothScroller),
     poll_ui: Rc<RefCell<crate::markdown_view::PollUi>>,
     /// The voice stage's width last frame, in pixels.
@@ -349,10 +351,23 @@ impl ChannelPage {
                         return;
                     }
                     let _ = page.update(cx, |page, cx| {
-                        // Esc in the search box leaves it for the message box.
+                        // Esc in the search box: first it empties the box, then it closes
+                        // the results, then it leaves for the message box.
                         let search_input = page.search.read(cx).input.clone();
                         if key == "escape" && gpui_kit::Focusable::focus_handle(search_input.read(cx), cx).is_focused(window) {
-                            page.input.update(cx, |input, cx| input.focus(window, cx));
+                            // An open filter menu goes first.
+                            if page.search.read(cx).focused {
+                                page.search.update(cx, |search, cx| {
+                                    search.focused = false;
+                                    cx.notify();
+                                });
+                            } else if !search_input.read(cx).value().is_empty() {
+                                search_input.update(cx, |input, cx| input.set_value("", window, cx));
+                            } else if page.search.read(cx).scope.is_some() {
+                                page.search.update(cx, |search, cx| search.close(window, cx));
+                            } else {
+                                page.input.update(cx, |input, cx| input.focus(window, cx));
+                            }
                             cx.stop_propagation();
                             return;
                         }
@@ -474,6 +489,7 @@ impl ChannelPage {
             hovered_tools: Rc::default(),
             asked_members: HashSet::new(),
             vc_chat_open: true,
+            vc_focus: None,
             vc_scroll: {
                 let handle = gpui_kit::ScrollHandle::new();
                 (handle.clone(), crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(handle)))
@@ -572,9 +588,21 @@ impl ChannelPage {
         let store_entity = self.ctx.services.store.clone();
         let controls = match &status {
             Some(status) => {
-                let (deafen, leave) = (store_entity.clone(), store_entity.clone());
+                let (deafen, leave, mute, camera) = (store_entity.clone(), store_entity.clone(), store_entity.clone(), store_entity.clone());
+                let muted = status.muted || status.deaf;
+                let camera_on = status.camera;
                 h_flex()
                     .gap(u(16.))
+                    .child(
+                        button("call-camera", if camera_on { Hsla::from(gpui_kit::rgb(0x248046)) } else { theme.foreground.opacity(0.15) }, if camera_on { "Turn Off Camera" } else { "Turn On Camera" })
+                            .on_click(move |_, _, cx| camera.update(cx, |store, cx| store.toggle_camera(cx)))
+                            .child(Icon::default().path(if camera_on { "icons/video.svg" } else { "icons/video-off.svg" }).size(u(22.))),
+                    )
+                    .child(
+                        button("call-mute", if muted { Hsla::from(gpui_kit::rgb(0xda373c)) } else { theme.foreground.opacity(0.15) }, if muted { "Unmute" } else { "Mute" })
+                            .on_click(move |_, _, cx| mute.update(cx, |store, cx| store.toggle_mute(cx)))
+                            .child(Icon::new(if muted { IconName::MicOff } else { IconName::Mic }).size(u(22.))),
+                    )
                     .child(
                         button("call-deafen", theme.foreground.opacity(0.15), if status.deaf { "Undeafen" } else { "Deafen" })
                             .on_click(move |_, _, cx| deafen.update(cx, |store, cx| store.toggle_deaf(cx)))
@@ -815,11 +843,65 @@ impl ChannelPage {
         // As many 16:9 tiles to a row as fit, never squeezed below the minimum.
         let rem = f32::from(window.rem_size()) / 16.;
         let room = (self.vc_width.get() / rem).max(320.) - 32.;
-        let (columns, width, height) = voice_tile_size(room, people.len());
+        // Focused on a stream we're watching: it's big, and the tiles are a strip of small ones.
+        let focus = self.vc_focus.filter(|f| store.watching() == Some(*f) && people.iter().any(|p| p.user_id == *f && p.streaming));
+        let (columns, width, height) = if focus.is_some() { (usize::MAX, 192., 108.) } else { voice_tile_size(room, people.len()) };
+        let focus_name = focus.and_then(|f| people.iter().find(|p| p.user_id == f)).map(|p| p.name.clone());
+        let focus_height = focus.and_then(|f| store.stream_picture(f)).map(|p| if p.source.1 > 0 { p.source.1 } else { p.height });
+        // Who's watching it, with the names and pictures to show them by.
+        let viewers: Vec<(Id, String, String)> = if focus.is_some() {
+            store
+                .stream_viewers()
+                .into_iter()
+                .filter_map(|id| {
+                    let user = store.cache().user(id)?;
+                    Some((id, store.cache().display_name(self.guild, user).to_string(), store.cache().avatar_url(self.guild, user, 64)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let core = self.ctx.services.core.clone();
         let speaking_now = self.ctx.services.store.read(cx).speaking().clone();
+        let store_entity = self.ctx.services.store.clone();
+        // The strip under a focused stream: only as many as fit, and a "+N" for whoever didn't.
+        let mut people = people;
+        let mut left_out = 0;
+        // Streams first, then cameras, then everyone else, each in the channel's own order:
+        // a stable place for everyone, rather than jumping about with whoever's talking.
+        people.sort_by_key(|p| (!p.streaming, store.camera(p.user_id).is_none()));
+        if focus.is_some() {
+            let fits = (((room + 8.) / (width + 8.)).floor() as usize).max(1);
+            if people.len() > fits {
+                left_out = people.len() - (fits - 1);
+                people.truncate(fits - 1);
+            }
+        }
+        let more = (left_out > 0).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(u(width))
+                .h(u(height))
+                .flex_shrink_0()
+                .rounded(u(8.))
+                .bg(tile)
+                .text_size(u(20.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(muted)
+                .child(format!("+{left_out}"))
+                .into_any_element()
+        });
         let mut tiles = people.into_iter().map(|p| {
             let speaking = speaking_now.contains(&p.user_id);
+            let camera = store.camera(p.user_id).is_some();
+            // Their Go Live: being watched here, or a button to watch it.
+            let watching = p.streaming && store.watching() == Some(p.user_id);
+            let in_call = store.voice_status().is_some_and(|v| v.channel == channel);
+            let (watch_store, stop_store) = (store_entity.clone(), store_entity.clone());
+            let tile_group = SharedString::from(format!("vc-tile-{}", p.user_id.0));
+            let focusable = watching;
             let color = crate::avatar_colors::color(&p.avatar_url, &core, cx);
             let (user, name) = (p.user_id, p.name.clone());
             div()
@@ -848,6 +930,88 @@ impl ChannelPage {
                     p.decoration.clone(),
                     tile,
                 ))
+                // Their camera, over the avatar, under their name.
+                .group(tile_group.clone())
+                .id(("vc-tile", user.0))
+                // A stream being watched goes big on a click.
+                .when(focusable, |d| {
+                    d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                        this.vc_focus = Some(user);
+                        cx.notify();
+                    }))
+                })
+                .when(camera && !watching, |d| d.child(crate::camera::view(store_entity.clone(), user.0, 8., false).absolute().top_0().left_0().size_full()))
+                // The one shown big above: a still of it here, not a second copy playing.
+                .when(watching && focus == Some(user), |d| {
+                    let key = crate::stream_card::stream_key(self.guild, channel, user);
+                    let still = crate::stream_card::preview(&store_entity, &key, cx);
+                    d.children(still.map(|url| gpui_kit::img(url).absolute().top_0().left_0().size_full().object_fit(gpui_kit::ObjectFit::Cover)))
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(gpui_kit::black().opacity(0.55))
+                                .text_color(gpui_kit::white())
+                                .text_size(u(14.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Currently watching"),
+                        )
+                })
+                .when(watching && focus != Some(user), |d| {
+                    d.child(crate::camera::view(store_entity.clone(), user.0, 8., true).absolute().top_0().left_0().size_full()).child(
+                        div()
+                            .id(("stop-watching", user.0))
+                            .absolute()
+                            .top(u(8.))
+                            .right(u(8.))
+                            .px(u(10.))
+                            .py(u(5.))
+                            .rounded(u(6.))
+                            .bg(gpui_kit::black().opacity(0.7))
+                            .text_color(gpui_kit::white())
+                            .text_size(u(13.))
+                            .cursor_pointer()
+                            .opacity(0.)
+                            .group_hover(tile_group.clone(), |d| d.opacity(1.))
+                            .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(move |_, _, cx| stop_store.update(cx, |store, cx| store.stop_watching(cx)))
+                            .child("Stop Watching"),
+                    )
+                })
+                .when(p.streaming && !watching && in_call, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(gpui_kit::black().opacity(0.45))
+                            .child(
+                                div()
+                                    .id(("watch-stream", user.0))
+                                    .px(u(16.))
+                                    .py(u(8.))
+                                    .rounded(u(6.))
+                                    .bg(gpui_kit::white().opacity(0.9))
+                                    .text_color(gpui_kit::black())
+                                    .text_size(u(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(gpui_kit::white()))
+                                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(move |_, _, cx| watch_store.update(cx, |store, cx| store.watch_stream(user, cx)))
+                                    .child("Watch Stream"),
+                            ),
+                    )
+                })
                 .child(
                     h_flex()
                         .absolute()
@@ -866,7 +1030,8 @@ impl ChannelPage {
                         .when(p.deafened, |d| d.child(Icon::new(IconName::HeadphoneOff).size(u(15.)).flex_shrink_0()))
                         .child(div().min_w_0().truncate().when_some(p.font, |d, font| d.font_family(font)).child(p.name)),
                 )
-        });
+                .into_any_element()
+        }).chain(more);
         v_flex()
             .flex_1()
             .min_w_0()
@@ -880,7 +1045,90 @@ impl ChannelPage {
                     .gap(u(8.))
                     .items_center()
                     .child(Icon::new(IconName::Volume2).size(u(24.)).text_color(muted))
-                    .child(div().flex_1().min_w_0().truncate().text_size(u(16.)).font_weight(FontWeight::SEMIBOLD).child(label.to_string()))
+                    .child(div().flex_1().min_w_0().truncate().text_size(u(16.)).font_weight(FontWeight::SEMIBOLD).child(match &focus_name {
+                        Some(name) => format!("{label} \u{2022} {name}"),
+                        None => label.to_string(),
+                    }))
+                    // Who's watching: faces overlapping, and on hover the list, names and all.
+                    .when(focus.is_some() && !viewers.is_empty(), |d| {
+                        let faces = viewers.iter().take(5).enumerate().map(|(i, (_, name, url))| {
+                            div()
+                                .size(u(26.))
+                                .flex_shrink_0()
+                                .when(i > 0, |d| d.ml(u(-8.)))
+                                .rounded_full()
+                                .border_2()
+                                .border_color(gpui_kit::black())
+                                .child(Avatar::new().border_0().src(url.clone()).name(name.clone()).size(u(22.)))
+                        });
+                        let list = v_flex()
+                            .absolute()
+                            .top(u(34.))
+                            .right_0()
+                            .w(u(220.))
+                            .max_h(u(320.))
+                            .p(u(6.))
+                            .gap(u(2.))
+                            .rounded(u(8.))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.popover)
+                            .shadow_lg()
+                            .occlude()
+                            .opacity(0.)
+                            .invisible()
+                            .group_hover("stream-viewers", |d| d.opacity(1.).visible())
+                            .child(div().px(u(6.)).py(u(4.)).text_size(u(12.)).font_weight(FontWeight::SEMIBOLD).text_color(muted).child(format!("{} WATCHING", viewers.len())))
+                            .children(viewers.iter().map(|(_, name, url)| {
+                                h_flex()
+                                    .gap(u(8.))
+                                    .px(u(6.))
+                                    .py(u(4.))
+                                    .items_center()
+                                    .rounded(u(4.))
+                                    .child(Avatar::new().border_0().src(url.clone()).name(name.clone()).size(u(24.)))
+                                    .child(div().min_w_0().truncate().text_size(u(14.)).child(name.clone()))
+                            }));
+                        // Its width spelled out: faces overlapping by 8 each made the layout
+                        // think it narrower than it is, and LIVE was drawn over them.
+                        let shown = viewers.len().min(5) as f32;
+                        let more = if viewers.len() > 5 { 34. } else { 0. };
+                        let pill_width = 12. + 26. + (shown - 1.).max(0.) * 18. + more;
+                        d.child(
+                            h_flex()
+                                .id("stream-viewers")
+                                .group("stream-viewers")
+                                .relative()
+                                .flex_shrink_0()
+                                .w(u(pill_width))
+                                .items_center()
+                                .px(u(6.))
+                                .py(u(2.))
+                                .rounded(u(14.))
+                                .bg(theme.foreground.opacity(0.08))
+                                .children(faces)
+                                .when(viewers.len() > 5, |d| d.child(div().ml(u(6.)).text_size(u(13.)).text_color(muted).child(format!("+{}", viewers.len() - 5))))
+                                // Over the video under it, not under it.
+                                .child(gpui_kit::deferred(list).with_priority(2)),
+                        )
+                    })
+                    // The stream's real size, as it comes, beside LIVE.
+                    .when(focus.is_some(), |d| {
+                        d.child(
+                            h_flex()
+                                .gap(u(6.))
+                                .px(u(8.))
+                                .py(u(2.))
+                                .rounded(u(6.))
+                                .flex_shrink_0()
+                                .bg(Hsla::from(gpui_kit::rgb(0xda373c)))
+                                .text_color(gpui_kit::white())
+                                .text_size(u(13.))
+                                .font_weight(FontWeight::BOLD)
+                                .when_some(focus_height, |d, h| d.child(format!("{h}p")))
+                                .child("LIVE"),
+                        )
+                    })
                     .when(!self.vc_chat_open, |d| {
                         d.child(tool_button("open-vc-chat", IconName::MessageCircle, "Open Chat", cx).on_click(cx.listener(|this, _, _, cx| {
                             this.vc_chat_open = true;
@@ -888,12 +1136,117 @@ impl ChannelPage {
                         })))
                     }),
             )
-            .child(
-                // Many people: the tiles scroll instead of running off the page.
+            // The focused stream, as big as fits, all of it showing; a click puts it back.
+            .children(focus.map(|user| {
+                let store = self.ctx.services.store.clone();
                 div()
+                    .id("vc-focus")
+                    .group("vc-focus")
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .mx(u(16.))
+                    .mt(u(8.))
+                    .rounded(u(8.))
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.vc_focus = None;
+                        cx.notify();
+                    }))
+                    .child(crate::camera::view_fit(store, user.0, 8., true, gpui_kit::ObjectFit::Contain).absolute().top_0().left_0().size_full())
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .left(u(12.))
+                            .bottom(u(12.))
+                            .gap(u(6.))
+                            .px(u(10.))
+                            .py(u(5.))
+                            .items_center()
+                            .rounded(u(8.))
+                            .bg(gpui_kit::black().opacity(0.7))
+                            .text_color(gpui_kit::white())
+                            .text_size(u(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(Icon::new(IconName::Monitor).size(u(16.)))
+                            .children(focus_name.clone()),
+                    )
+                    // Filling the window, and the screen.
+                    .child(
+                        div()
+                            .id("stream-fullscreen-enter")
+                            .absolute()
+                            .top(u(12.))
+                            .right(u(12.))
+                            .size(u(36.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(u(8.))
+                            .bg(gpui_kit::black().opacity(0.7))
+                            .text_color(gpui_kit::white())
+                            .cursor_pointer()
+                            .opacity(0.)
+                            .group_hover("vc-focus", |d| d.opacity(1.))
+                            .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Full Screen").build(window, cx))
+                            .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                crate::videos::enter_fullscreen(&format!("stream:{}", user.0), window, cx);
+                            })
+                            .child(Icon::new(IconName::Maximize).size(u(18.))),
+                    )
+                    // The stream's sound: muted or not, and how loud.
+                    .child({
+                        let (volume, muted) = self.ctx.services.store.read(cx).stream_audio();
+                        let (mute_store, slide_store) = (self.ctx.services.store.clone(), self.ctx.services.store.clone());
+                        h_flex()
+                            .id("stream-audio")
+                            .absolute()
+                            .right(u(12.))
+                            .bottom(u(12.))
+                            .gap(u(10.))
+                            .px(u(10.))
+                            .py(u(6.))
+                            .items_center()
+                            .rounded(u(8.))
+                            .bg(gpui_kit::black().opacity(0.7))
+                            .text_color(gpui_kit::white())
+                            .opacity(0.)
+                            .group_hover("vc-focus", |d| d.opacity(1.))
+                            // Using it doesn't leave the focused view.
+                            .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                div()
+                                    .id("stream-mute")
+                                    .cursor_pointer()
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        mute_store.update(cx, |store, cx| store.toggle_stream_mute(cx));
+                                    })
+                                    .child(Icon::new(if muted || volume == 0. { IconName::VolumeX } else { IconName::Volume2 }).size(u(20.))),
+                            )
+                            .child(div().w(u(120.)).child(crate::slider::slider(
+                                "stream-volume",
+                                if muted { 0. } else { volume / 2. },
+                                false,
+                                Hsla::from(gpui_kit::rgb(0x5865f2)),
+                                gpui_kit::white().opacity(0.3),
+                                std::rc::Rc::new(move |level, cx| slide_store.update(cx, |store, cx| store.set_stream_volume(level * 2., cx))),
+                            )))
+                            .child(div().w(u(40.)).text_size(u(13.)).child(format!("{:.0}%", if muted { 0. } else { volume * 100. })))
+                    })
+                    .into_any_element()
+            }))
+            .child(
+                // Many people: the tiles scroll instead of running off the page. With a stream
+                // focused, they're a strip under it.
+                div()
+                    .relative()
+                    .when(focus.is_none(), |d| d.flex_1().min_h_0())
+                    .when(focus.is_some(), |d| d.flex_none().h(u(140.)))
                     .child(
                         div().id("vc-stage").size_full().overflow_y_scroll().track_scroll(&self.vc_scroll.0).child(
                             // Rows of our own, not wrapping: the width is last frame's,
@@ -1327,8 +1680,36 @@ impl ChannelPage {
                 if mods.mod_view {
                     entries.push(Entry::later("Open in Mod View"));
                 }
+                // Timed out already: taking it off instead, after a confirm that says how long's left.
+                let timed_out_until = store
+                    .read(cx)
+                    .cache()
+                    .member(guild, user)
+                    .and_then(|m| m.communication_disabled_until.as_deref())
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .filter(|t| *t > chrono::Utc::now());
                 if mods.timeout {
-                    entries.push(Entry::item(format!("Timeout {name}"), panel(What::Timeout { guild, user, name: name.clone() })).danger());
+                    match timed_out_until {
+                        Some(until) => {
+                            let (store, name) = (store.clone(), name.clone());
+                            entries.push(
+                                Entry::item("Remove Timeout", move |_, cx| {
+                                    let left = remaining(until - chrono::Utc::now());
+                                    let store = store.clone();
+                                    crate::confirm::ask(
+                                        format!("Remove Timeout for {name}?"),
+                                        format!("{name} has {left} left on their timeout. Removing it lets them talk again right away."),
+                                        "Remove Timeout",
+                                        move |cx| store.update(cx, |store, cx| store.timeout_member(guild, user, None, String::new(), cx)),
+                                        cx,
+                                    );
+                                })
+                                .danger(),
+                            );
+                        }
+                        None => entries.push(Entry::item(format!("Timeout {name}"), panel(What::Timeout { guild, user, name: name.clone() })).danger()),
+                    }
                 }
                 if mods.kick {
                     entries.push(Entry::item(format!("Kick {name}"), panel(What::Kick { guild, user, name: name.clone(), handle: handle.clone() })).danger());
@@ -2200,7 +2581,27 @@ impl ChannelPage {
             .filter(|e| !wanted.is_empty() && e.name.to_lowercase().contains(&wanted))
             .collect();
         custom.sort_by_key(|e| !e.name.to_lowercase().starts_with(&wanted));
-        let mut items: Vec<SuggestItem> = custom
+        // Emoji used before go first, the most used at the top, wherever their names fall.
+        let use_key = |e: &SuggestItem| crate::picker::use_key(e.emoji, e.custom.as_ref().map(|(n, id, a)| (n.as_str(), *id, *a)));
+        let mut favourites: Vec<(u32, SuggestItem)> = custom
+            .iter()
+            .map(|e| SuggestItem { emoji: None, avatar: None, label: format!(":{}:", e.name), detail: String::new(), mention: None, custom: Some((e.name.clone(), e.id, e.animated)) })
+            .chain(crate::emoji_suggest::suggestions(query, 40).into_iter().map(|(emoji, code)| SuggestItem {
+                emoji: Some(emoji),
+                avatar: None,
+                label: format!(":{code}:"),
+                detail: String::new(),
+                mention: None,
+                custom: None,
+            }))
+            .filter_map(|item| {
+                let used = use_key(&item).map_or(0, |key| crate::picker::uses(&key));
+                (used > 0).then_some((used, item))
+            })
+            .collect();
+        favourites.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
+        let mut items: Vec<SuggestItem> = favourites.into_iter().map(|(_, item)| item).take(LIMIT).collect();
+        let base: Vec<SuggestItem> = custom
             .into_iter()
             .take(custom_room)
             .map(|e| SuggestItem {
@@ -2212,8 +2613,8 @@ impl ChannelPage {
                 custom: Some((e.name.clone(), e.id, e.animated)),
             })
             .collect();
-        let room = LIMIT - items.len();
-        items.extend(crate::emoji_suggest::suggestions(query, room).into_iter().map(|(emoji, code)| SuggestItem {
+        let room = LIMIT.saturating_sub(base.len());
+        let base = base.into_iter().chain(crate::emoji_suggest::suggestions(query, room).into_iter().map(|(emoji, code)| SuggestItem {
             emoji: Some(emoji),
             avatar: None,
             label: format!(":{code}:"),
@@ -2221,6 +2622,14 @@ impl ChannelPage {
             mention: None,
             custom: None,
         }));
+        for item in base {
+            if items.len() >= LIMIT {
+                break;
+            }
+            if !items.contains(&item) {
+                items.push(item);
+            }
+        }
         items
     }
 
@@ -2301,6 +2710,9 @@ impl ChannelPage {
         let Some(item) = s.items.get(s.selected).cloned() else { return };
         if s.cursor > self.input.read(cx).value().len() {
             return;
+        }
+        if let Some(key) = crate::picker::use_key(item.emoji, item.custom.as_ref().map(|(n, id, a)| (n.as_str(), *id, *a))) {
+            crate::picker::count_use(key);
         }
         let custom = item.custom.clone().map(|(name, id, animated)| {
             ping_token(self.ctx.services.store.read(cx).cache(), self.guild, ComposerPing::CustomEmoji { name, id, animated })
@@ -2487,7 +2899,7 @@ impl ChannelPage {
     /// Live markdown: what the marks wrap looks the part as it's typed.
     fn style_composer(&mut self, cx: &mut Context<Self>) {
         let theme = cx.theme();
-        let (dim, code_bg, cover) = (theme.muted_foreground, theme.foreground.opacity(0.08), theme.muted_foreground.opacity(0.35));
+        let (dim, code_bg, cover, link) = (theme.muted_foreground, theme.foreground.opacity(0.08), theme.muted_foreground.opacity(0.35), theme.link);
         let text = self.input.read(cx).value().to_string();
         let styles = crate::composer_md::styles(&text)
             .into_iter()
@@ -2505,6 +2917,7 @@ impl ChannelPage {
                 };
                 (range, style)
             })
+            .chain(crate::markdown::link_ranges(&text).into_iter().map(|range| (range, gpui_kit::HighlightStyle { color: Some(link), ..Default::default() })))
             .collect();
         self.input.update(cx, |input, cx| input.set_text_styles(styles, cx));
     }
@@ -2727,6 +3140,24 @@ fn voice_tile_size(room: f32, people: usize) -> (usize, f32, f32) {
     (fit, width, (width * 9. / 16.).round())
 }
 
+/// How long's left, as Discord says it: "1d 3h 12m 5s", leaving out what's zero ahead.
+fn remaining(left: chrono::TimeDelta) -> String {
+    let total = left.num_seconds().max(0);
+    let (d, h, m, s) = (total / 86_400, total / 3600 % 24, total / 60 % 60, total % 60);
+    let mut parts = Vec::new();
+    if d > 0 {
+        parts.push(format!("{d}d"));
+    }
+    if d > 0 || h > 0 {
+        parts.push(format!("{h}h"));
+    }
+    if d > 0 || h > 0 || m > 0 {
+        parts.push(format!("{m}m"));
+    }
+    parts.push(format!("{s}s"));
+    parts.join(" ")
+}
+
 fn user_token(id: Id, name: &str) -> InlineToken {
     InlineToken::new(format!("user:{id}"), format!("<@{id}>")).with_label(format!("@{name}"))
 }
@@ -2859,6 +3290,36 @@ fn on_author_click(
             }
         });
     }
+}
+
+/// The text of an author's name when names can be selected. Its click does what a click on the
+/// name does otherwise, since a drag that ends on the name mustn't open the profile.
+fn selectable_name(
+    message: Id,
+    page: &WeakEntity<ChannelPage>,
+    author: &cord_core::model::User,
+    name: &str,
+    anchor: &Anchor,
+) -> crate::badges::TextMaker {
+    let (page, id, name, anchor) = (page.clone(), author.id, name.to_string(), anchor.clone());
+    Rc::new(move |text| {
+        let (page, name, anchor) = (page.clone(), name.clone(), anchor.clone());
+        InteractiveText::new(("name-select", message.0), StyledText::new(text.to_string()))
+            .allow_select()
+            .on_click(std::iter::once(0..text.len()).collect(), move |_, window, cx| {
+                let position = anchor.get().map_or(window.mouse_position(), |b| gpui_kit::point(b.right() + gpui_kit::px(8.), b.top()));
+                let shift = window.modifiers().shift;
+                let name = name.clone();
+                let _ = page.update(cx, |page, cx| {
+                    if shift {
+                        page.mention(id, name, window, cx)
+                    } else {
+                        page.open_profile(id, position, window, cx)
+                    }
+                });
+            })
+            .into_any_element()
+    })
 }
 
 /// Hovering a name or avatar fetches their profile ahead of a click.
@@ -3302,6 +3763,7 @@ fn message_row(
     hovered: &Rc<std::cell::Cell<Option<Id>>>,
     hovered_tools: &Rc<std::cell::Cell<Option<Id>>>,
     replying_to: Option<Id>,
+    select_names: bool,
     cx: &App,
 ) -> AnyElement {
     let author = &m.message.author;
@@ -3350,6 +3812,7 @@ fn message_row(
             .into_any_element()
     };
 
+    let time = nav::format_message_time(ms, &chrono::Local::now());
     let header = (!stacked).then(|| {
         h_flex()
             .gap(u(4.))
@@ -3364,9 +3827,10 @@ fn message_row(
                     .when_some(by.color, |this, color| this.text_color(color))
                     .when_some(by.font, |this, font| this.font_family(font))
                     .on_hover(on_author_hover(page, author.id))
-                    .on_click(on_author_click(page, author, &by.name, &name_anchor))
+                    // A selectable name takes its click from the text, which tells a click from the end of a drag.
+                    .when(!select_names, |this| this.on_click(on_author_click(page, author, &by.name, &name_anchor)))
                     .on_mouse_down(gpui_kit::MouseButton::Right, on_author_menu(page, author, &by.name))
-                    .child(crate::badges::name_effect(crate::badges::name_text(("author-name", ix), &by.name, &by.stops, hovered.get() == Some(m.message.id)), &by.name, &crate::badges::NameLook { effect: by.effect, effect_color: by.effect_color, font: by.font, color: by.color, stops: Vec::new() }, hovered.get() == Some(m.message.id) || hovered_tools.get() == Some(m.message.id)))
+                    .child(crate::badges::name_effect(crate::badges::name_text_with(("author-name", ix), &by.name, &by.stops, hovered.get() == Some(m.message.id), select_names.then(|| selectable_name(m.message.id, page, author, &by.name, &name_anchor))), &by.name, &crate::badges::NameLook { effect: by.effect, effect_color: by.effect_color, font: by.font, color: by.color, stops: Vec::new() }, hovered.get() == Some(m.message.id) || hovered_tools.get() == Some(m.message.id)))
             ))
             .when_some(by.tag.clone(), |this, (tag, badge)| {
                 this.child(crate::badges::tag_pill(SharedString::from(format!("tag-{ix}")), &tag, badge.as_deref(), cx))
@@ -3396,7 +3860,11 @@ fn message_row(
                     .ml(u(4.))
                     .text_size(u(12.))
                     .text_color(theme.muted_foreground)
-                    .child(nav::format_message_time(ms, &chrono::Local::now())),
+                    .child(if select_names {
+                        InteractiveText::new(("time-select", m.message.id.0), StyledText::new(time.clone())).allow_select().into_any_element()
+                    } else {
+                        time.into_any_element()
+                    }),
             )
     });
 
@@ -4141,7 +4609,7 @@ impl Render for ChannelPage {
                 let page = cx.entity().downgrade();
                 let guild = self.guild;
                 let prefs = self.ctx.services.settings.read(cx).get();
-                let (compact, chat_text, smooth) = (prefs.compact, prefs.chat_text, prefs.smooth_scrolling);
+                let (compact, chat_text, smooth, select_names) = (prefs.compact, prefs.chat_text, prefs.smooth_scrolling, prefs.select_names);
                 let shared = Shared {
                     poll_ui: self.poll_ui.clone(),
                     in_card: false,
@@ -4314,7 +4782,7 @@ impl Render for ChannelPage {
                     } else if compact {
                         compact_row(i, m, guild, cache, &shared, &page, replying_to, cx)
                     } else {
-                        message_row(i, m, stacked, !new_day, guild, cache, &shared, &page, &hovered_row, &hovered_tools, replying_to, cx)
+                        message_row(i, m, stacked, !new_day, guild, cache, &shared, &page, &hovered_row, &hovered_tools, replying_to, select_names, cx)
                     };
                     // Someone we ignore: a line to unfold, not their message.
                     let row = if system.is_none() && !notice && crate::places::is_ignored(m.message.author.id) && !UNFOLDED.with_borrow(|set| set.contains(&m.message.id)) && cache.me().map(|u| u.id) != Some(m.message.author.id) {
@@ -4558,8 +5026,11 @@ impl Render for ChannelPage {
         let strip = |search: AnyElement| h_flex().flex_shrink_0().h(u(TOP_BAR)).px(u(8.)).items_center().border_b_1().border_color(border).child(search);
         let right_column = if searching {
             // Wider while searching, without touching the width the member list was given.
-            let text_size = self.ctx.services.settings.read(cx).get().chat_text as f32;
-            let results = crate::search_view::results(&self.search, &self.ctx.services.store, self.parsed.clone(), self.revealed.clone(), text_size, cx);
+            let (text_size, smooth) = {
+                let settings = self.ctx.services.settings.read(cx).get();
+                (settings.chat_text as f32, settings.smooth_scrolling)
+            };
+            let results = crate::search_view::results(&self.search, &self.ctx.services.store, self.parsed.clone(), self.revealed.clone(), text_size, smooth, cx);
             Some(
                 v_flex()
                     .w(u(members_width.max(crate::search_view::RESULTS_WIDTH)))

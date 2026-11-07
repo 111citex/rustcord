@@ -1234,7 +1234,11 @@ impl Cache {
         emoji: &ReactionEmoji,
         change: impl FnOnce(&mut crate::model::Reaction, bool) -> bool,
     ) {
-        let Some(chat) = self.chat_message(channel, message) else { return };
+        let Some(chat) = self.chat_message(channel, message) else {
+            tracing::info!(%channel, %message, "reaction: message not loaded here, ignored");
+            return;
+        };
+        tracing::info!(%channel, %message, "reaction: applied");
         let reactions = &mut chat.message.reactions;
         let (ix, existed) = match reactions.iter().position(|r| r.emoji == *emoji) {
             Some(i) => (i, true),
@@ -1576,7 +1580,7 @@ impl Cache {
                 }
             }
             // For whoever's in the call; nothing to keep here.
-            CoreEvent::VoiceServer(_) => {}
+            CoreEvent::VoiceServer(_) | CoreEvent::StreamCreate { .. } | CoreEvent::StreamUpdate { .. } | CoreEvent::StreamServer { .. } | CoreEvent::StreamDelete { .. } => {}
             CoreEvent::RecipientAdd { channel_id, user } => {
                 let id = user.id;
                 self.users.insert(id, user);

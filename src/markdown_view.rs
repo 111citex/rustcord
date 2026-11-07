@@ -444,9 +444,12 @@ fn text(env: &Env, key: &str, runs: &[Run], cx: &App) -> AnyElement {
     if let Some((mark, when)) = edited_mark.zip(crate::nav::edited_at(env.message, &chrono::Local)) {
         tips.push((mark, when.into()));
     }
-    if clicks.is_empty() && tips.is_empty() {
+    // Message text can be selected; a preview (the line above a reply) is only a target.
+    let selectable = !env.shared.inert;
+    if clicks.is_empty() && tips.is_empty() && !selectable {
         return div().child(styled).into_any_element();
     }
+    let nothing_to_hover = clicks.is_empty() && tips.is_empty();
     let ranges: Vec<Range<usize>> = clicks.iter().map(|(r, _)| r.clone()).collect();
     let actions: Vec<_> = clicks.iter().map(|(_, c)| run_click(c, env.message.id, env.shared)).collect();
     let users: Vec<Option<Id>> = clicks.iter().map(|(_, c)| if let Click::User(id) = c { Some(*id) } else { None }).collect();
@@ -455,6 +458,13 @@ fn text(env: &Env, key: &str, runs: &[Run], cx: &App) -> AnyElement {
     let mentioned: Vec<(Range<usize>, Id)> = clicks.iter().filter_map(|(r, c)| if let Click::User(id) = c { Some((r.clone(), *id)) } else { None }).collect();
     let id = ElementId::from((ElementId::from(("md", env.message.id.0)), key.to_string()));
     let mut interactive = InteractiveText::new(id, styled);
+    if selectable {
+        interactive = interactive.allow_select();
+        // Copying raw markdown takes the message as written. Text in an embed isn't the message's own.
+        if !env.shared.in_card && cx.try_global::<gpui_kit::SelectionPrefs>().is_some_and(|prefs| prefs.copy_source) {
+            interactive = interactive.select_source(env.message.id.0, env.message.content.clone());
+        }
+    }
     if !ranges.is_empty() {
         // Whatever can be clicked underlines under the pointer.
         let spans = ranges.clone();
@@ -481,8 +491,13 @@ fn text(env: &Env, key: &str, runs: &[Run], cx: &App) -> AnyElement {
             // A long address wraps, instead of running off the screen.
             let tip = tip.clone();
             let widest = window.viewport_size().width * 0.6;
-            Some(gpui_kit::component::tooltip::Tooltip::element(move |_, _| div().max_w(widest).child(tip.clone())).build(window, cx))
+            // Its own size, set: left to inherit, it took the chat's when drawn with the chat
+            // and the window's otherwise, and flickered between the two.
+            Some(gpui_kit::component::tooltip::Tooltip::element(move |_, _| div().max_w(widest).text_size(crate::ui::u(13.)).line_height(crate::ui::u(18.)).child(tip.clone())).build(window, cx))
         });
+    }
+    if nothing_to_hover {
+        return interactive.into_any_element();
     }
     // Its own hover only speaks while the pointer's over the text: this says it left.
     div()

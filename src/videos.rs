@@ -115,11 +115,16 @@ struct Fullscreen {
 
 impl Global for Fullscreen {}
 
+/// What fills the window: a video's address, or `stream:<user>` for a Go Live.
+pub fn fullscreen_key(cx: &App) -> Option<String> {
+    cx.try_global::<Fullscreen>().and_then(|f| f.url.clone())
+}
+
 fn is_fullscreen(url: &str, cx: &App) -> bool {
     cx.try_global::<Fullscreen>().and_then(|f| f.url.as_deref()) == Some(url)
 }
 
-fn enter_fullscreen(url: &str, window: &mut gpui_kit::Window, cx: &mut App) {
+pub fn enter_fullscreen(url: &str, window: &mut gpui_kit::Window, cx: &mut App) {
     let toggled = !window.is_fullscreen();
     if toggled {
         window.toggle_fullscreen();
@@ -128,7 +133,7 @@ fn enter_fullscreen(url: &str, window: &mut gpui_kit::Window, cx: &mut App) {
     cx.refresh_windows();
 }
 
-fn leave_fullscreen(window: &mut gpui_kit::Window, cx: &mut App) {
+pub fn leave_fullscreen(window: &mut gpui_kit::Window, cx: &mut App) {
     if std::mem::take(cx.default_global::<Fullscreen>()).toggled {
         window.toggle_fullscreen();
     }

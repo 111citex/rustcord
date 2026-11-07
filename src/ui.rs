@@ -67,6 +67,23 @@ pub fn note_shell_view(view: gpui_kit::EntityId) {
     SHELL_VIEW.set(Some(view));
 }
 
+thread_local! {
+    static OVERLAY_VIEW: std::cell::Cell<Option<gpui_kit::EntityId>> = const { std::cell::Cell::new(None) };
+}
+
+/// Notes the view the floating panels are drawn in.
+pub fn note_overlay_view(view: gpui_kit::EntityId) {
+    OVERLAY_VIEW.set(Some(view));
+}
+
+/// Redraws the floating panels alone: the ringing panel, the video window, a live card.
+pub fn redraw_overlays(cx: &mut gpui_kit::App) {
+    match OVERLAY_VIEW.get() {
+        Some(view) => cx.notify(view),
+        None => redraw_shell(cx),
+    }
+}
+
 /// Redraws the overlays alone: not everything under them, as a window refresh would.
 pub fn redraw_shell(cx: &mut gpui_kit::App) {
     match SHELL_VIEW.get() {

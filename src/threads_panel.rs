@@ -236,12 +236,13 @@ impl Render for ThreadsPanel {
                     ),
             )
             .child(
+                // Sized by its rows, up to the most: as "the rest of the room" it was nothing,
+                // the panel having no height of its own to share out.
                 div()
                     .relative()
-                    .flex_1()
                     .min_h_0()
                     .child(
-                        div().id("threads-list").size_full().max_h(u(460.)).overflow_y_scroll().track_scroll(&self.scroll).child(
+                        div().id("threads-list").w_full().max_h(u(460.)).overflow_y_scroll().track_scroll(&self.scroll).child(
                             v_flex()
                                 .w_full()
                                 .p(u(8.))

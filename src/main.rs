@@ -19,6 +19,10 @@ mod font_pages;
 mod image_disk;
 mod places;
 mod picker;
+mod camera;
+mod video_pip;
+mod stream_card;
+mod overlays;
 mod perf;
 mod captcha;
 mod chat_format;
@@ -171,7 +175,7 @@ fn run() -> anyhow::Result<()> {
         let preferences = settings::Settings::load();
         theme::init(preferences.theme.clone(), cx);
         name_fonts::init(cx);
-        let settings = cx.new(|_| settings::SettingsStore::new(preferences));
+        let settings = cx.new(|cx| settings::SettingsStore::new(preferences, cx));
 
         let toasts = cx.new(|_| Toasts);
         let store = cx.new(|_| Store::new(core.clone(), toasts.clone()));
@@ -208,7 +212,8 @@ fn run() -> anyhow::Result<()> {
         };
 
         if let Err(error) = gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| Shell::new(router.clone(), services.clone(), window, cx))
+            let shell = cx.new(|cx| Shell::new(router.clone(), services.clone(), window, cx));
+            cx.new(|cx| overlays::Root::new(shell, services.clone(), router.clone(), cx))
         }) {
             tracing::error!(%error, "failed to open the window");
             cx.quit();

@@ -127,6 +127,17 @@ pub enum StoreEvent {
 }
 
 /// A call being joined or under way. Both of the gateway's answers are needed first.
+/// Someone's Go Live we're watching: a second connection, to the stream's own server.
+struct Watching {
+    key: String,
+    user: Id,
+    /// Who else is watching it, as Discord last said.
+    viewers: Vec<Id>,
+    rtc: Option<Id>,
+    server: Option<(String, String)>,
+    call: Option<cord_voice::VoiceCall>,
+}
+
 struct VoiceJoin {
     /// `None` in a DM or group call.
     guild: Option<Id>,
@@ -145,6 +156,8 @@ pub struct VoiceStatus {
     pub connected: bool,
     pub ping_ms: Option<u32>,
     pub deaf: bool,
+    pub muted: bool,
+    pub camera: bool,
 }
 
 /// The colour band of a ping: Discord's green, yellow and red.
@@ -168,6 +181,17 @@ pub struct Store {
     voice: Option<VoiceJoin>,
     /// Who's making sound in our call.
     speaking: std::collections::HashSet<Id>,
+    /// Our mic's muted. Kept between calls, as Discord does.
+    muted: bool,
+    /// The Go Live we're watching.
+    watching: Option<Watching>,
+    /// Discord's sound for leaving a call, once fetched.
+    disconnect_sound: Option<cord_voice::Clip>,
+    /// A Go Live to watch once we've joined its channel.
+    watch_once_joined: Option<Id>,
+    /// How loud streams play, 0 to 2, and whether they're muted; kept between streams.
+    stream_volume: f32,
+    stream_muted: bool,
     /// Plays with a desktop notification, once it's been fetched.
     message_sound: Option<cord_voice::Clip>,
     core: Arc<Core>,
@@ -215,7 +239,7 @@ impl EventEmitter<StoreEvent> for Store {}
 
 impl Store {
     pub fn new(core: Arc<Core>, toasts: Entity<Toasts>) -> Self {
-        Store { speaking: Default::default(), message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None, declined: Default::default(), ring: None, pins: HashMap::new(), pins_shown: None, loading_newer: None }
+        Store { speaking: Default::default(), muted: false, watching: None, disconnect_sound: None, watch_once_joined: None, stream_volume: 1., stream_muted: false, message_sound: None, voice: None, core, toasts, cache: Cache::default(), connection: None, events: None, open: None, history: HashMap::new(), recent: Vec::new(), nonce_seq: 0, send_chains: HashMap::new(), loading_older: None, members: None, acked: HashMap::new(), typing: HashMap::new(), new_after: None, declined: Default::default(), ring: None, pins: HashMap::new(), pins_shown: None, loading_newer: None }
     }
 
     pub fn core(&self) -> &Arc<Core> {
@@ -719,13 +743,8 @@ impl Store {
         self.voice = Some(VoiceJoin { guild, channel, session: None, server: None, call: None });
         // Answering a call here stops it ringing here.
         self.declined.remove(&channel);
-        self.core.send_gateway(serde_json::json!({"op": 4, "d": {
-            "guild_id": guild.map(|g| g.to_string()),
-            "channel_id": channel.to_string(),
-            "self_mute": true,
-            "self_deaf": false,
-            "self_video": false,
-        }}));
+        cord_voice::mic().set_muted(self.muted);
+        self.send_voice_state(false);
         // The panel's ping and state change without any event to say so.
         cx.spawn(async move |this, cx| {
             let mut last = None;
@@ -733,7 +752,16 @@ impl Store {
                 cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
                 let Ok(keep_going) = this.update(cx, |store, cx| {
                     // Only a change is worth a redraw.
-                    let speaking: std::collections::HashSet<Id> = store.voice.as_ref().and_then(|v| v.call.as_ref()).map_or_else(Default::default, |call| call.speaking().into_iter().map(Id).collect());
+                    let mut speaking: std::collections::HashSet<Id> = store.voice.as_ref().and_then(|v| v.call.as_ref()).map_or_else(Default::default, |call| call.speaking().into_iter().map(Id).collect());
+                    // Pictures of cameras that went off are let go.
+                    let cameras = store.voice.as_ref().and_then(|v| v.call.as_ref()).map(cord_voice::VoiceCall::cameras).unwrap_or_default();
+                    crate::camera::forget_others(&cameras, store.watching().map(|w| w.0), cx);
+                    // Our own ring: while what we say is going out.
+                    if cord_voice::mic().is_open()
+                        && let Some(me) = store.cache.me()
+                    {
+                        speaking.insert(me.id);
+                    }
                     if speaking != store.speaking {
                         store.speaking = speaking;
                         cx.notify();
@@ -910,8 +938,105 @@ impl Store {
         });
     }
 
+    /// Watches `user`'s Go Live in `channel`, joining it first if we're not there.
+    pub fn watch_stream_in(&mut self, guild: Option<Id>, channel: Id, user: Id, cx: &mut Context<Self>) {
+        if self.voice.as_ref().is_some_and(|v| v.channel == channel) {
+            self.watch_stream(user, cx);
+            return;
+        }
+        self.watch_once_joined = Some(user);
+        self.join_voice(guild, channel, cx);
+    }
+
+    /// Starts watching `user`'s Go Live in the call we're in.
+    pub fn watch_stream(&mut self, user: Id, cx: &mut Context<Self>) {
+        if self.voice.is_none() || self.watching.as_ref().is_some_and(|w| w.user == user) {
+            return;
+        }
+        self.stop_watching(cx);
+        let Some(voice) = &self.voice else { return };
+        let key = match voice.guild {
+            Some(guild) => format!("guild:{guild}:{}:{user}", voice.channel),
+            None => format!("call:{}:{user}", voice.channel),
+        };
+        self.core.send_gateway(serde_json::json!({"op": 20, "d": {"stream_key": key}}));
+        tracing::info!(%user, "stream: asked to watch");
+        self.watching = Some(Watching { key, user, viewers: Vec::new(), rtc: None, server: None, call: None });
+        cx.notify();
+    }
+
+    pub fn stop_watching(&mut self, cx: &mut Context<Self>) {
+        let Some(watching) = self.watching.take() else { return };
+        self.core.send_gateway(serde_json::json!({"op": 19, "d": {"stream_key": watching.key}}));
+        cx.notify();
+    }
+
+    /// How loud streams play (0 to 2), and whether they're muted.
+    pub fn stream_audio(&self) -> (f32, bool) {
+        (self.stream_volume, self.stream_muted)
+    }
+
+    pub fn set_stream_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        self.stream_volume = volume.clamp(0., 2.);
+        // Turning it up from nothing unmutes, as Discord's slider does.
+        if self.stream_volume > 0. {
+            self.stream_muted = false;
+        }
+        self.apply_stream_audio();
+        cx.notify();
+    }
+
+    pub fn toggle_stream_mute(&mut self, cx: &mut Context<Self>) {
+        self.stream_muted = !self.stream_muted;
+        self.apply_stream_audio();
+        cx.notify();
+    }
+
+    /// Puts the stream's volume and mute on its connection. Deafening leaves a stream
+    /// alone: it's the call that goes quiet, not what we chose to watch.
+    fn apply_stream_audio(&self) {
+        if let Some(call) = self.watching.as_ref().and_then(|w| w.call.as_ref()) {
+            call.set_volume(if self.stream_muted { 0. } else { self.stream_volume });
+        }
+    }
+
+    /// Who's watching the Go Live we're watching (us among them).
+    pub fn stream_viewers(&self) -> Vec<Id> {
+        self.watching.as_ref().map(|w| w.viewers.clone()).unwrap_or_default()
+    }
+
+    /// Whose Go Live we're watching.
+    pub fn watching(&self) -> Option<Id> {
+        self.watching.as_ref().map(|w| w.user)
+    }
+
+    /// The newest picture of the Go Live we're watching.
+    pub fn stream_picture(&self, user: Id) -> Option<std::sync::Arc<cord_voice::Picture>> {
+        let watching = self.watching.as_ref().filter(|w| w.user == user)?;
+        watching.call.as_ref()?.picture(user.0)
+    }
+
+    /// Connects to the stream's server, once both its id and its address are here.
+    fn start_watching(&mut self) {
+        let Some(me) = self.cache.me().map(|u| u.id) else { return };
+        let Some(session) = self.voice.as_ref().and_then(|v| v.session.clone()) else { return };
+        let runtime = self.core.runtime().clone();
+        let Some(watching) = &mut self.watching else { return };
+        let (Some(rtc), Some((endpoint, token))) = (watching.rtc, watching.server.clone()) else { return };
+        tracing::info!(user = %watching.user, "stream: connecting");
+        watching.call = Some(cord_voice::VoiceCall::join(
+            cord_voice::JoinInfo { endpoint, server_id: rtc.0, channel_id: rtc.0 - 1, user_id: me.0, session_id: session, token, viewer: true },
+            &runtime,
+        ));
+        self.apply_stream_audio();
+    }
+
     pub fn leave_voice(&mut self, cx: &mut Context<Self>) {
+        self.stop_watching(cx);
         let Some(voice) = self.voice.take() else { return };
+        if voice.call.is_some() {
+            cord_voice::play_once(self.disconnect_sound.clone().unwrap_or_else(|| cord_voice::stand_in(cord_voice::Sound::Disconnected)));
+        }
         self.update_ring();
         self.core.send_gateway(serde_json::json!({"op": 4, "d": {
             "guild_id": voice.guild.map(|g| g.to_string()),
@@ -940,25 +1065,92 @@ impl Store {
         }
     }
 
-    /// Stops or starts hearing the call.
+    /// Stops or starts hearing the call. Deafened, we're not heard either.
     pub fn toggle_deaf(&mut self, cx: &mut Context<Self>) {
         let Some(voice) = &self.voice else { return };
         let Some(call) = &voice.call else { return };
         let deaf = !call.is_deaf();
         call.set_deaf(deaf);
         call.play_sound(if deaf { cord_voice::Sound::Deafened } else { cord_voice::Sound::Undeafened });
+        cord_voice::mic().set_muted(self.muted || deaf);
+        self.send_voice_state(deaf);
+        cx.notify();
+    }
+
+    /// Stops or starts our mic. Whether others see it depends on the setting.
+    pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        // Deafened, the mic button undeafens and unmutes, as Discord's does.
+        if self.voice.as_ref().and_then(|v| v.call.as_ref()).is_some_and(cord_voice::VoiceCall::is_deaf) {
+            self.muted = false;
+            self.toggle_deaf(cx);
+            return;
+        }
+        self.muted = !self.muted;
+        let deaf = false;
+        cord_voice::mic().set_muted(self.muted || deaf);
+        if let Some(call) = self.voice.as_ref().and_then(|v| v.call.as_ref()) {
+            call.play_sound(if self.muted { cord_voice::Sound::Muted } else { cord_voice::Sound::Unmuted });
+        }
+        if self.voice.is_some() {
+            self.send_voice_state(deaf);
+        }
+        cx.notify();
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Tells Discord how we are in the call: deafened means muted too, and muting
+    /// shows only when the setting says it should.
+    fn send_voice_state(&self, deaf: bool) {
+        let Some(voice) = &self.voice else { return };
+        let local = crate::settings::MUTE_STAYS_LOCAL.load(std::sync::atomic::Ordering::Relaxed);
         self.core.send_gateway(serde_json::json!({"op": 4, "d": {
             "guild_id": voice.guild.map(|g| g.to_string()),
             "channel_id": voice.channel.to_string(),
-            "self_mute": true,
+            "self_mute": deaf || (self.muted && !local),
             "self_deaf": deaf,
-            "self_video": false,
+            "self_video": self.camera_on(),
         }}));
+    }
+
+    /// Whether our camera's on in the call we're in.
+    pub fn camera_on(&self) -> bool {
+        self.voice.as_ref().and_then(|v| v.call.as_ref()).is_some_and(cord_voice::VoiceCall::camera_on)
+    }
+
+    /// Turns our camera on or off: only ever from the camera button.
+    pub fn toggle_camera(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.cache.me().map(|u| u.id) else { return };
+        let Some(call) = self.voice.as_ref().and_then(|v| v.call.as_ref()) else { return };
+        let on = !call.camera_on();
+        call.set_camera(on, me.0);
+        let deaf = call.is_deaf();
+        self.send_voice_state(deaf);
         cx.notify();
     }
 
     pub fn speaking(&self) -> &std::collections::HashSet<Id> {
         &self.speaking
+    }
+
+    /// Tells the decoder how big `user`'s camera or stream is drawn, so it's decoded no bigger.
+    pub fn show_video_at(&self, user: Id, stream: bool, size: (u32, u32)) {
+        let call = if stream { self.watching.as_ref().and_then(|w| w.call.as_ref()) } else { self.voice.as_ref().and_then(|v| v.call.as_ref()) };
+        if let Some(call) = call {
+            call.show_at(user.0, size);
+        }
+    }
+
+    /// Whose cameras we're getting, in the call we're in.
+    pub fn cameras(&self) -> Vec<u64> {
+        self.voice.as_ref().and_then(|v| v.call.as_ref()).map(cord_voice::VoiceCall::cameras).unwrap_or_default()
+    }
+
+    /// The newest picture of `user`'s camera, in the call we're in.
+    pub fn camera(&self, user: Id) -> Option<std::sync::Arc<cord_voice::Picture>> {
+        self.voice.as_ref()?.call.as_ref()?.picture(user.0)
     }
 
     pub fn voice_status(&self) -> Option<VoiceStatus> {
@@ -970,6 +1162,8 @@ impl Store {
             connected: call.is_some_and(|c| c.stats().state() == cord_voice::State::Connected),
             ping_ms: call.and_then(|c| c.stats().ping_ms()),
             deaf: call.is_some_and(cord_voice::VoiceCall::is_deaf),
+            muted: self.muted,
+            camera: call.is_some_and(cord_voice::VoiceCall::camera_on),
         })
     }
 
@@ -978,7 +1172,7 @@ impl Store {
     /// stand-ins play.
     fn load_call_sounds(&self, cx: &mut Context<Self>) {
         use cord_voice::Sound;
-        const SOUNDS: [(Sound, &str); 7] = [
+        const SOUNDS: [(Sound, &str); 12] = [
             (Sound::StreamStarted, "abe52a3c92953edb"),
             (Sound::StreamEnded, "cbff07b5a83e0321"),
             (Sound::Connected, "b135ff6c8e091b43"),
@@ -986,12 +1180,22 @@ impl Store {
             (Sound::SomeoneLeft, "7b9a183742515fc2"),
             (Sound::Deafened, "529ff198eac567af"),
             (Sound::Undeafened, "b150f03c89944403"),
+            // Names to files, from the table in Discord's web app.
+            (Sound::Muted, "2d3b4ba32c34c862"),
+            (Sound::Unmuted, "e74c4a06134a20e4"),
+            (Sound::Disconnected, "dd0911025fe00b2e"),
+            (Sound::PttStart, "f5c8ec31889c5317"),
+            (Sound::PttStop, "34b5969be3a063ba"),
         ];
         let core = self.core.clone();
         cx.spawn(async move |this, cx| {
             for (sound, name) in SOUNDS {
                 let Some(clip) = sound_file(core.clone(), name, cx.background_executor().clone()).await else { continue };
                 let still_here = this.update(cx, |store, _| {
+                    // Leaving plays after the call's gone, so the store keeps that one itself.
+                    if sound == Sound::Disconnected {
+                        store.disconnect_sound = Some(clip.clone());
+                    }
                     if let Some(call) = store.voice.as_ref().and_then(|v| v.call.as_ref()) {
                         call.set_sound(sound, clip.clone());
                     }
@@ -1020,6 +1224,7 @@ impl Store {
                 user_id: me.0,
                 session_id: session,
                 token,
+                viewer: false,
             },
             &runtime,
         );
@@ -1030,6 +1235,9 @@ impl Store {
         call.play_sound(cord_voice::Sound::Joining);
         voice.call = Some(call);
         self.load_call_sounds(cx);
+        if let Some(user) = self.watch_once_joined.take() {
+            self.watch_stream(user, cx);
+        }
     }
 
     /// One at a time, stopping at the first that fails.
@@ -1516,6 +1724,38 @@ impl Store {
                 if let (Some(voice), Some(endpoint)) = (&mut self.voice, server.endpoint) {
                     voice.server = Some((endpoint, server.token));
                     self.start_voice(cx);
+                    cx.notify();
+                }
+                return;
+            }
+            CoreEvent::StreamUpdate { stream_key, viewer_ids } => {
+                if let Some(watching) = self.watching.as_mut().filter(|w| w.key == stream_key) {
+                    watching.viewers = viewer_ids;
+                    cx.notify();
+                }
+                return;
+            }
+            CoreEvent::StreamCreate { stream_key, rtc_server_id, viewer_ids } => {
+                if let Some(watching) = self.watching.as_mut().filter(|w| w.key == stream_key) {
+                    watching.viewers = viewer_ids;
+                    watching.rtc = Some(rtc_server_id);
+                    self.start_watching();
+                    cx.notify();
+                }
+                return;
+            }
+            CoreEvent::StreamServer { stream_key, endpoint, token } => {
+                if let (Some(watching), Some(endpoint)) = (self.watching.as_mut().filter(|w| w.key == stream_key), endpoint) {
+                    watching.server = Some((endpoint, token));
+                    self.start_watching();
+                    cx.notify();
+                }
+                return;
+            }
+            CoreEvent::StreamDelete { stream_key } => {
+                if self.watching.as_ref().is_some_and(|w| w.key == stream_key) {
+                    tracing::info!("stream: ended");
+                    self.watching = None;
                     cx.notify();
                 }
                 return;

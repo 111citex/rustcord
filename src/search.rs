@@ -270,7 +270,7 @@ pub fn get(core: &Arc<Core>, window: &mut Window, cx: &mut App) -> Entity<Search
             }
         })];
         let scroll = gpui_kit::ScrollHandle::new();
-        let scroller = crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(scroll.clone()));
+        let scroller = crate::smooth_scroll::SmoothScroller::new(crate::smooth_scroll::ScrollTarget::Handle(scroll.clone())).calm_hover().layered();
         Search { input, core, scope: None, query: Query::default(), unknown: Vec::new(), results: Results::Loading, sort: Sort::Newest, focused: false, asked: 0, scroll, scroller, placeholder: "Search".into(), _watching: watching }
     });
     cx.set_global(Shared(search.clone()));
@@ -319,6 +319,8 @@ impl Search {
         self.asked += 1;
         let (asked, core, query) = (self.asked, self.core.clone(), self.query.clone());
         self.results = Results::Loading;
+        // A new page or sort is no reason for the filter menu: the box may still be focused.
+        self.focused = false;
         self.scroller.stop();
         self.scroll.set_offset(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)));
         cx.notify();

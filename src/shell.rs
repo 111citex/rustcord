@@ -1207,6 +1207,18 @@ impl SidePane {
                 let top = row_top.clone();
                 gpui_kit::canvas(move |bounds, _, _| top.set(bounds.top()), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
             })
+            // Live: their stream's card beside the row while the pointer's there.
+            .when(p.streaming, |this| {
+                let guild = self.voice_row_guild(cx);
+                let channel = guild.and_then(|g| self.services.store.read(cx).cache().voice_state(g, p.user_id)).and_then(|v| v.channel_id);
+                let (user, name, top, column) = (p.user_id, p.name.clone(), row_top.clone(), self.services.settings.read(cx).get().column_width);
+                this.when_some(channel, |this, channel| {
+                    this.on_hover(move |on, window, cx| {
+                        let at = gpui_kit::point(window.rem_size() * ((RAIL_WIDTH + column + 8.) / 16.), top.get());
+                        crate::stream_card::hover_row(*on, guild, channel, user, name.clone(), at, cx);
+                    })
+                })
+            })
             .on_click({
                 let (user, column) = (p.user_id, self.services.settings.read(cx).get().column_width);
                 // Their card opens just right of the column, level with the row's top.
@@ -1240,6 +1252,8 @@ impl SidePane {
                     )
                     .when_some(p.tag_badge.as_deref(), |d, url| d.child(crate::badges::tag_icon(url, cx))),
             )
+            // Camera on: a filled camera, grey, beside the other state icons.
+            .when(p.video, |this| this.child(Icon::default().path("icons/video-fill.svg").size(u(16.)).flex_shrink_0().text_color(theme.muted_foreground)))
             .when(p.streaming, |this| {
                 this.child(
                     div()
@@ -1333,6 +1347,15 @@ impl SidePane {
                         .child(div().truncate().text_size(u(14.)).font_weight(FontWeight::SEMIBOLD).text_color(color).child(if status.connected { "Voice Connected" } else { "Connecting" }))
                         .child(div().truncate().text_size(u(12.)).text_color(theme.muted_foreground).child(place)),
                 )
+                // Our camera: on and off only from here (or the call's own controls).
+                .child({
+                    let (camera, on) = (self.services.store.clone(), status.camera);
+                    round("voice-camera")
+                        .text_color(if on { gpui_kit::Hsla::from(gpui_kit::rgb(0x23a55a)) } else { theme.sidebar_foreground })
+                        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(if on { "Turn Off Camera" } else { "Turn On Camera" }).build(window, cx))
+                        .on_click(move |_, _, cx| camera.update(cx, |store, cx| store.toggle_camera(cx)))
+                        .child(Icon::default().path(if on { "icons/video.svg" } else { "icons/video-off.svg" }).size(u(18.)))
+                })
                 .child(
                     round("voice-leave")
                         .text_color(theme.sidebar_foreground)
@@ -1350,7 +1373,9 @@ impl SidePane {
         let router = self.router.clone();
         let call = self.services.store.read(cx).voice_status();
         let deaf = call.as_ref().is_some_and(|c| c.deaf);
+        let muted = self.services.store.read(cx).is_muted() || deaf;
         let deafen = self.services.store.clone();
+        let mute = self.services.store.clone();
         let cache = self.services.store.read(cx).cache();
         let own = me.as_ref().and_then(|m| cache.presence(m.id)).cloned().unwrap_or(cord_core::member_list::UserPresence { status: cord_core::member_list::Status::Online, ..Default::default() });
         let voice = me.as_ref().is_some_and(|m| cache.in_voice(m.id));
@@ -1370,12 +1395,6 @@ impl SidePane {
                 .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
                 .child(Icon::new(icon).size(u(19.)))
         };
-        // Mic and headphones carry a small device-menu chevron (inert for now).
-        let with_menu = |id: &'static str, icon: IconName, tooltip: &'static str| {
-            h_flex().flex_shrink_0().items_center().gap(u(3.)).child(button(id, icon, tooltip)).child(
-                Icon::new(IconName::ChevronDown).size(u(11.)).text_color(theme.sidebar_foreground).flex_shrink_0(),
-            )
-        };
         h_flex()
             .h(u(PANEL_HEIGHT))
             .w_full()
@@ -1386,7 +1405,17 @@ impl SidePane {
             .items_center()
             .when_some(me, |this, me| {
                 let avatar = Avatar::new().border_0().src(cdn::avatar_url(me.id, me.avatar.as_deref(), 64)).name(me.display_name().to_string());
-                this.child(div().flex_shrink_0().child(crate::members::avatar_with_status(avatar, 32., Some(own.status), false, None, panel(theme))))
+                // Our own speaking ring, as in the call: while what we say is going out.
+                let talking = !muted && self.services.store.read(cx).speaking().contains(&me.id);
+                this.child(
+                    div()
+                        .relative()
+                        .flex_shrink_0()
+                        .child(crate::members::avatar_with_status(avatar, 32., Some(own.status), false, None, panel(theme)))
+                        .when(talking, |d| {
+                            d.child(div().absolute().top(u(-3.)).left(u(-3.)).size(u(38.)).rounded_full().border_2().border_color(gpui_kit::rgb(0x23a55a)))
+                        }),
+                )
                 .child(
                     v_flex()
                         .flex_1()
@@ -1398,7 +1427,18 @@ impl SidePane {
                         }),
                 )
             })
-            .child(with_menu("voice-mic", if call.is_some() { IconName::MicOff } else { IconName::Mic }, if call.is_some() { "Listening only for now" } else { "Join a voice channel to listen" }))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(u(3.))
+                    .child(
+                        button("voice-mic", if muted { IconName::MicOff } else { IconName::Mic }, if muted { "Unmute" } else { "Mute" })
+                            .when(muted, |d| d.text_color(gpui_kit::rgb(0xf23f43)))
+                            .on_click(move |_, _, cx| mute.update(cx, |store, cx| store.toggle_mute(cx))),
+                    )
+                    .child(Icon::new(IconName::ChevronDown).size(u(11.)).text_color(theme.sidebar_foreground).flex_shrink_0()),
+            )
             // Deafen: only does something in a call.
             .child(
                 h_flex()
@@ -1477,6 +1517,20 @@ impl Shell {
                     ToastKind::Error => Notification::error(toast.message.clone()),
                 };
                 window.push_notification(notification.title(toast.title.clone()), cx);
+            }),
+            // Ctrl+C copies selected message text. Here, ahead of everything: key bindings run
+            // before any key handler, and the focused message box binds Ctrl+C to its own Copy,
+            // which with nothing selected in it took the key and copied nothing. A message
+            // selection, when there is one, wins; pressing in the box lets go of it, so copying
+            // from the box still works.
+            cx.intercept_keystrokes(|event, _, cx| {
+                if event.keystroke.key == "c"
+                    && event.keystroke.modifiers.secondary()
+                    && let Some(text) = gpui_kit::selected_text(cx)
+                {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+                    cx.stop_propagation();
+                }
             }),
         ];
         window.set_window_title("Rustcord");
@@ -1664,10 +1718,38 @@ impl Render for Shell {
                 cx.defer(move |cx| navigate(&router, "/channels/@me", cx));
             }
         }
+        // Push to talk only hears keys while the window has focus: let go when it loses it,
+        // or the key's release would never come and we'd stay on.
+        if !window.is_window_active() {
+            cord_voice::mic().set_ptt(false);
+        }
         v_flex()
             .relative()
             .image_cache(self.pictures.clone())
-            .on_modifiers_changed(|event: &gpui_kit::ModifiersChangedEvent, _, cx: &mut gpui_kit::App| crate::ui::note_shift(event.modifiers.shift, cx))
+            .on_modifiers_changed(|event: &gpui_kit::ModifiersChangedEvent, _, cx: &mut gpui_kit::App| {
+                crate::ui::note_shift(event.modifiers.shift, cx);
+                // A modifier as the push-to-talk key comes as a change, not a key press.
+                let held = crate::settings::PTT_KEY.with_borrow(|key| match key.as_str() {
+                    "shift" => Some(event.modifiers.shift),
+                    "control" => Some(event.modifiers.control),
+                    "alt" => Some(event.modifiers.alt),
+                    "super" | "platform" => Some(event.modifiers.platform),
+                    _ => None,
+                });
+                if let Some(held) = held {
+                    cord_voice::mic().set_ptt(held);
+                }
+            })
+            .capture_key_down(|event: &gpui_kit::KeyDownEvent, _, _| {
+                if crate::settings::PTT_KEY.with_borrow(|key| !key.is_empty() && *key == event.keystroke.key) {
+                    cord_voice::mic().set_ptt(true);
+                }
+            })
+            .capture_key_up(|event: &gpui_kit::KeyUpEvent, _, _| {
+                if crate::settings::PTT_KEY.with_borrow(|key| !key.is_empty() && *key == event.keystroke.key) {
+                    cord_voice::mic().set_ptt(false);
+                }
+            })
             .on_action(cx.listener(|this, _: &ToggleInfo, window, cx| this.toggle_info(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSwitcher, window, cx| {
                 let here = nav::parse_location(this.router.read(cx).current_path()).and_then(|l| l.channel);
@@ -1727,6 +1809,12 @@ impl Render for Shell {
             }))
             .on_key_down(crate::viewer::on_key)
             .on_key_down(crate::videos::on_key)
+            // Escape lets go of selected message text (Ctrl+C is caught ahead of this, in `new`).
+            .on_key_down(|event: &gpui_kit::KeyDownEvent, window, cx: &mut gpui_kit::App| {
+                if event.keystroke.key == "escape" && gpui_kit::clear_text_selection(cx) {
+                    window.refresh();
+                }
+            })
             .on_key_down(|event: &gpui_kit::KeyDownEvent, _, cx: &mut gpui_kit::App| {
                 if event.keystroke.key == "escape" && crate::context_menu::is_open(cx) {
                     crate::context_menu::close(cx);
@@ -1734,6 +1822,8 @@ impl Render for Shell {
             })
             .children(crate::viewer::overlay(window, cx))
             .children(crate::videos::overlay(cx))
+            .children(crate::video_pip::fullscreen_overlay(&self.services.store, cx))
+
             .children(crate::context_menu::overlay(cx))
             .child(self.mouse_side_buttons())
             .children(crate::confirm::overlay(window, cx))
@@ -1742,7 +1832,7 @@ impl Render for Shell {
             .children(crate::picker::overlay(window, cx))
             .children(crate::panels::overlay(window, cx))
             .children(crate::emoji_card::overlay(cx))
-            .children(crate::call_ring::overlay(&self.services.store.clone(), window, cx))
+
             .when_some(self.info.clone(), |this, monitor| {
                 this.child(
                     v_flex()

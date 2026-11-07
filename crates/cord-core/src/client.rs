@@ -646,6 +646,16 @@ impl Core {
         .await
     }
 
+    /// A Go Live's current thumbnail: a CDN picture Discord refreshes every few minutes.
+    pub async fn stream_preview(&self, stream_key: String) -> Result<Option<String>, HttpError> {
+        let http = self.http.clone();
+        self.on_rt(async move {
+            let preview: Value = http.get(&format!("/streams/{stream_key}/preview")).await?;
+            Ok(preview["url"].as_str().map(str::to_string))
+        })
+        .await
+    }
+
     pub async fn add_friend(&self, user: Id) -> Result<(), HttpError> {
         let http = self.http.clone();
         let result = self

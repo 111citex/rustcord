@@ -3,10 +3,14 @@
 
 use std::collections::BTreeMap;
 
-/// Frames (20 ms each) held before someone starts playing.
+/// Frames (20 ms each) held before someone starts playing, at least: on a calm line.
 const TARGET: usize = 3;
+/// And at most, on a line whose packets keep coming in late.
+const MOST_TARGET: usize = 8;
+/// Frames played without a late packet before the wait comes down by one.
+const CALM_FOR: u32 = 500;
 /// Holding more than this, they've fallen behind: skip ahead.
-const TOO_MANY: usize = 12;
+const TOO_MANY: usize = 14;
 /// Frames in a row to cover over before taking it that they've stopped talking.
 const MAX_CONCEALED: u32 = 5;
 
@@ -22,7 +26,6 @@ pub enum Next {
     Conceal,
 }
 
-#[derive(Default)]
 pub struct Jitter {
     /// Keyed by distance from `next`, so that sequence numbers can wrap around.
     held: BTreeMap<u32, Vec<u8>>,
@@ -35,6 +38,19 @@ pub struct Jitter {
     skipped: u32,
     /// Started again after a silence, not yet told about.
     restarted: bool,
+    /// Frames held before starting: grows when packets come too late to play, as a
+    /// jittery line needs, and comes back down once it's calm.
+    target: usize,
+    /// Frames played since the last late packet.
+    calm: u32,
+    /// Packets that came after their turn, not yet told about.
+    late: u32,
+}
+
+impl Default for Jitter {
+    fn default() -> Self {
+        Jitter { held: BTreeMap::new(), next: None, base: 0, concealed: 0, skipped: 0, restarted: false, target: TARGET, calm: 0, late: 0 }
+    }
 }
 
 impl Jitter {
@@ -46,9 +62,25 @@ impl Jitter {
     }
 
     pub fn push(&mut self, seq: u16, payload: Vec<u8>) {
-        if let Some(key) = self.key(seq) {
-            self.held.insert(key, payload);
+        match self.key(seq) {
+            // Already played past, or covered over: too late. Wait longer from the next burst.
+            Some(key) if key < self.base && self.next.is_some() => self.too_late(),
+            Some(key) => {
+                self.held.insert(key, payload);
+            }
+            None => self.too_late(),
         }
+    }
+
+    fn too_late(&mut self) {
+        self.late += 1;
+        self.calm = 0;
+        self.target = (self.target + 1).min(MOST_TARGET);
+    }
+
+    /// Packets that came too late to play, since last asked.
+    pub fn take_late(&mut self) -> u32 {
+        std::mem::take(&mut self.late)
     }
 
     /// Frames dropped to catch up since last asked.
@@ -68,7 +100,7 @@ impl Jitter {
 
     /// Starts from the oldest held, once there's enough to ride out a late packet.
     fn begin(&mut self) -> bool {
-        if self.held.len() < TARGET {
+        if self.held.len() < self.target {
             return false;
         }
         // Not playing: keys are plain sequence numbers. Find where a wrap would be.
@@ -90,6 +122,11 @@ impl Jitter {
     fn advance(&mut self) {
         self.next = self.next.map(|n| n.wrapping_add(1));
         self.base = self.base.wrapping_add(1);
+        self.calm += 1;
+        if self.calm >= CALM_FOR && self.target > TARGET {
+            self.calm = 0;
+            self.target -= 1;
+        }
     }
 
     /// The next 20 ms.
@@ -166,6 +203,17 @@ mod tests {
     }
 
     #[test]
+    fn late_packets_make_it_wait_longer_next_time() {
+        let mut j = Jitter::default();
+        fill(&mut j, &[10, 11, 12]);
+        assert_eq!(j.next(), Next::Play(p(10)));
+        assert_eq!(j.next(), Next::Play(p(11)));
+        j.push(10, p(10));
+        assert_eq!(j.take_late(), 1);
+        assert_eq!(j.target, TARGET + 1);
+    }
+
+    #[test]
     fn out_of_order_packets_land_in_order() {
         let mut j = Jitter::default();
         fill(&mut j, &[12, 10, 11]);
@@ -222,7 +270,7 @@ mod tests {
         let seqs: Vec<u16> = (0..20).collect();
         fill(&mut j, &seqs);
         match j.next() {
-            Next::Play(first) => assert!(first[0] >= 8, "started at {}", first[0]),
+            Next::Play(first) => assert!(usize::from(first[0]) >= 20 - TOO_MANY, "started at {}", first[0]),
             other => panic!("{other:?}"),
         }
     }

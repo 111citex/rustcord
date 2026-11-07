@@ -1,4 +1,4 @@
-//! Long GIFs, decoded a frame at a time. Their file stays in memory (it's small) and
+//! Long GIFs and animated WebPs, decoded a frame at a time. Their file stays in memory (it's small) and
 //! a thread decodes the next frame as the last is taken, so the thread sits idle when
 //! nobody's looking. Short ones are all decoded up front: decoding them over and over
 //! would cost more than keeping them.
@@ -32,9 +32,16 @@ thread_local! {
 /// time the file ends.
 fn decode(source: StreamSource, out: std::sync::mpsc::SyncSender<image::Frame>) {
     loop {
-        let Ok(decoder) = image::codecs::gif::GifDecoder::new(Cursor::new(source.bytes.clone())) else { return };
+        let frames = if source.webp {
+            let Ok(mut decoder) = image::codecs::webp::WebPDecoder::new(Cursor::new(source.bytes.clone())) else { return };
+            let _ = decoder.set_background_color(image::Rgba([0, 0, 0, 0]));
+            decoder.into_frames()
+        } else {
+            let Ok(decoder) = image::codecs::gif::GifDecoder::new(Cursor::new(source.bytes.clone())) else { return };
+            decoder.into_frames()
+        };
         let mut any = false;
-        for frame in decoder.into_frames() {
+        for frame in frames {
             let Ok(mut frame) = frame else { continue };
             any = true;
             // GPUI's images are BGRA.

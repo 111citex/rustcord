@@ -163,6 +163,7 @@ fn mix(speakers: &Mutex<Speakers>, voices: &mut HashMap<u32, Voice>, stats: &Sta
                 let queue = speakers.queues.get_mut(&ssrc)?;
                 let next = queue.next();
                 stats.skipped.fetch_add(queue.take_skipped(), Relaxed);
+                stats.late.fetch_add(queue.take_late(), Relaxed);
                 Some((ssrc, next, gain, queue.take_restarted()))
             })
             .collect()
@@ -265,7 +266,7 @@ pub fn play_looping(clip: Clip, gap: Duration) -> Looping {
 }
 
 fn loop_alone(clip: &Clip, gap: Duration, stop: &Arc<AtomicBool>) -> Result<(), String> {
-    let device = cpal::default_host().default_output_device().ok_or("no output device")?;
+    let device = output_device().ok_or("no output device")?;
     let default = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = usize::from(default.channels()).max(1);
     let mut config: cpal::StreamConfig = default.into();
@@ -299,7 +300,7 @@ fn loop_alone(clip: &Clip, gap: Duration, stop: &Arc<AtomicBool>) -> Result<(), 
 }
 
 fn sound_alone(clip: &Clip) -> Result<(), String> {
-    let device = cpal::default_host().default_output_device().ok_or("no output device")?;
+    let device = output_device().ok_or("no output device")?;
     let default = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = usize::from(default.channels()).max(1);
     let mut config: cpal::StreamConfig = default.into();
@@ -327,9 +328,42 @@ fn sound_alone(clip: &Clip) -> Result<(), String> {
     Ok(())
 }
 
-pub fn start(speakers: Arc<Mutex<Speakers>>, stats: Arc<Stats>, deaf: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+/// The speakers chosen by name; `None` is the system's default.
+static OUTPUT: Mutex<Option<String>> = Mutex::new(None);
+/// How loud the call plays, as f32 bits: 1 as sent, up to 2.
+static OUTPUT_VOLUME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F80_0000);
+
+/// Sets how loud the whole call plays: 1 as sent, 0 silent, 2 double.
+pub fn set_output_volume(volume: f32) {
+    OUTPUT_VOLUME.store(volume.clamp(0., 2.).to_bits(), Relaxed);
+}
+
+fn output_volume() -> f32 {
+    f32::from_bits(OUTPUT_VOLUME.load(Relaxed))
+}
+
+/// Plays through the device called `name` from the next sound or call on; `None` for
+/// the system's default.
+pub fn set_output_device(name: Option<String>) {
+    if let Ok(mut output) = OUTPUT.lock() {
+        *output = name;
+    }
+}
+
+pub(crate) fn output_device() -> Option<cpal::Device> {
+    let chosen = OUTPUT.lock().ok().and_then(|o| o.clone());
+    if let Some(name) = chosen
+        && let Ok(mut devices) = crate::capture::named_host().output_devices()
+        && let Some(device) = devices.find(|d| d.description().is_ok_and(|desc| desc.name() == name))
+    {
+        return Some(device);
+    }
+    crate::capture::default_host().default_output_device()
+}
+
+pub fn start(speakers: Arc<Mutex<Speakers>>, stats: Arc<Stats>, deaf: Arc<AtomicBool>, stop: Arc<AtomicBool>, volume: Arc<std::sync::atomic::AtomicU32>) {
     let spawned = std::thread::Builder::new().name("voice-playback".into()).spawn(move || {
-        if let Err(error) = play(&speakers, &stats, &deaf, &stop) {
+        if let Err(error) = play(&speakers, &stats, &deaf, &stop, &volume) {
             tracing::error!(%error, "voice: couldn't play audio");
         }
     });
@@ -338,8 +372,8 @@ pub fn start(speakers: Arc<Mutex<Speakers>>, stats: Arc<Stats>, deaf: Arc<Atomic
     }
 }
 
-fn play(speakers: &Mutex<Speakers>, stats: &Stats, deaf: &AtomicBool, stop: &AtomicBool) -> Result<(), String> {
-    let device = cpal::default_host().default_output_device().ok_or("no output device")?;
+fn play(speakers: &Mutex<Speakers>, stats: &Stats, deaf: &AtomicBool, stop: &AtomicBool, volume: &std::sync::atomic::AtomicU32) -> Result<(), String> {
+    let device = output_device().ok_or("no output device")?;
     let default = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = default.channels() as usize;
     let mut config: cpal::StreamConfig = default.into();
@@ -383,7 +417,7 @@ fn play(speakers: &Mutex<Speakers>, stats: &Stats, deaf: &AtomicBool, stop: &Ato
         }
         let any = mix(speakers, &mut voices, stats, &mut frame);
         // Deafening fades the call out over the frame, and undeafening back in.
-        let wanted = if deaf.load(Relaxed) { 0. } else { 1. };
+        let wanted = if deaf.load(Relaxed) { 0. } else { output_volume() * f32::from_bits(volume.load(Relaxed)) };
         if any {
             ramp(heard_level, wanted, &mut frame);
         } else {

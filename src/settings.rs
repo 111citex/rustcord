@@ -4,8 +4,17 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::Context;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::{App, Context};
 use serde::{Deserialize, Serialize};
+
+/// Whether muting is kept from Discord, as the settings say.
+pub static MUTE_STAYS_LOCAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// The push-to-talk key, as the settings say.
+    pub static PTT_KEY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
 
 pub const ZOOM_MIN: u16 = 100;
 pub const ZOOM_MAX: u16 = 160;
@@ -36,6 +45,30 @@ pub struct Settings {
     /// UI's own pixels.
     pub column_width: f32,
     pub members_width: f32,
+    /// The microphone by name; `None` follows the system's default.
+    pub input_device: Option<String>,
+    /// The speakers or headphones by name; `None` follows the system's default.
+    pub output_device: Option<String>,
+    /// Push to talk, rather than sending whenever we're heard.
+    pub push_to_talk: bool,
+    /// The push-to-talk key, as GPUI names keys; empty until one's set.
+    pub ptt_key: String,
+    /// Voice activity opens above this, in dB.
+    pub voice_threshold_db: i32,
+    /// "off", "rnnoise" or "deepfilter".
+    pub noise_suppression: String,
+    /// Muting only stops the mic: others aren't told we're muted.
+    pub mute_stays_local: bool,
+    /// Mic volume, percent: 100 as it comes, up to 200.
+    pub input_volume: u16,
+    /// Call volume, percent: 100 as sent, up to 200.
+    pub output_volume: u16,
+    /// Selecting message text can run from one message into the next. Off, it stays in one.
+    pub select_across: bool,
+    /// Copying selected messages takes each one's markdown, whole, rather than what's shown.
+    pub copy_raw: bool,
+    /// Message authors' names and times can be selected and copied too, like the text.
+    pub select_names: bool,
 }
 
 impl Default for Settings {
@@ -51,6 +84,18 @@ impl Default for Settings {
             show_members: true,
             column_width: 303.,
             members_width: 264.,
+            input_device: None,
+            output_device: None,
+            push_to_talk: false,
+            ptt_key: String::new(),
+            voice_threshold_db: -50,
+            noise_suppression: "rnnoise".into(),
+            mute_stays_local: false,
+            input_volume: 100,
+            output_volume: 100,
+            select_across: true,
+            copy_raw: false,
+            select_names: false,
         }
     }
 }
@@ -94,7 +139,36 @@ impl Settings {
         self.chat_text = self.chat_text.clamp(CHAT_TEXT_MIN, CHAT_TEXT_MAX);
         self.image_screens = self.image_screens.min(MAX_IMAGE_SCREENS);
         self.big_memory_kb = step_big_memory(self.big_memory_kb, 0);
+        self.voice_threshold_db = self.voice_threshold_db.clamp(-100, 0);
+        self.input_volume = self.input_volume.min(200);
+        self.output_volume = self.output_volume.min(200);
+        if !matches!(self.noise_suppression.as_str(), "off" | "rnnoise" | "deepfilter") {
+            self.noise_suppression = "rnnoise".into();
+        }
         self
+    }
+
+    /// Hands the voice settings to the mic and speakers.
+    pub fn apply_voice(&self) {
+        MUTE_STAYS_LOCAL.store(self.mute_stays_local, std::sync::atomic::Ordering::Relaxed);
+        PTT_KEY.with_borrow_mut(|key| key.clone_from(&self.ptt_key));
+        let mic = cord_voice::mic();
+        mic.set_device(self.input_device.clone());
+        mic.set_mode(if self.push_to_talk { cord_voice::InputMode::PushToTalk } else { cord_voice::InputMode::VoiceActivity });
+        mic.set_threshold_db(self.voice_threshold_db);
+        mic.set_suppression(match self.noise_suppression.as_str() {
+            "off" => cord_voice::Suppression::Off,
+            "deepfilter" => cord_voice::Suppression::DeepFilter,
+            _ => cord_voice::Suppression::RnNoise,
+        });
+        cord_voice::set_output_device(self.output_device.clone());
+        mic.set_gain(f32::from(self.input_volume) / 100.);
+        cord_voice::set_output_volume(f32::from(self.output_volume) / 100.);
+    }
+
+    /// Hands the text-selection settings to GPUI, with the theme's selection colour.
+    pub fn apply_selection(&self, cx: &mut App) {
+        cx.set_global(gpui_kit::SelectionPrefs { across: self.select_across, copy_source: self.copy_raw, color: cx.theme().selection });
     }
 
     /// The window's rem size for this zoom.
@@ -122,7 +196,9 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
-    pub fn new(settings: Settings) -> Self {
+    pub fn new(settings: Settings, cx: &mut App) -> Self {
+        settings.apply_voice();
+        settings.apply_selection(cx);
         SettingsStore { settings }
     }
 
@@ -135,6 +211,8 @@ impl SettingsStore {
     pub fn update_unsaved(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut Settings)) {
         edit(&mut self.settings);
         self.settings = std::mem::take(&mut self.settings).clamped();
+        self.settings.apply_voice();
+        self.settings.apply_selection(cx);
         cx.notify();
     }
 
@@ -151,6 +229,8 @@ impl SettingsStore {
         if self.settings == before {
             return;
         }
+        self.settings.apply_voice();
+        self.settings.apply_selection(cx);
         if let Err(error) = self.settings.save_to(&Settings::path()) {
             tracing::error!(%error, "couldn't save settings");
         }
@@ -166,7 +246,7 @@ mod tests {
     fn round_trips_through_a_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/settings.json");
-        let settings = Settings { image_screens: 3, big_memory_kb: 256, theme: "Gruvbox".into(), zoom: 120, chat_text: 18, compact: true, smooth_scrolling: false, show_members: false, column_width: 303., members_width: 264., };
+        let settings = Settings { image_screens: 3, big_memory_kb: 256, theme: "Gruvbox".into(), zoom: 120, chat_text: 18, compact: true, smooth_scrolling: false, show_members: false, column_width: 303., members_width: 264., ..Settings::default() };
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), settings);
     }
@@ -190,6 +270,8 @@ mod tests {
         assert_eq!(s.zoom, 100);
         assert!(s.smooth_scrolling);
         assert!(s.show_members, "the member list is on unless turned off");
+        assert!(s.select_across && !s.copy_raw, "selecting runs across messages and copies what's shown");
+        assert!(!s.select_names, "names and times stay out of selections unless asked for");
     }
 
     #[test]

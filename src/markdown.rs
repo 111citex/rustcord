@@ -484,6 +484,40 @@ fn atomic_token(s: &str) -> Option<usize> {
     matches!(message_text::segments(token).as_slice(), [Segment::Mention(_) | Segment::CustomEmoji { .. }]).then_some(end + 1)
 }
 
+/// Where links are in text being typed: bare ones (also inside `<…>`), and the label
+/// of a `[label](https://…)`, so the message box can colour them as it's written.
+pub fn link_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        if rest.starts_with('[')
+            && let Some(close) = rest.find("](")
+            && !rest[..close].contains('\n')
+            && let Some(len) = bare_url_len(&rest[close + 2..])
+            && rest[close + 2 + len..].starts_with(')')
+        {
+            found.push(at + 1..at + close);
+            at += close + 2 + len + 1;
+            continue;
+        }
+        let word_start = text[..at].chars().next_back().is_none_or(|c| c.is_whitespace() || matches!(c, '<' | '(' | '"' | '\''));
+        if word_start && let Some(mut len) = bare_url_len(rest) {
+            // `<https://…>`: the closing mark isn't part of it.
+            if text[..at].ends_with('<')
+                && let Some(close) = rest[..len].find('>')
+            {
+                len = close;
+            }
+            found.push(at..at + len);
+            at += len;
+            continue;
+        }
+        at += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    found
+}
+
 /// Length of a bare `http(s)://` link at the start of `s`. Punctuation that
 /// ends a sentence, and an unbalanced closing parenthesis, are not part of it.
 fn bare_url_len(s: &str) -> Option<usize> {
@@ -887,6 +921,14 @@ mod tests {
         // Not links: wrong scheme, brackets without a target.
         assert_eq!(para("[x](javascript:alert)"), [plain_run("[x](javascript:alert)")]);
         assert_eq!(para("[just brackets]"), [plain_run("[just brackets]")]);
+    }
+
+    #[test]
+    fn links_are_found_while_typing() {
+        let text = "see https://x.dev/a. and <https://y.dev> or [docs](https://z.dev)";
+        let found: Vec<&str> = link_ranges(text).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(found, ["https://x.dev/a", "https://y.dev", "docs"]);
+        assert!(link_ranges("nohttps://x.dev").is_empty(), "inside a word isn't a link");
     }
 
     #[test]

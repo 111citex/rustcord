@@ -9,7 +9,7 @@ use gpui_kit::component::avatar::Avatar;
 use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::{
     AnimationExt as _, AnyElement, App, Entity, FontWeight, Global, InteractiveElement as _, IntoElement as _, ParentElement as _, Pixels, Point,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, anchored, deferred, div, point, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, deferred, div, point, px,
 };
 
 use gpui_kit::assets::IconName;
@@ -93,7 +93,7 @@ fn follow(store: &Entity<Store>, cx: &mut App) {
                     if ring.number == number {
                         ring.shown = None;
                         ring.closing = false;
-                        crate::ui::redraw_shell(cx);
+                        crate::ui::redraw_overlays(cx);
                     }
                 });
             })
@@ -128,7 +128,7 @@ fn drag_watcher() -> impl gpui_kit::IntoElement {
                     48. * scale,
                 );
                 cx.global_mut::<Ring>().at = Some(point(px(kept.x), px(kept.y)));
-                crate::ui::redraw_shell(cx);
+                crate::ui::redraw_overlays(cx);
             });
             window.on_mouse_event(|_: &gpui_kit::MouseUpEvent, _, _, cx| {
                 if cx.try_global::<Ring>().is_some_and(|r| r.grab.is_some()) {
@@ -244,7 +244,8 @@ pub fn overlay(store: &Entity<Store>, window: &Window, cx: &mut App) -> Option<A
             d.opacity(shown).mt(u((1. - shown) * 16.))
         });
     Some(
-        deferred(anchored().position(at).child(div().child(drag_watcher()).child(card)))
+        // Exactly where it was put: `anchored` flips it to another corner when part of it's out.
+        deferred(div().absolute().left(at.x).top(at.y).child(drag_watcher()).child(card))
             .with_priority(5)
             .into_any_element(),
     )

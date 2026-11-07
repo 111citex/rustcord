@@ -12,9 +12,11 @@ use serde_json::{Value, json};
 use tokio::net::UdpSocket;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::capture::Outgoing;
 use crate::playback::Speakers;
 use crate::sounds::Sound;
 use crate::transport::{self, Mode};
+use crate::video::{self, Pictures};
 use crate::{JoinInfo, State, Stats};
 
 const GATEWAY_VERSION: u8 = 8;
@@ -215,8 +217,39 @@ impl Dave {
         }
     }
 
+    /// Puts DAVE's layer on an H.264 frame of ours, as `seal` does audio.
+    fn seal_video(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        if self.version == 0 {
+            return Some(frame.to_vec());
+        }
+        let session = self.session.as_mut().filter(|s| s.is_ready())?;
+        match session.encrypt(MediaType::VIDEO, davey::Codec::H264, frame) {
+            Ok(sealed) => Some(sealed.into_owned()),
+            Err(error) => {
+                tracing::debug!(%error, "voice: couldn't encrypt our video");
+                None
+            }
+        }
+    }
+
+    /// Puts DAVE's layer on a frame of ours. `None`: it can't go out yet, the group's keys
+    /// not being ready, and sending it as is would be refused by the others.
+    fn seal(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        if self.version == 0 {
+            return Some(frame.to_vec());
+        }
+        let session = self.session.as_mut().filter(|s| s.is_ready())?;
+        match session.encrypt_opus(frame) {
+            Ok(sealed) => Some(sealed.into_owned()),
+            Err(error) => {
+                tracing::debug!(%error, "voice: couldn't encrypt our audio");
+                None
+            }
+        }
+    }
+
     /// Takes off DAVE's layer, if the packet has it. `None`: can't be played.
-    fn open(&mut self, user: Option<u64>, payload: Vec<u8>, counts: &mut Counts) -> Option<Vec<u8>> {
+    fn open(&mut self, user: Option<u64>, payload: Vec<u8>, media: MediaType, counts: &mut Counts) -> Option<Vec<u8>> {
         if self.version == 0 || payload.len() < 11 || payload[payload.len() - 2..] != DAVE_MARKER {
             counts.plain += 1;
             return Some(payload);
@@ -229,7 +262,7 @@ impl Dave {
             counts.unknown_speaker += 1;
             return None;
         };
-        match session.decrypt(user, MediaType::AUDIO, &payload) {
+        match session.decrypt(user, media, &payload) {
             Ok(audio) => {
                 counts.decrypted += 1;
                 Some(audio)
@@ -245,13 +278,33 @@ impl Dave {
     }
 }
 
+/// Where our own audio is up to.
+struct Sending {
+    seq: u16,
+    timestamp: u32,
+    /// The nonce: never the same twice for one key.
+    counter: u32,
+    speaking: bool,
+}
+
+impl Sending {
+    /// Seals the next 20 ms of ours.
+    fn next(&mut self, mode: Mode, key: &[u8; 32], ssrc: u32, payload: &[u8]) -> Option<Vec<u8>> {
+        let packet = transport::seal_packet(mode, key, self.seq, self.timestamp, ssrc, self.counter, payload);
+        self.seq = self.seq.wrapping_add(1);
+        self.timestamp = self.timestamp.wrapping_add(960);
+        self.counter = self.counter.wrapping_add(1);
+        packet
+    }
+}
+
 /// Hangs on to the call until it's over, trying again if the connection drops.
-pub async fn run(info: JoinInfo, speakers: Arc<Mutex<Speakers>>, stats: Arc<Stats>, stop: Arc<tokio::sync::Notify>) {
+pub async fn run(info: JoinInfo, speakers: Arc<Mutex<Speakers>>, stats: Arc<Stats>, stop: Arc<tokio::sync::Notify>, mut outgoing: tokio::sync::mpsc::Receiver<Outgoing>, pictures: Arc<Pictures>) {
     let mut failures = 0;
     loop {
         stats.set_state(State::Connecting);
         let began = Instant::now();
-        match connect(&info, &speakers, &stats, &stop).await {
+        match connect(&info, &speakers, &stats, &stop, &mut outgoing, &pictures).await {
             End::Stopped => break,
             End::Final(why) => {
                 tracing::info!(%why, "voice: call ended");
@@ -300,7 +353,7 @@ fn parse_discovery(packet: &[u8]) -> Option<(String, u16)> {
 }
 
 /// One connection, from joining until it ends.
-async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, stop: &tokio::sync::Notify) -> End {
+async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, stop: &tokio::sync::Notify, outgoing: &mut tokio::sync::mpsc::Receiver<Outgoing>, pictures: &Arc<Pictures>) -> End {
     let (socket, _) = match tokio::time::timeout(HANDSHAKE, tokio_tungstenite::connect_async(gateway_url(&info.endpoint))).await {
         Ok(Ok(socket)) => socket,
         Ok(Err(error)) => return End::Retry(error.to_string()),
@@ -314,6 +367,9 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
         "session_id": info.session_id,
         "token": info.token,
         "max_dave_protocol_version": davey::DAVE_PROTOCOL_VERSION,
+        // We take video; what we'd send is settled later, by Opcode 12.
+        "video": true,
+        "streams": [{"type": "video", "rid": "100", "quality": 100}],
     }});
     if let Err(error) = ws_tx.send(Message::text(identify.to_string())).await {
         return End::Retry(error.to_string());
@@ -330,11 +386,21 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
     let mut ops_seen = std::collections::BTreeSet::new();
     let mut udp: Option<UdpSocket> = None;
     let mut ssrc = 0u32;
+    // Ours for video, from Ready, and where our camera's frames are up to.
+    let (mut video_ssrc, mut rtx_ssrc) = (0u32, 0u32);
+    let mut video_seq: u16 = 0;
+    let mut video_on = false;
     let mut mode = Mode::Aes;
     let mut key: Option<[u8; 32]> = None;
     let mut buffer = vec![0u8; 2048];
     let mut connected_at: Option<Instant> = None;
     let started = Instant::now();
+    // Video: whose each SSRC is, which SSRC each resend SSRC repeats, and frames in progress.
+    let mut video_users: HashMap<u32, u64> = HashMap::new();
+    let mut rtx_of: HashMap<u32, u32> = HashMap::new();
+    let mut inbound_video: HashMap<u32, video::Inbound> = HashMap::new();
+    // Our audio: carries on from the silence sent on connecting.
+    let mut sent = Sending { seq: 5, timestamp: 5 * 960, counter: 5, speaking: false };
 
     loop {
         let mut out: Vec<Reply> = Vec::new();
@@ -373,6 +439,10 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                         match op {
                             2 => {
                                 ssrc = d["ssrc"].as_u64().unwrap_or(0) as u32;
+                                if let Some(stream) = d["streams"].as_array().and_then(|s| s.first()) {
+                                    video_ssrc = stream["ssrc"].as_u64().unwrap_or(0) as u32;
+                                    rtx_ssrc = stream["rtx_ssrc"].as_u64().unwrap_or(0) as u32;
+                                }
                                 let offered: Vec<String> = d["modes"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(str::to_string)).collect();
                                 let Some(chosen) = Mode::choose(&offered) else { return End::Final("no encryption mode in common".into()) };
                                 mode = chosen;
@@ -389,7 +459,7 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                                     Err(error) => return End::Retry(error),
                                 };
                                 udp = Some(socket);
-                                out.push(Reply::Json(json!({"op": 1, "d": {"protocol": "udp", "data": {"address": address, "port": port, "mode": mode.name()}}})));
+                                out.push(Reply::Json(json!({"op": 1, "d": {"protocol": "udp", "data": {"address": address, "port": port, "mode": mode.name()}, "codecs": video::codecs()}})));
                             }
                             4 => {
                                 let bytes: Vec<u8> = d["secret_key"].as_array().into_iter().flatten().filter_map(|b| b.as_u64().map(|b| b as u8)).collect();
@@ -399,7 +469,9 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                                 dave.reinit(&mut out);
                                 stats.set_state(State::Connected);
                                 connected_at = Some(Instant::now());
-                                if let Ok(mut speakers) = speakers.lock() {
+                                if !info.viewer
+                                    && let Ok(mut speakers) = speakers.lock()
+                                {
                                     speakers.play_sound(Sound::Connected);
                                 }
                                 tracing::info!(dave = dave.version, mode = mode.name(), setup_ms = started.elapsed().as_millis() as u64, "voice: connected");
@@ -408,8 +480,13 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                                 if let Err(error) = ws_tx.send(Message::text(speaking.to_string())).await {
                                     return End::Retry(error.to_string());
                                 }
-                                // The server starts sending once it's heard from us.
-                                if let Some(socket) = &udp {
+                                // Video's announced (none of ours yet) before any can come, and we
+                                // ask for everyone's at full quality.
+                                out.push(Reply::Json(json!({"op": 12, "d": {"audio_ssrc": ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": []}})));
+                                out.push(Reply::Json(json!({"op": 15, "d": {"any": 100}})));
+                                // The server starts sending once it's heard from us. Watching a
+                                // stream, we never send media: the keepalive is enough.
+                                if let Some(socket) = udp.as_ref().filter(|_| !info.viewer) {
                                     for i in 0..5u16 {
                                         if let Some(packet) = transport::seal_packet(mode, &secret, i, u32::from(i) * 960, ssrc, u32::from(i), &SILENCE) {
                                             let _ = socket.send(&packet).await;
@@ -427,6 +504,37 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                                     }
                                 }
                             }
+                            12 => {
+                                // Someone's video, on or off.
+                                if let Some(user) = d["user_id"].as_str().and_then(|u| u.parse::<u64>().ok()) {
+                                    // It also says they're here, for DAVE's group.
+                                    dave.users.insert(user);
+                                    let gone: Vec<u32> = video_users.iter().filter(|(_, u)| **u == user).map(|(s, _)| *s).collect();
+                                    for old in gone {
+                                        video_users.remove(&old);
+                                        inbound_video.remove(&old);
+                                        rtx_of.retain(|_, primary| *primary != old);
+                                    }
+                                    let mut any = false;
+                                    for stream in d["streams"].as_array().into_iter().flatten() {
+                                        let (Some(primary), true) = (stream["ssrc"].as_u64(), stream["active"].as_bool().unwrap_or(true)) else { continue };
+                                        video_users.insert(primary as u32, user);
+                                        if let Some(rtx) = stream["rtx_ssrc"].as_u64() {
+                                            rtx_of.insert(rtx as u32, primary as u32);
+                                        }
+                                        any = true;
+                                    }
+                                    if let Some(primary) = d["video_ssrc"].as_u64().filter(|s| *s != 0) {
+                                        video_users.insert(primary as u32, user);
+                                        any = true;
+                                    }
+                                    if !any {
+                                        pictures.remove(user);
+                                    }
+                                    tracing::info!(user, on = any, "video: someone's camera");
+                                    out.push(Reply::Json(json!({"op": 15, "d": {"any": 100}})));
+                                }
+                            }
                             6 => {
                                 if let Some((nonce, sent)) = heartbeat_sent.take() {
                                     if d["t"].as_u64() == Some(nonce) {
@@ -438,11 +546,11 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                                 let interval = d["heartbeat_interval"].as_f64().unwrap_or(13_750.).max(1000.);
                                 heartbeat = tokio::time::interval(Duration::from_secs_f64(interval / 1000.));
                             }
-                            11 | 12 => {
+                            11 => {
                                 // Those already here are listed as we join: only newcomers ring.
                                 let settled = connected_at.is_some_and(|at| at.elapsed() > Duration::from_secs(3));
                                 let new_user = d["user_ids"].as_array().into_iter().flatten().filter_map(|u| u.as_str()?.parse::<u64>().ok()).any(|u| u != info.user_id && !dave.users.contains(&u));
-                                if settled && new_user
+                                if settled && new_user && !info.viewer
                                     && let Ok(mut speakers) = speakers.lock()
                                 {
                                     speakers.play_sound(Sound::SomeoneJoined);
@@ -455,7 +563,9 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                             13 => {
                                 if let Some(user) = d["user_id"].as_str().and_then(|u| u.parse::<u64>().ok()) {
                                     dave.users.remove(&user);
-                                    if let Ok(mut speakers) = speakers.lock() {
+                                    if !info.viewer
+                                        && let Ok(mut speakers) = speakers.lock()
+                                    {
                                         speakers.play_sound(Sound::SomeoneLeft);
                                     }
                                     let gone: Vec<u32> = users_by_ssrc.iter().filter(|(_, u)| **u == user).map(|(s, _)| *s).collect();
@@ -487,9 +597,79 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                     decrypted = counts.decrypted, unknown_speaker = counts.unknown_speaker,
                     not_ready = counts.not_ready, failed = counts.failed, speaking = counts.speaking_events,
                     speakers = users_by_ssrc.len(), group = dave.users.len(), dave = dave.version, ready,
-                    played, concealed, skipped, underruns,
+                    played, concealed, skipped, underruns, late = stats.late(),
                     ops = ?ops_seen, "voice: packets"
                 );
+            }
+            item = outgoing.recv() => {
+                let (Some(item), Some(socket), Some(secret)) = (item, &udp, &key) else { continue };
+                match item {
+                    Outgoing::Frame(frame) => {
+                        let Some(payload) = dave.seal(&frame) else { continue };
+                        if !sent.speaking {
+                            sent.speaking = true;
+                            // 1: the microphone.
+                            out.push(Reply::Json(json!({"op": 5, "d": {"speaking": 1, "delay": 0, "ssrc": ssrc}})));
+                        }
+                        if let Some(packet) = sent.next(mode, secret, ssrc, &payload) {
+                            let _ = socket.send(&packet).await;
+                        }
+                    }
+                    Outgoing::Stop => {
+                        if sent.speaking {
+                            // Five frames of silence end it cleanly for the others' decoders.
+                            for _ in 0..5 {
+                                if let Some(packet) = sent.next(mode, secret, ssrc, &SILENCE) {
+                                    let _ = socket.send(&packet).await;
+                                }
+                            }
+                            sent.speaking = false;
+                            out.push(Reply::Json(json!({"op": 5, "d": {"speaking": 0, "delay": 0, "ssrc": ssrc}})));
+                        }
+                    }
+                    Outgoing::VideoOn if video_ssrc != 0 => {
+                        video_on = true;
+                        out.push(Reply::Json(json!({"op": 12, "d": {
+                            "audio_ssrc": ssrc,
+                            "video_ssrc": video_ssrc,
+                            "rtx_ssrc": rtx_ssrc,
+                            "streams": [{
+                                "type": "video", "rid": "100", "ssrc": video_ssrc, "rtx_ssrc": rtx_ssrc, "active": true, "quality": 100,
+                                "max_bitrate": crate::video_send::BITRATE, "max_framerate": crate::video_send::FPS,
+                                "max_resolution": {"type": "fixed", "width": crate::video_send::WIDTH, "height": crate::video_send::HEIGHT},
+                            }],
+                        }})));
+                        tracing::info!(video_ssrc, "camera: on");
+                    }
+                    Outgoing::VideoOn => tracing::warn!("camera: no video SSRC from the server"),
+                    Outgoing::VideoOff => {
+                        if video_on {
+                            video_on = false;
+                            out.push(Reply::Json(json!({"op": 12, "d": {"audio_ssrc": ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": []}})));
+                            tracing::info!("camera: off");
+                        }
+                    }
+                    Outgoing::Video { frame, timestamp, .. } => {
+                        if !video_on {
+                            continue;
+                        }
+                        // DAVE's layer on the whole frame, then cut into packets.
+                        let Some(sealed) = dave.seal_video(&frame) else {
+                            crate::video_send::KEYFRAME_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        };
+                        let packets = crate::video_send::packetize_h264(&sealed);
+                        let last = packets.len().saturating_sub(1);
+                        for (i, payload) in packets.iter().enumerate() {
+                            let marker = i == last;
+                            if let Some(packet) = transport::seal_rtp(mode, secret, video::H264, marker, video_seq, timestamp, video_ssrc, sent.counter, payload) {
+                                let _ = socket.send(&packet).await;
+                            }
+                            video_seq = video_seq.wrapping_add(1);
+                            sent.counter = sent.counter.wrapping_add(1);
+                        }
+                    }
+                }
             }
             _ = keepalive.tick() => {
                 if let Some(socket) = &udp {
@@ -507,12 +687,58 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                 let Ok(size) = received else { continue };
                 let Some(secret) = &key else { continue };
                 counts.received += 1;
+                // RTCP: reports, and someone watching our camera asking for a keyframe. They come
+                // bundled, a receiver report usually first and the request after it, so any RTCP
+                // is opened and looked through, not only what starts with a request.
+                if size > 1 && (200..=206).contains(&buffer[1]) {
+                    if let Some(rtcp) = transport::open_rtcp(mode, secret, &buffer[..size])
+                        && video_on
+                        && transport::keyframe_request(&rtcp) == Some(video_ssrc)
+                    {
+                        crate::video_send::KEYFRAME_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 let Some(rtp) = transport::open_packet(mode, secret, &buffer[..size]) else {
                     counts.unreadable += 1;
                     continue;
                 };
+                if let Some((codec, resend)) = video::video_payload(rtp.payload_type) {
+                    // A resend carries the original sequence number first, on its own SSRC.
+                    let (primary, seq, payload) = if resend {
+                        let Some(primary) = rtx_of.get(&rtp.ssrc).copied() else { continue };
+                        if rtp.payload.len() < 2 {
+                            continue;
+                        }
+                        (primary, u16::from_be_bytes([rtp.payload[0], rtp.payload[1]]), rtp.payload[2..].to_vec())
+                    } else {
+                        (rtp.ssrc, rtp.seq, rtp.payload)
+                    };
+                    let Some(user) = video_users.get(&primary).copied() else { continue };
+                    // Padding only, sent to probe the line: nothing to put in a frame.
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    let inbound = inbound_video.entry(primary).or_insert_with(|| video::Inbound::new(user, codec, pictures.clone()));
+                    if let Some(mut frame) = inbound.push(seq, rtp.timestamp, rtp.marker, payload) {
+                        match dave.open(Some(user), std::mem::take(&mut frame.data), MediaType::VIDEO, &mut counts) {
+                            Some(clear) => {
+                                frame.data = clear;
+                                inbound.decode(frame);
+                            }
+                            None => inbound.broken = true,
+                        }
+                    }
+                    if inbound.wants_keyframe()
+                        && let Some(packet) = transport::seal_rtcp(mode, secret, sent.counter, &transport::pli(ssrc, primary))
+                    {
+                        sent.counter = sent.counter.wrapping_add(1);
+                        let _ = udp.as_ref().map(|s| s.try_send(&packet));
+                    }
+                    continue;
+                }
                 let user = users_by_ssrc.get(&rtp.ssrc).copied();
-                if let Some(audio) = dave.open(user, rtp.payload, &mut counts)
+                if let Some(audio) = dave.open(user, rtp.payload, MediaType::AUDIO, &mut counts)
                     && let Ok(mut speakers) = speakers.lock()
                 {
                     speakers.push(rtp.ssrc, rtp.seq, audio);
@@ -566,10 +792,10 @@ mod tests {
         let mut dave = Dave::new(1, 2);
         dave.version = 1;
         let mut counts = Counts::default();
-        assert_eq!(dave.open(Some(3), SILENCE.to_vec(), &mut counts), Some(SILENCE.to_vec()), "silence stays clear");
+        assert_eq!(dave.open(Some(3), SILENCE.to_vec(), MediaType::AUDIO, &mut counts), Some(SILENCE.to_vec()), "silence stays clear");
         let mut sealed = vec![0u8; 20];
         sealed[18..].copy_from_slice(&DAVE_MARKER);
-        assert_eq!(dave.open(Some(3), sealed, &mut counts), None, "no keys yet: dropped, not played as noise");
+        assert_eq!(dave.open(Some(3), sealed, MediaType::AUDIO, &mut counts), None, "no keys yet: dropped, not played as noise");
         assert_eq!((counts.plain, counts.not_ready), (1, 1));
     }
 }

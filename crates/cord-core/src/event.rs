@@ -95,6 +95,14 @@ pub enum CoreEvent {
     CallUpdate(crate::call::Call),
     /// The last person left a DM or group call.
     CallDelete { channel_id: Id },
+    /// A Go Live stream we asked to watch has a media server: the second connection's `server_id`.
+    StreamCreate { stream_key: String, rtc_server_id: Id, viewer_ids: Vec<Id> },
+    /// Who's watching a stream we're watching (or sending) changed.
+    StreamUpdate { stream_key: String, viewer_ids: Vec<Id> },
+    /// Where that stream's media server is, and its token.
+    StreamServer { stream_key: String, endpoint: Option<String>, token: String },
+    /// The stream's over, or we're no longer watching it.
+    StreamDelete { stream_key: String },
     /// Someone joined, left or changed in a DM or group call.
     PrivateVoiceState(VoiceState),
     /// Which voice server to connect to, for the call we asked to join.
@@ -224,6 +232,19 @@ struct VoiceEvent {
     member: Option<Member>,
     #[serde(flatten)]
     state: VoiceState,
+}
+
+#[derive(Deserialize)]
+struct StreamEvent {
+    stream_key: String,
+    #[serde(default)]
+    rtc_server_id: Option<Id>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    viewer_ids: Vec<Id>,
 }
 
 #[derive(Deserialize)]
@@ -581,6 +602,13 @@ pub fn decode_dispatch(t: &str, d: Value) -> Option<CoreEvent> {
         "CHANNEL_PINS_UPDATE" => from_value::<ChannelOnly>(d).map(|c| CoreEvent::PinsChanged { channel_id: c.channel_id }),
         "CALL_CREATE" | "CALL_UPDATE" => from_value(d).map(CoreEvent::CallUpdate),
         "CALL_DELETE" => from_value::<ChannelOnly>(d).map(|c| CoreEvent::CallDelete { channel_id: c.channel_id }),
+        "STREAM_CREATE" => from_value::<StreamEvent>(d).and_then(|s| {
+            let rtc_server_id = s.rtc_server_id.ok_or_else(|| serde::de::Error::missing_field("rtc_server_id"))?;
+            Ok(CoreEvent::StreamCreate { stream_key: s.stream_key, rtc_server_id, viewer_ids: s.viewer_ids })
+        }),
+        "STREAM_UPDATE" => from_value::<StreamEvent>(d).map(|s| CoreEvent::StreamUpdate { stream_key: s.stream_key, viewer_ids: s.viewer_ids }),
+        "STREAM_SERVER_UPDATE" => from_value::<StreamEvent>(d).map(|s| CoreEvent::StreamServer { stream_key: s.stream_key, endpoint: s.endpoint, token: s.token.unwrap_or_default() }),
+        "STREAM_DELETE" => from_value::<StreamEvent>(d).map(|s| CoreEvent::StreamDelete { stream_key: s.stream_key }),
         "VOICE_SERVER_UPDATE" => from_value(d).map(CoreEvent::VoiceServer),
         "VOICE_STATE_UPDATE" => match from_value::<VoiceEvent>(d) {
             Ok(v) => match v.guild_id.or(v.state.guild_id) {
@@ -630,6 +658,14 @@ mod tests {
         let create = decode_dispatch("CALL_CREATE", json!({"channel_id": "9", "ringing": ["3"], "voice_states": []}));
         assert!(matches!(create, Some(CoreEvent::CallUpdate(c)) if c.ringing == vec![Id(3)]));
         assert!(matches!(decode_dispatch("CALL_DELETE", json!({"channel_id": "9"})), Some(CoreEvent::CallDelete { channel_id: Id(9) })));
+        assert!(matches!(
+            decode_dispatch("STREAM_CREATE", json!({"stream_key": "guild:1:2:3", "rtc_server_id": "44", "viewer_ids": [], "paused": false})),
+            Some(CoreEvent::StreamCreate { rtc_server_id: Id(44), .. })
+        ));
+        assert!(matches!(
+            decode_dispatch("STREAM_SERVER_UPDATE", json!({"stream_key": "guild:1:2:3", "endpoint": "x.discord.media:443", "token": "t"})),
+            Some(CoreEvent::StreamServer { endpoint: Some(_), .. })
+        ));
         let joined = decode_dispatch("VOICE_STATE_UPDATE", json!({"user_id": "2", "channel_id": "9", "guild_id": null}));
         assert!(matches!(joined, Some(CoreEvent::PrivateVoiceState(v)) if v.channel_id == Some(Id(9))));
     }

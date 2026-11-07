@@ -175,8 +175,21 @@ pub fn name_clip<E: gpui_kit::Styled>(element: E, stops: &[gpui_kit::Hsla]) -> E
 /// `text` as a smooth left-to-right gradient through `stops`, `phase` (0 to 1) along
 /// its loop. Fewer than two stops: plain text (the caller sets its colour).
 pub fn gradient_text(text: &str, stops: &[gpui_kit::Hsla], phase: f32) -> AnyElement {
+    gradient_text_with(text, stops, phase, None)
+}
+
+/// Makes the element that holds a name's text, so a name can be built as selectable text.
+pub type TextMaker = std::rc::Rc<dyn Fn(&str) -> AnyElement>;
+
+/// `gradient_text`, with `make` building the text itself when given. The invisible text that
+/// sizes a gradient name is what a selection lands on, so it gets made that way too.
+fn gradient_text_with(text: &str, stops: &[gpui_kit::Hsla], phase: f32, make: Option<&TextMaker>) -> AnyElement {
+    let make_text = |text: &str| match make {
+        Some(make) => make(text),
+        None => text.to_string().into_any_element(),
+    };
     if stops.len() < 2 || text.is_empty() {
-        return text.to_string().into_any_element();
+        return make_text(text);
     }
     let (owned, stops) = (gpui_kit::SharedString::from(text.to_string()), stops.to_vec());
     let painted = owned.clone();
@@ -184,7 +197,10 @@ pub fn gradient_text(text: &str, stops: &[gpui_kit::Hsla], phase: f32) -> AnyEle
         .relative()
         .min_w_0()
         // Sizes it, and truncates it, as text would be. Never seen.
-        .child(div().text_color(gpui_kit::transparent_black()).child(owned))
+        .child(div().text_color(gpui_kit::transparent_black()).child(match make {
+            Some(make) => make(&owned),
+            None => owned.into_any_element(),
+        }))
         .child(
             gpui_kit::canvas(
                 |_, _, _| {},
@@ -249,13 +265,18 @@ pub fn gradient_text(text: &str, stops: &[gpui_kit::Hsla], phase: f32) -> AnyEle
 
 /// A name's text: with `moving` set, a gradient drifts along it on a seamless loop.
 pub fn name_text(id: impl Into<gpui_kit::ElementId>, text: &str, stops: &[gpui_kit::Hsla], moving: bool) -> AnyElement {
+    name_text_with(id, text, stops, moving, None)
+}
+
+/// `name_text` with `make` building the text, for a name that can be selected.
+pub fn name_text_with(id: impl Into<gpui_kit::ElementId>, text: &str, stops: &[gpui_kit::Hsla], moving: bool, make: Option<TextMaker>) -> AnyElement {
     if !moving || stops.len() < 2 {
-        return gradient_text(text, stops, 0.);
+        return gradient_text_with(text, stops, 0., make.as_ref());
     }
     let (text, stops) = (text.to_string(), stops.to_vec());
     div()
         .with_animation(id, gpui_kit::Animation::new(std::time::Duration::from_millis(1500)).repeat(), move |d, t| {
-            d.child(gradient_text(&text, &stops, t))
+            d.child(gradient_text_with(&text, &stops, t, make.as_ref()))
         })
         .into_any_element()
 }

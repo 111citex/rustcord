@@ -16,6 +16,13 @@ pub enum Sound {
     SomeoneLeft,
     Deafened,
     Undeafened,
+    Muted,
+    Unmuted,
+    /// We left the call: played on its own, after the call's gone.
+    Disconnected,
+    /// The push-to-talk key, down and up.
+    PttStart,
+    PttStop,
     StreamStarted,
     StreamEnded,
     /// Someone's calling us.
@@ -52,6 +59,11 @@ pub fn fallback(sound: Sound) -> Clip {
         Sound::SomeoneLeft => tones(&[(880., 0.09), (660., 0.14)]),
         Sound::Deafened => tones(&[(520., 0.07), (390., 0.11)]),
         Sound::Undeafened => tones(&[(390., 0.07), (520., 0.11)]),
+        Sound::Muted => tones(&[(600., 0.06), (450., 0.09)]),
+        Sound::Unmuted => tones(&[(450., 0.06), (600., 0.09)]),
+        Sound::Disconnected => tones(&[(660., 0.09), (440., 0.16)]),
+        Sound::PttStart => tones(&[(700., 0.04)]),
+        Sound::PttStop => tones(&[(500., 0.04)]),
         Sound::StreamStarted => tones(&[(520., 0.08), (780., 0.14)]),
         Sound::StreamEnded => tones(&[(780., 0.08), (520., 0.14)]),
         // A ring is its two notes twice; the gap between rings comes from the loop.

@@ -620,6 +620,9 @@ use image::Frame;
 
 /// Rustcord: GIF files bigger than this are decoded a frame at a time.
 const STREAM_GIFS_ABOVE: usize = 256 * 1024;
+/// Rustcord: and animated WebP ones. It packs more frames into fewer bytes, so a
+/// small file can still unpack to hundreds of MB.
+const STREAM_WEBPS_ABOVE: usize = 64 * 1024;
 
 /// Rustcord: the `#fit=WxH` on an address: the size its frames are shown at.
 fn fit_hint(uri: &str) -> Option<(u32, u32)> {
@@ -710,7 +713,7 @@ impl Asset for ImageAssetLoader {
                         for pixel in first.buffer_mut().chunks_exact_mut(4) {
                             pixel.swap(0, 2);
                         }
-                        let stream = StreamSource { bytes: Arc::from(bytes), fit };
+                        let stream = StreamSource { bytes: Arc::from(bytes), fit, webp: false };
                         let frames: SmallVec<[Frame; 1]> = SmallVec::from_iter([fit_frame(first, fit)]);
                         return Ok(Arc::new(RenderImage::new(frames).with_stream(stream)));
                     }
@@ -746,6 +749,23 @@ impl Asset for ImageAssetLoader {
                     ImageFormat::WebP => {
                         let mut decoder = WebPDecoder::new(Cursor::new(&bytes))?;
 
+                        // Rustcord: a long animation stays a file, as long GIFs do.
+                        if decoder.has_animation() && bytes.len() > STREAM_WEBPS_ABOVE {
+                            let _ = decoder.set_background_color(Rgba([0, 0, 0, 0]));
+                            let first = decoder.into_frames().next().transpose()?;
+                            let Some(mut first) = first else {
+                                return Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
+                                    "WebP has no frames ({source:?})"
+                                ))));
+                            };
+                            for pixel in first.buffer_mut().chunks_exact_mut(4) {
+                                pixel.swap(0, 2);
+                            }
+                            let stream = StreamSource { bytes: Arc::from(bytes), fit, webp: true };
+                            let frames: SmallVec<[Frame; 1]> = SmallVec::from_iter([fit_frame(first, fit)]);
+                            return Ok(Arc::new(RenderImage::new(frames).with_stream(stream)));
+                        }
+
                         if decoder.has_animation() {
                             let _ = decoder.set_background_color(Rgba([0, 0, 0, 0]));
                             let mut frames = SmallVec::new();
@@ -757,7 +777,7 @@ impl Asset for ImageAssetLoader {
                                         for pixel in frame.buffer_mut().chunks_exact_mut(4) {
                                             pixel.swap(0, 2);
                                         }
-                                        frames.push(frame);
+                                        frames.push(fit_frame(frame, fit));
                                     }
                                     Err(err) => {
                                         log::debug!(

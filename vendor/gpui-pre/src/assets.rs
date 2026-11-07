@@ -58,6 +58,8 @@ pub struct StreamSource {
     pub bytes: Arc<[u8]>,
     /// The size to scale its frames to fit, if any.
     pub fit: Option<(u32, u32)>,
+    /// An animated WebP rather than a GIF.
+    pub webp: bool,
 }
 
 /// Rustcord: a frame's pixels are only held until they're on the GPU.
@@ -107,6 +109,11 @@ impl RenderImage {
     /// Where the rest of its frames are, if it's the first frame of a long animation.
     pub fn stream(&self) -> Option<&StreamSource> {
         self.stream.as_ref()
+    }
+
+    /// Rustcord: whether a frame's pixels are still here, not yet on the GPU.
+    pub fn has_pixels(&self, frame_index: usize) -> bool {
+        self.data.get(frame_index).is_some_and(|f| f.pixels.lock().is_some())
     }
 
     /// Takes a frame's pixels: they're the GPU's from here on. `None` if they've

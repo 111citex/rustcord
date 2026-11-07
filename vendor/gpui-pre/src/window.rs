@@ -5278,6 +5278,13 @@ impl Window {
         Ok(())
     }
 
+    /// Rustcord: whether `paint_image` would draw this frame: it's on the GPU, or its
+    /// pixels are here to go there.
+    pub fn image_frame_ready(&self, data: &RenderImage, frame_index: usize) -> bool {
+        data.has_pixels(frame_index)
+            || self.sprite_atlas.contains(&RenderImageParams { image_id: data.id, frame_index }.into())
+    }
+
     /// Returns whether every frame of an image is present in the sprite atlas.
     #[cfg(any(test, feature = "test-support"))]
     pub fn has_image_atlas_entry(&self, data: &RenderImage) -> bool {
@@ -5700,7 +5707,15 @@ impl Window {
         // after the wheel's stopped. Anything else may act on what's under the pointer.
         let only_passing = match &event {
             PlatformInput::ScrollWheel(_) => true,
-            PlatformInput::MouseMove(moved) => moved.pressed_button.is_none(),
+            // Rustcord: a drag that's selecting text passes too. Settling every gliding layer at
+            // each move of a selection drag stalled scrolling while selecting; the selection
+            // catches up when the layers next settle.
+            PlatformInput::MouseMove(moved) => {
+                moved.pressed_button.is_none()
+                    || cx
+                        .try_global::<crate::elements::text_selection::TextSelection>()
+                        .is_some_and(|selection| selection.is_dragging())
+            }
             _ => false,
         };
         if !only_passing {

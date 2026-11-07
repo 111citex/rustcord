@@ -1,9 +1,10 @@
 use crate::{
-    ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
+    ActiveTooltip, AnyView, App, BorrowAppContext as _, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SelectionPrefs, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    WrappedLineLayout, elements::text_selection::{self, TextSelection}, fill, register_tooltip_mouse_handlers,
+    set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -1042,6 +1043,8 @@ pub struct InteractiveText {
     tooltip_id: Option<TooltipId>,
     clickable_ranges: Vec<Range<usize>>,
     right_click: Option<(Vec<Range<usize>>, RightClickListener)>,
+    selectable: bool,
+    select_source: Option<(u64, SharedString)>,
 }
 
 type RightClickListener = Box<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App)>;
@@ -1073,7 +1076,25 @@ impl InteractiveText {
             tooltip_id: None,
             clickable_ranges: Vec::new(),
             right_click: None,
+            selectable: false,
+            select_source: None,
         }
+    }
+
+    /// Lets the user select this text by dragging, and copy it (see [`crate::selected_text`]).
+    /// A drag can run across other selectable texts. Clicks on `on_click` ranges still work: a
+    /// press only becomes a selection once the pointer has moved a few pixels.
+    pub fn allow_select(mut self) -> Self {
+        self.selectable = true;
+        self
+    }
+
+    /// What this text was made from (for instance the markdown behind it). When the app asks
+    /// for source copying, a selection that touches this text copies this, whole. Texts cut
+    /// from one thing give it the same `group`, and it is copied once however many are touched.
+    pub fn select_source(mut self, group: u64, source: impl Into<SharedString>) -> Self {
+        self.select_source = Some((group, source.into()));
+        self
     }
 
     /// Called with the index of the range and the pointer's position when the user
@@ -1202,6 +1223,10 @@ impl Element for InteractiveText {
     ) {
         let current_view = window.current_view();
         let text_layout = self.text.layout().clone();
+        let select_key = global_id.filter(|_| self.selectable).cloned();
+        if let Some(key) = select_key.as_ref() {
+            self.paint_selection(key, bounds, &text_layout, hitbox, window, cx);
+        }
         window.with_element_state::<InteractiveTextState, _>(
             global_id.unwrap(),
             |interactive_state, window| {
@@ -1225,8 +1250,13 @@ impl Element for InteractiveText {
                         window.on_mouse_event(
                             move |event: &MouseUpEvent, phase, window: &mut Window, cx| {
                                 if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                                    if let Ok(mouse_up_index) =
-                                        text_layout.index_for_position(event.position)
+                                    // A selection that was just made isn't a click.
+                                    let selected = cx
+                                        .try_global::<TextSelection>()
+                                        .is_some_and(|selection| selection.dragged);
+                                    if !selected
+                                        && let Ok(mouse_up_index) =
+                                            text_layout.index_for_position(event.position)
                                     {
                                         click_listener(
                                             &clickable_ranges,
@@ -1354,6 +1384,84 @@ impl Element for InteractiveText {
                 ((), interactive_state)
             },
         );
+    }
+}
+
+impl InteractiveText {
+    /// Paints this text's share of the selection highlight and wires up selecting. The highlight
+    /// goes down first so the text lands on top of it.
+    fn paint_selection(
+        &self,
+        key: &GlobalElementId,
+        bounds: Bounds<Pixels>,
+        text_layout: &TextLayout,
+        hitbox: &Hitbox,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let prefs = cx.try_global::<SelectionPrefs>().copied().unwrap_or_default();
+        let selection = cx.default_global::<TextSelection>();
+        selection.register(key, bounds, text_layout, &self.text.text, self.select_source.as_ref());
+        if let Some(range) = selection.range_in(key) {
+            for rect in text_selection::rects(text_layout, bounds, range) {
+                window.paint_quad(fill(rect, prefs.color));
+            }
+        }
+
+        // Text that isn't a link gets the I-beam; the click handling below puts the hand over links.
+        window.set_cursor_style(crate::CursorStyle::IBeam, hitbox);
+        // A change to the selection redraws the view this text is in, not the whole window: a
+        // whole-window refresh rebuilt every scroll layer at each step of a drag, and scrolling
+        // while selecting lagged behind.
+        let view = window.current_view();
+
+        window.on_mouse_event({
+            let (key, hitbox, text_layout) = (key.clone(), hitbox.clone(), text_layout.clone());
+            move |event: &MouseDownEvent, phase, window, cx| {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                if phase == DispatchPhase::Capture {
+                    // A press away from every selectable text lets go of the selection.
+                    let away = cx
+                        .try_global::<TextSelection>()
+                        .is_some_and(|selection| !selection.over_text(event.position));
+                    if away && text_selection::clear_text_selection(cx) {
+                        cx.notify(view);
+                    }
+                } else if hitbox.is_hovered(window) {
+                    let index = text_layout.index_for_position(event.position).unwrap_or_else(|i| i);
+                    // A plain press over nothing selected changes nothing on screen.
+                    let had = text_selection::selected_text(cx).is_some();
+                    cx.global_mut::<TextSelection>().press(&key, index, event.position, event.click_count);
+                    if had || event.click_count >= 2 {
+                        cx.notify(view);
+                    }
+                }
+            }
+        });
+
+        window.on_mouse_event({
+            let key = key.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                // Every selectable text hears the move; only the one the press began in acts on it.
+                if phase != DispatchPhase::Bubble
+                    || !event.dragging()
+                    || !cx.try_global::<TextSelection>().is_some_and(|selection| selection.drives(&key))
+                {
+                    return;
+                }
+                if cx.update_global::<TextSelection, _>(|selection, cx| selection.drag(event.position, cx)) {
+                    cx.notify(view);
+                }
+            }
+        });
+
+        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture && let Some(selection) = cx.try_global::<TextSelection>() && selection.is_dragging() {
+                cx.global_mut::<TextSelection>().release();
+            }
+        });
     }
 }
 

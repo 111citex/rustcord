@@ -1442,7 +1442,8 @@ pub trait PlatformAtlas {
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
 
-    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+    /// Rustcord: whether `key` has a tile. Not a test helper any more: images check
+    /// whether a frame can be drawn before switching to it.
     fn contains(&self, _key: &AtlasKey) -> bool {
         false
     }

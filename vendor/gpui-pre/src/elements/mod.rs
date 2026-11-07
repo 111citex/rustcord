@@ -10,6 +10,7 @@ mod list;
 mod surface;
 mod svg;
 mod text;
+pub(crate) mod text_selection;
 mod uniform_list;
 
 pub use anchored::*;
@@ -24,4 +25,5 @@ pub use list::*;
 pub use surface::*;
 pub use svg::*;
 pub use text::*;
+pub use text_selection::{SelectionPrefs, clear_text_selection, selected_text};
 pub use uniform_list::*;

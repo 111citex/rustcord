@@ -915,9 +915,6 @@ impl ChannelPage {
                 .rounded(u(8.))
                 .overflow_hidden()
                 .bg(color.map_or(tile, |c| gpui_kit::rgb(c).into()))
-                .when(speaking, |d| {
-                    d.child(div().absolute().top_0().left_0().size_full().rounded(u(8.)).border_3().border_color(Hsla::from(gpui_kit::rgb(0x23a55a))))
-                })
                 .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(move |this, event: &gpui_kit::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     this.user_menu(user, name.clone(), event.position, cx);
@@ -1011,6 +1008,10 @@ impl ChannelPage {
                                     .child("Watch Stream"),
                             ),
                     )
+                })
+                // Talking: the green outline, over their camera or stream too, not under it.
+                .when(speaking, |d| {
+                    d.child(div().absolute().top_0().left_0().size_full().rounded(u(8.)).border_3().border_color(Hsla::from(gpui_kit::rgb(0x23a55a))))
                 })
                 .child(
                     h_flex()

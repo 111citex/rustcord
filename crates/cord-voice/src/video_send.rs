@@ -115,7 +115,15 @@ fn run(sink: &tokio::sync::mpsc::Sender<Outgoing>, pictures: &Pictures, me: u64,
 /// they could never use (Discord's error 2012).
 pub fn four_byte_start_codes(frame: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(frame.len() + 16);
+    // One of each parameter set at most: Apple's decoder doesn't take them twice in a frame.
+    let mut seen_sps = false;
+    let mut seen_pps = false;
     for nal in alhazen_core::nal::split_annex_b(frame).into_iter().filter(|n| !n.is_empty()) {
+        match nal[0] & 0x1f {
+            7 if std::mem::replace(&mut seen_sps, true) => continue,
+            8 if std::mem::replace(&mut seen_pps, true) => continue,
+            _ => {}
+        }
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(nal);
     }
@@ -154,6 +162,12 @@ pub fn packetize_h264(frame: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameter_sets_go_once() {
+        let twice = [0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3];
+        assert_eq!(four_byte_start_codes(&twice), vec![0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3]);
+    }
 
     #[test]
     fn start_codes_become_four_bytes() {

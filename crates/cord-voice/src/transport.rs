@@ -138,8 +138,7 @@ pub fn seal_rtcp(mode: Mode, key: &[u8; 32], counter: u32, packet: &[u8]) -> Opt
 }
 
 /// Seals a video packet of ours with Discord's header extensions (one-byte profile, 0xBEDE):
-/// the transport sequence number (ID 5), playout delay (ID 6, which Discord expects on video)
-/// and the RID of the layer it belongs to (ID 11). The extension's own header stays readable;
+/// the transport sequence number (ID 5) and the RID of the layer it belongs to (ID 11). The extension's own header stays readable;
 /// its elements are sealed with the payload, as in Discord's RTP-size modes.
 #[allow(clippy::too_many_arguments)]
 pub fn seal_video_rtp(mode: Mode, key: &[u8; 32], payload_type: u8, marker: bool, seq: u16, timestamp: u32, ssrc: u32, counter: u32, transport_seq: u16, rid: &str, payload: &[u8]) -> Option<Vec<u8>> {
@@ -149,8 +148,9 @@ pub fn seal_video_rtp(mode: Mode, key: &[u8; 32], payload_type: u8, marker: bool
         out.extend_from_slice(data);
     };
     element(&mut elements, 5, &transport_seq.to_be_bytes());
-    // Playout delay: no minimum and no maximum (12 bits each, in 10 ms): play as soon as it can.
-    element(&mut elements, 6, &[0, 0, 0]);
+    // No playout delay (ID 6): a 0/0 one puts WebRTC viewers in a zero-delay rendering mode, and
+    // Discord's iOS app then showed our camera only in picture-in-picture, black in the app.
+    // Discord's own camera (a WebRTC client) doesn't send one either.
     element(&mut elements, 11, rid.as_bytes());
     while elements.len() % 4 != 0 {
         elements.push(0);

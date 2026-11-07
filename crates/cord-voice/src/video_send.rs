@@ -59,7 +59,8 @@ fn run(sink: &tokio::sync::mpsc::Sender<Outgoing>, pictures: &Pictures, me: u64,
     let mut encoder: Option<(Box<dyn alhazen_encode::VideoEncoder>, u32, u32)> = None;
     let mut number = 0u64;
     let mut last_keyframe = std::time::Instant::now();
-    let _ = sink.blocking_send(Outgoing::VideoOn);
+    // Said on only once the first frame's encoded: cameras take seconds to wake, and viewers
+    // told before then would wait on nothing, and time out on it.
     // The first frame anyone gets is a keyframe.
     KEYFRAME_WANTED.store(true, Relaxed);
     while !stop.load(Relaxed) {
@@ -69,7 +70,16 @@ fn run(sink: &tokio::sync::mpsc::Sender<Outgoing>, pictures: &Pictures, me: u64,
         };
         // An encoder for the camera's real size (it may not give exactly what was asked).
         if encoder.as_ref().is_none_or(|(_, w, h)| (*w, *h) != (frame.width, frame.height)) {
-            let config = alhazen_encode::Config { codec: alhazen_encode::Codec::H264, width: frame.width, height: frame.height, fps: FPS, bitrate: BITRATE };
+            // Constrained Baseline: what Discord's clients agree on for H.264. Phones' decoders
+            // turned away High profile frames, asked for keyframes again and again, and gave up.
+            let config = alhazen_encode::Config {
+                codec: alhazen_encode::Codec::H264,
+                h264_profile: alhazen_encode::H264Profile::ConstrainedBaseline,
+                width: frame.width,
+                height: frame.height,
+                fps: FPS,
+                bitrate: BITRATE,
+            };
             let opened = alhazen_encode::open(config).map_err(|e| e.to_string())?;
             tracing::info!(encoder = opened.name(), width = frame.width, height = frame.height, "camera: encoding");
             encoder = Some((opened, frame.width, frame.height));
@@ -82,9 +92,12 @@ fn run(sink: &tokio::sync::mpsc::Sender<Outgoing>, pictures: &Pictures, me: u64,
         }
         let stride = frame.width as usize * 4;
         let encoded = encoder.encode(&alhazen_encode::Frame { bgra: &frame.bgra, stride, pts: frame.pts }, keyframe).map_err(|e| e.to_string())?;
+        if number == 0 {
+            let _ = sink.blocking_send(Outgoing::VideoOn);
+        }
         // RTP's video clock is 90 kHz.
         let timestamp = (frame.pts * 9 / 100) as u32;
-        if sink.try_send(Outgoing::Video { frame: encoded.data, keyframe: encoded.keyframe, timestamp }).is_err() {
+        if sink.try_send(Outgoing::Video { frame: four_byte_start_codes(&encoded.data), keyframe: encoded.keyframe, timestamp }).is_err() {
             // The network's behind: the next frame's a keyframe, so nothing's left broken.
             KEYFRAME_WANTED.store(true, Relaxed);
         }
@@ -93,6 +106,20 @@ fn run(sink: &tokio::sync::mpsc::Sender<Outgoing>, pictures: &Pictures, me: u64,
         pictures.set(me, Picture { width: frame.width, height: frame.height, bgra: Arc::from(frame.bgra), number, source: (frame.width, frame.height) });
     }
     Ok(())
+}
+
+/// The frame with a four-byte start code before every NAL unit. Receivers put the frame back
+/// together that way before taking DAVE's layer off, and DAVE's record of which bytes it left
+/// readable counts from the frame as it was sealed: NVENC's three-byte start codes between
+/// units moved every one after the first, nothing decrypted, and viewers waited on a keyframe
+/// they could never use (Discord's error 2012).
+pub fn four_byte_start_codes(frame: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(frame.len() + 16);
+    for nal in alhazen_core::nal::split_annex_b(frame).into_iter().filter(|n| !n.is_empty()) {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+    }
+    out
 }
 
 /// An H.264 frame (Annex B, DAVE's layer on if any) as RTP payloads (RFC 6184): small NAL
@@ -127,6 +154,12 @@ pub fn packetize_h264(frame: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_codes_become_four_bytes() {
+        let nvenc = [0, 0, 0, 1, 0x67, 9, 0, 0, 1, 0x68, 8, 0, 0, 1, 0x65, 7];
+        assert_eq!(four_byte_start_codes(&nvenc), vec![0, 0, 0, 1, 0x67, 9, 0, 0, 0, 1, 0x68, 8, 0, 0, 0, 1, 0x65, 7]);
+    }
 
     #[test]
     fn packets_come_back_as_the_frame() {

@@ -137,6 +137,53 @@ pub fn seal_rtcp(mode: Mode, key: &[u8; 32], counter: u32, packet: &[u8]) -> Opt
     Some(out)
 }
 
+/// Seals a video packet of ours with Discord's header extensions (one-byte profile, 0xBEDE):
+/// the transport sequence number (ID 5), playout delay (ID 6, which Discord expects on video)
+/// and the RID of the layer it belongs to (ID 11). The extension's own header stays readable;
+/// its elements are sealed with the payload, as in Discord's RTP-size modes.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_video_rtp(mode: Mode, key: &[u8; 32], payload_type: u8, marker: bool, seq: u16, timestamp: u32, ssrc: u32, counter: u32, transport_seq: u16, rid: &str, payload: &[u8]) -> Option<Vec<u8>> {
+    let mut elements = Vec::with_capacity(16);
+    let element = |out: &mut Vec<u8>, id: u8, data: &[u8]| {
+        out.push((id << 4) | (data.len() as u8 - 1));
+        out.extend_from_slice(data);
+    };
+    element(&mut elements, 5, &transport_seq.to_be_bytes());
+    // Playout delay: no minimum and no maximum (12 bits each, in 10 ms): play as soon as it can.
+    element(&mut elements, 6, &[0, 0, 0]);
+    element(&mut elements, 11, rid.as_bytes());
+    while elements.len() % 4 != 0 {
+        elements.push(0);
+    }
+    let mut packet = Vec::with_capacity(RTP_HEADER + 4 + elements.len() + payload.len() + TAG + COUNTER);
+    packet.extend_from_slice(&[0x90, (payload_type & 0x7f) | if marker { 0x80 } else { 0 }]);
+    packet.extend_from_slice(&seq.to_be_bytes());
+    packet.extend_from_slice(&timestamp.to_be_bytes());
+    packet.extend_from_slice(&ssrc.to_be_bytes());
+    packet.extend_from_slice(&[0xBE, 0xDE]);
+    packet.extend_from_slice(&((elements.len() / 4) as u16).to_be_bytes());
+    let clear = packet.len();
+    let mut body = elements;
+    body.extend_from_slice(payload);
+    let counter = counter.to_be_bytes();
+    let plain = Payload { msg: &body, aad: &packet[..clear] };
+    let sealed = match mode {
+        Mode::Aes => {
+            let mut nonce = [0u8; 12];
+            nonce[..COUNTER].copy_from_slice(&counter);
+            Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key)).encrypt(Nonce::from_slice(&nonce), plain).ok()?
+        }
+        Mode::XChaCha => {
+            let mut nonce = [0u8; 24];
+            nonce[..COUNTER].copy_from_slice(&counter);
+            XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key)).encrypt(XNonce::from_slice(&nonce), plain).ok()?
+        }
+    };
+    packet.extend_from_slice(&sealed);
+    packet.extend_from_slice(&counter);
+    Some(packet)
+}
+
 /// Opens an RTCP packet: its first 8 bytes are readable, the rest sealed. `None` if it isn't
 /// RTCP or doesn't open. Returns the whole packet, header and all, opened.
 pub fn open_rtcp(mode: Mode, key: &[u8; 32], packet: &[u8]) -> Option<Vec<u8>> {
@@ -161,6 +208,36 @@ pub fn keyframe_request(rtcp: &[u8]) -> Option<u32> {
         let words = u16::from_be_bytes([rtcp[at + 2], rtcp[at + 3]]) as usize;
         if kind == 206 && matches!(first & 0x1f, 1 | 4) {
             return Some(u32::from_be_bytes([rtcp[at + 8], rtcp[at + 9], rtcp[at + 10], rtcp[at + 11]]));
+        }
+        at += (words + 1) * 4;
+    }
+    None
+}
+
+/// What a receiver report (RTCP 201, or the report blocks of a sender report, 200) says about
+/// `ssrc`: (fraction lost out of 256, packets lost in all, the highest sequence number seen).
+pub fn report_about(rtcp: &[u8], ssrc: u32) -> Option<(u8, u32, u32)> {
+    let mut at = 0;
+    while at + 8 <= rtcp.len() {
+        let (first, kind) = (rtcp[at], rtcp[at + 1]);
+        let words = u16::from_be_bytes([rtcp[at + 2], rtcp[at + 3]]) as usize;
+        let count = (first & 0x1f) as usize;
+        // Report blocks start after the sender's SSRC (RR), or after its 20-byte sender info (SR).
+        let blocks = match kind {
+            201 => Some(at + 8),
+            200 => Some(at + 28),
+            _ => None,
+        };
+        if let Some(mut block) = blocks {
+            for _ in 0..count {
+                let Some(b) = rtcp.get(block..block + 24) else { break };
+                if u32::from_be_bytes([b[0], b[1], b[2], b[3]]) == ssrc {
+                    let lost = u32::from_be_bytes([0, b[5], b[6], b[7]]);
+                    let highest = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
+                    return Some((b[4], lost, highest));
+                }
+                block += 24;
+            }
         }
         at += (words + 1) * 4;
     }
@@ -252,6 +329,16 @@ mod tests {
             [header, body, counter.to_vec()].concat()
         };
         assert_eq!(open_packet(Mode::Aes, &key, &sealed).unwrap().payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn video_packets_carry_discords_extensions() {
+        let packet = seal_video_rtp(Mode::Aes, &KEY, 101, true, 9, 90_000, 77, 5, 3, "100", b"frame").unwrap();
+        assert_eq!(packet[0], 0x90, "the extension bit");
+        assert_eq!(&packet[12..14], &[0xBE, 0xDE]);
+        // Our own receiving side takes the extension off and gets the payload back.
+        let opened = open_packet(Mode::Aes, &KEY, &packet).unwrap();
+        assert_eq!((opened.payload.as_slice(), opened.marker, opened.payload_type), (&b"frame"[..], true, 101));
     }
 
     #[test]

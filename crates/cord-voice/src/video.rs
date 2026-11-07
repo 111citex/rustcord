@@ -23,13 +23,15 @@ const MOST_HELD: usize = 2000;
 
 /// What we offer to send and receive, for Select Protocol.
 pub fn codecs() -> serde_json::Value {
-    let video = |name: &str, pt: u8| {
-        serde_json::json!({"name": name, "type": "video", "priority": 1000, "payload_type": pt, "rtx_payload_type": pt + 1, "encode": false, "decode": true})
+    // `encode`: whether we can send it. Said false, the server took us for unable to send
+    // H.264, and what our camera sent never reached anyone as video they could start.
+    let video = |name: &str, pt: u8, encode: bool| {
+        serde_json::json!({"name": name, "type": "video", "priority": 1000, "payload_type": pt, "rtx_payload_type": pt + 1, "encode": encode, "decode": true})
     };
     serde_json::json!([
         {"name": "opus", "type": "audio", "priority": 1000, "payload_type": 120},
         // Only what can be put back together yet: VP8, VP9 and AV1 come next.
-        video("H264", H264),
+        video("H264", H264, true),
     ])
 }
 

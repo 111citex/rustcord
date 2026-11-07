@@ -389,6 +389,8 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
     // Ours for video, from Ready, and where our camera's frames are up to.
     let (mut video_ssrc, mut rtx_ssrc) = (0u32, 0u32);
     let mut video_seq: u16 = 0;
+    let mut transport_seq: u16 = 0;
+    let mut report_logged: Option<Instant> = None;
     let mut video_on = false;
     let mut mode = Mode::Aes;
     let mut key: Option<[u8; 32]> = None;
@@ -466,6 +468,8 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                                 let Ok(secret) = <[u8; 32]>::try_from(bytes) else { return End::Retry("bad session description".into()) };
                                 key = Some(secret);
                                 dave.version = d["dave_protocol_version"].as_u64().unwrap_or(0) as u16;
+                                // The codecs the server settled on for the call: what we send has to be these.
+                                tracing::info!(audio = %d["audio_codec"], video = %d["video_codec"], "voice: codecs");
                                 dave.reinit(&mut out);
                                 stats.set_state(State::Connected);
                                 connected_at = Some(Instant::now());
@@ -662,10 +666,11 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                         let last = packets.len().saturating_sub(1);
                         for (i, payload) in packets.iter().enumerate() {
                             let marker = i == last;
-                            if let Some(packet) = transport::seal_rtp(mode, secret, video::H264, marker, video_seq, timestamp, video_ssrc, sent.counter, payload) {
+                            if let Some(packet) = transport::seal_video_rtp(mode, secret, video::H264, marker, video_seq, timestamp, video_ssrc, sent.counter, transport_seq, "100", payload) {
                                 let _ = socket.send(&packet).await;
                             }
                             video_seq = video_seq.wrapping_add(1);
+                            transport_seq = transport_seq.wrapping_add(1);
                             sent.counter = sent.counter.wrapping_add(1);
                         }
                     }
@@ -691,10 +696,21 @@ async fn connect(info: &JoinInfo, speakers: &Mutex<Speakers>, stats: &Stats, sto
                 // bundled, a receiver report usually first and the request after it, so any RTCP
                 // is opened and looked through, not only what starts with a request.
                 if size > 1 && (200..=206).contains(&buffer[1]) {
-                    if let Some(rtcp) = transport::open_rtcp(mode, secret, &buffer[..size])
+                    let opened = transport::open_rtcp(mode, secret, &buffer[..size]);
+                    // Whether the server gets our video at all, and how much of it: every few seconds.
+                    if let Some(rtcp) = &opened
+                        && video_on
+                        && let Some((fraction, lost, highest)) = transport::report_about(rtcp, video_ssrc)
+                        && report_logged.is_none_or(|at: Instant| at.elapsed() > Duration::from_secs(3))
+                    {
+                        report_logged = Some(Instant::now());
+                        tracing::info!(fraction_lost = fraction, lost, highest_seq = highest, sent_seq = video_seq, "camera: server's report");
+                    }
+                    if let Some(rtcp) = opened
                         && video_on
                         && transport::keyframe_request(&rtcp) == Some(video_ssrc)
                     {
+                        tracing::info!("camera: keyframe asked for");
                         crate::video_send::KEYFRAME_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     continue;
